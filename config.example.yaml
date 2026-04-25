@@ -1,0 +1,114 @@
+# Mai - Offline AI Assistant Configuration
+# All paths use forward slashes for cross-platform compatibility
+#
+# 1. Copy this file to config.yaml
+# 2. Update paths to match your model locations
+# 3. Download models from: https://github.com/k2-fsa/sherpa-onnx/releases
+
+audio:
+  sample_rate: 16000
+  capture_buffer_ms: 100
+  playback_device: ""  # empty = default
+
+kws:
+  provider: "cpu"
+  num_threads: 2
+  debug: 0
+  model_dir: "./sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
+  encoder: "encoder-epoch-12-avg-2-chunk-16-left-64.onnx"
+  decoder: "decoder-epoch-12-avg-2-chunk-16-left-64.onnx"
+  joiner: "joiner-epoch-12-avg-2-chunk-16-left-64.onnx"
+  tokens: "tokens.txt"
+  keywords: "▁MA I @mai, ▁MY @mai, ▁HE Y ▁MA I @mai"  # Subword token version
+  confidence_threshold: 0.02
+  cooldown_ms: 1500
+
+vad:
+  provider: "cpu"
+  num_threads: 2
+  debug: 0
+  sample_rate: 16000
+  model: "./silero_vad.onnx"
+
+  window_size: 512
+  threshold: 0.6
+  min_silence_duration: 0.8
+  min_speech_duration: 0.5
+  max_speech_duration: 10.0
+  buffer_size_seconds: 20
+
+asr:
+  type: "nemo"
+  provider: "cpu"
+  num_threads: 2
+  debug: 0
+  model_dir: "./sherpa-onnx-nemo-streaming-fast-conformer-ctc-en-480ms"
+  encoder: "model.onnx"
+  tokens: "tokens.txt"
+  decoding_method: "greedy_search"
+  max_active_paths: 4
+  enable_endpoint: 1
+  rule1_min_trailing_silence: 2.4
+  rule2_min_trailing_silence: 1.2
+  rule3_min_utterance_length: 20
+
+tts:
+  provider: "cpu"
+  num_threads: 2
+  debug: 0
+  output_sample_rate: 44100  # Supertonic outputs 44.1kHz, Pocket/ZipVoice may differ
+
+  # Select active model: "supertonic" | "pocket" | "zipvoice"
+  active_model: "supertonic"
+
+  supertonic:
+    model_dir: "./sherpa-onnx-supertonic-tts-int8-2026-03-06"
+    duration_predictor: "duration_predictor.int8.onnx"
+    text_encoder: "text_encoder.int8.onnx"
+    vector_estimator: "vector_estimator.int8.onnx"
+    vocoder: "vocoder.int8.onnx"
+    tts_json: "tts.json"
+    unicode_indexer: "unicode_indexer.bin"
+    voice_style: "voice.bin"
+    sid: 0
+    num_steps: 5
+    speed: 1.25
+    extra: '{"lang": "en"}'
+
+  pocket:
+    model_dir: "./sherpa-onnx-pocket-tts-2026-01-26"
+    lm_flow: "lm_flow.onnx"
+    lm_main: "lm_main.onnx"
+    encoder: "encoder.onnx"
+    decoder: "decoder.onnx"
+    text_conditioner: "text_conditioner.onnx"
+    vocab_json: "vocab.json"
+    token_scores_json: "token_scores.json"
+    voice_embedding_cache_capacity: 50
+
+  zipvoice:
+    model_dir: "./sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"
+    encoder: "encoder.int8.onnx"
+    decoder: "decoder.int8.onnx"
+    data_dir: "espeak-ng-data"
+    lexicon: "lexicon.txt"
+    tokens: "tokens.txt"
+    vocoder: "./vocos_24khz.onnx"  # ⚠️ MUST DOWNLOAD: https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos_24khz.onnx
+    num_steps: 4
+    speed: 1.0
+    extra: '{"min_char_in_sentence": 10}'
+
+  voice_cloning:
+    enabled: false
+    model: "pocket"  # "pocket" or "zipvoice" (supertonic does NOT support cloning)
+    reference_audio: "./mai_san_v2.wav"
+    reference_text: ""  # Only for ZipVoice. Empty = auto-detect
+    max_reference_audio_len: 10.0
+    seed: 42
+
+llm:
+  provider: "ollama"
+  model: "gemma4:e2b-it-q4_K_M"
+  url: "http://localhost:11434/api/generate"
+  auto_start: true
+  system_prompt: "You are Mai, a helpful and concise offline AI assistant. Keep your answers short and friendly."
