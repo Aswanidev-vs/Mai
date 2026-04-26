@@ -340,12 +340,28 @@ func main() {
 		case StateWakeWord:
 			// If in follow-up window, allow VAD to trigger listening
 			if time.Since(lastResponseTime) < 10*time.Second {
-				vadDetector.AcceptWaveform(samples)
+				// Feed to ASR continuously so we capture what the user says
+				asrStream.AcceptWaveform(16000, samples)
+
+				// Feed to VAD buffer for speech detection
+				vadBuffer.Push(samples)
+				for vadBuffer.Size() >= cfg.VAD.WindowSize {
+					head := vadBuffer.Head()
+					chunk := vadBuffer.Get(head, cfg.VAD.WindowSize)
+					vadBuffer.Pop(cfg.VAD.WindowSize)
+					vadDetector.AcceptWaveform(chunk)
+				}
+
+				// Check if VAD has detected speech segments
 				if !vadDetector.IsEmpty() {
 					log.Println("[FOLLOW-UP] Speech detected! Skipping wake word.")
 					state = StateListening
-					vadDetector.Pop() // Clear the trigger segment
-					recognizer.Reset(asrStream)
+					// Clear VAD segments - they were just for start detection
+					for !vadDetector.IsEmpty() {
+						vadDetector.Pop()
+					}
+					sessionText = ""
+					lastText = ""
 					return
 				}
 			}
@@ -417,8 +433,11 @@ func main() {
 					workerChan <- Task{Text: sessionText}
 					state = StateWakeWord
 					sessionText = ""
+					recognizer.Reset(asrStream)
+					lastText = ""
 					return
 				}
+
 			}
 		}
 	}
