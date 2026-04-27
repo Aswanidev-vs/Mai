@@ -122,6 +122,11 @@ type Config struct {
 		AutoStart    bool   `yaml:"auto_start"`
 		SystemPrompt string `yaml:"system_prompt"`
 	} `yaml:"llm"`
+	Vision struct {
+		Enabled bool   `yaml:"enabled"`
+		Model   string `yaml:"model"`
+		URL     string `yaml:"url"`
+	} `yaml:"vision"`
 }
 
 func main() {
@@ -307,7 +312,7 @@ func main() {
 	}()
 
 	// Initialize automation system
-	auto := NewAutomation()
+	auto := NewAutomation(cfg.Vision.Model, cfg.Vision.URL, cfg.Vision.Enabled)
 	executor := NewActionExecutor(auto)
 	log.Println("[AUTO] Automation system ready")
 

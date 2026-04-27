@@ -14,16 +14,19 @@ import (
 	"github.com/go-vgo/robotgo"
 )
 
-// Automation provides system and UI automation primitives using RobotGo.
 type Automation struct {
 	// defaultDelay is the pause between automation steps to let UI catch up.
-	defaultDelay time.Duration
+	defaultDelay  time.Duration
+	vision        *Vision
+	visionEnabled bool
 }
 
 // NewAutomation creates a new Automation instance with sensible defaults.
-func NewAutomation() *Automation {
+func NewAutomation(visionModel, visionURL string, visionEnabled bool) *Automation {
 	return &Automation{
-		defaultDelay: 500 * time.Millisecond,
+		defaultDelay:  500 * time.Millisecond,
+		vision:        NewVision(visionModel, visionURL),
+		visionEnabled: visionEnabled,
 	}
 }
 
@@ -34,10 +37,10 @@ func (a *Automation) SetDelay(d time.Duration) {
 
 // appInfo holds launch metadata for a known application.
 type appInfo struct {
-	exeName       string   // Executable name for direct launch
-	windowTitle   string   // Window title keyword for verification
-	protocol      string   // Protocol URI (e.g., "ms-settings:") for UWP apps
-	altTitles     []string // Alternative window title fragments
+	exeName     string   // Executable name for direct launch
+	windowTitle string   // Window title keyword for verification
+	protocol    string   // Protocol URI (e.g., "ms-settings:") for UWP apps
+	altTitles   []string // Alternative window title fragments
 }
 
 // knownApps maps common names to their launch metadata.
@@ -477,11 +480,11 @@ func (a *Automation) SendMessage(app, contact, text string) error {
 
 			robotgo.KeyTap("f", "ctrl")
 			time.Sleep(500 * time.Millisecond)
-			
+
 			// Type contact name
 			robotgo.TypeStr(contact)
 			time.Sleep(1000 * time.Millisecond) // Wait for search results
-			
+
 			// Press Enter to select the first result
 			robotgo.KeyTap("enter")
 			time.Sleep(800 * time.Millisecond) // Wait for chat to open
@@ -522,16 +525,16 @@ func (a *Automation) GetScreenSize() (width, height int) {
 	return robotgo.GetScreenSize()
 }
 
-// TakeScreenshot captures the entire screen and returns it as bytes (PNG).
-func (a *Automation) TakeScreenshot() ([]byte, error) {
-	log.Println("[AUTO] Taking screenshot")
-	img := robotgo.CaptureScreen()
-	if img == nil {
-		return nil, fmt.Errorf("failed to capture screen")
-	}
-	// robotgo.CaptureScreen returns a bitmap; we'd need to encode to PNG
-	// For now, return nil - full implementation would use image encoding
-	return nil, fmt.Errorf("screenshot encoding not yet implemented")
+// Scroll performs a mouse scroll. positive = up, negative = down.
+func (a *Automation) Scroll(amount int) {
+	log.Printf("[AUTO] Scrolling: %d", amount)
+	robotgo.Scroll(0, amount)
+}
+
+// TakeScreenshot captures the entire screen and saves it to a file.
+func (a *Automation) TakeScreenshot(filename string) error {
+	log.Printf("[AUTO] Taking screenshot: %s", filename)
+	return robotgo.SaveCapture(filename)
 }
 
 // CloseApp attempts to close an application by window title.
@@ -627,24 +630,44 @@ func (a *Automation) PlayMedia(platform, query, browser string) error {
 			return err
 		}
 
-		// Wait for browser to open and load (increased for reliability)
+		// Wait for browser to open and load
 		time.Sleep(5 * time.Second)
 
-		// Try to ensure the window is focused
-		// We use a broad check for "YouTube" or the browser name
+		// Vision-Assisted Detection of "Shorts" (only if enabled)
+		if a.vision != nil && a.visionEnabled {
+			log.Println("[AUTO] Checking for Shorts shelf using vision...")
+			tmpFile := "temp_screen.png"
+			if err := a.TakeScreenshot(tmpFile); err == nil {
+				// If we find the word "Shorts", it usually means the shelf is at the top
+				// Using FindElement for specific text detection
+				if _, _, err := a.vision.FindElement(tmpFile, "Shorts"); err == nil {
+					log.Println("[AUTO] Shorts detected! Scrolling down to find real videos...")
+					a.Scroll(-800) // Scroll down (negative on most systems for down)
+					time.Sleep(1500 * time.Millisecond)
+				}
+			}
+		}
+
+		// Fallback to Keyboard Heuristic
+		log.Println("[AUTO] Playing video via keyboard heuristic.")
 		kw := "YouTube"
 		if browser != "" {
 			kw = browser
 		}
-		
+
 		// Focus the window to ensure keys go to the browser
-		robotgo.ActiveName(kw) 
+		robotgo.ActiveName(kw)
 		time.Sleep(500 * time.Millisecond)
 
-		// Heuristic: On YouTube results page, Tab focuses the first video, Enter plays it
-		log.Printf("[AUTO] Sending play command to YouTube...")
-		robotgo.KeyTap("tab")
+		// Deeper Jump: Esc to clear, PageDown to skip shorts, 9 Tabs to reach video
+		log.Printf("[AUTO] Sending deep-jump play sequence...")
+		robotgo.KeyTap("esc")
 		time.Sleep(200 * time.Millisecond)
+
+		for i := 0; i < 13; i++ {
+			robotgo.KeyTap("tab")
+			time.Sleep(50 * time.Millisecond)
+		}
 		robotgo.KeyTap("enter")
 		return nil
 	}
@@ -672,7 +695,7 @@ func (a *Automation) OpenURL(urlStr, browser string) error {
 		if fullPath := a.findExecutablePath(exeName); fullPath != "" {
 			exeName = fullPath
 		}
-		
+
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
 			// Use start to launch the browser with the URL
