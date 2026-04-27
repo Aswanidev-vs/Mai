@@ -63,6 +63,9 @@ type Config struct {
 		Decoder                 string  `yaml:"decoder"`
 		Joiner                  string  `yaml:"joiner"`
 		Tokens                  string  `yaml:"tokens"`
+		ConvFrontend            string  `yaml:"conv_frontend"`
+		Tokenizer               string  `yaml:"tokenizer"`
+		Language                string  `yaml:"language"`
 		DecodingMethod          string  `yaml:"decoding_method"`
 		MaxActivePaths          int     `yaml:"max_active_paths"`
 		EnableEndpoint          int     `yaml:"enable_endpoint"`
@@ -198,42 +201,64 @@ func main() {
 	log.Println("[VAD] Voice activity detector ready")
 
 	// 3. Initialize ASR
-	asrConfig := sherpa.OnlineRecognizerConfig{}
-	asrConfig.FeatConfig = sherpa.FeatureConfig{SampleRate: 16000, FeatureDim: 80}
+	var recognizer *sherpa.OnlineRecognizer
+	var offlineRecognizer *sherpa.OfflineRecognizer
+	var asrStream *sherpa.OnlineStream
 
-	if cfg.ASR.Type == "nemo" {
-		asrConfig.ModelConfig.NemoCtc.Model = join(cfg.ASR.ModelDir, cfg.ASR.Encoder)
-		asrConfig.ModelConfig.Tokens = join(cfg.ASR.ModelDir, cfg.ASR.Tokens)
+	if cfg.ASR.Type == "qwen3" {
+		offlineConfig := sherpa.OfflineRecognizerConfig{}
+		offlineConfig.FeatConfig = sherpa.FeatureConfig{SampleRate: 16000, FeatureDim: 80}
+		offlineConfig.ModelConfig.Qwen3ASR.ConvFrontend = join(cfg.ASR.ModelDir, cfg.ASR.ConvFrontend)
+		offlineConfig.ModelConfig.Qwen3ASR.Encoder = join(cfg.ASR.ModelDir, cfg.ASR.Encoder)
+		offlineConfig.ModelConfig.Qwen3ASR.Decoder = join(cfg.ASR.ModelDir, cfg.ASR.Decoder)
+		offlineConfig.ModelConfig.Qwen3ASR.Tokenizer = join(cfg.ASR.ModelDir, cfg.ASR.Tokenizer)
+		offlineConfig.ModelConfig.NumThreads = cfg.ASR.NumThreads
+		offlineConfig.ModelConfig.Provider = "cpu"
+		offlineConfig.DecodingMethod = "greedy_search"
+
+		offlineRecognizer = sherpa.NewOfflineRecognizer(&offlineConfig)
+		if offlineRecognizer == nil {
+			log.Fatal("Failed to create Offline ASR recognizer")
+		}
+		defer sherpa.DeleteOfflineRecognizer(offlineRecognizer)
+		log.Println("[ASR] Offline Qwen3 recognizer ready")
 	} else {
-		// Default to Transducer (Zipformer)
-		asrConfig.ModelConfig.Transducer.Encoder = join(cfg.ASR.ModelDir, cfg.ASR.Encoder)
-		asrConfig.ModelConfig.Transducer.Decoder = join(cfg.ASR.ModelDir, cfg.ASR.Decoder)
-		asrConfig.ModelConfig.Transducer.Joiner = join(cfg.ASR.ModelDir, cfg.ASR.Joiner)
-		asrConfig.ModelConfig.Tokens = join(cfg.ASR.ModelDir, cfg.ASR.Tokens)
+		asrConfig := sherpa.OnlineRecognizerConfig{}
+		asrConfig.FeatConfig = sherpa.FeatureConfig{SampleRate: 16000, FeatureDim: 80}
+
+		if cfg.ASR.Type == "nemo" {
+			asrConfig.ModelConfig.NemoCtc.Model = join(cfg.ASR.ModelDir, cfg.ASR.Encoder)
+			asrConfig.ModelConfig.Tokens = join(cfg.ASR.ModelDir, cfg.ASR.Tokens)
+		} else {
+			// Default to Transducer (Zipformer)
+			asrConfig.ModelConfig.Transducer.Encoder = join(cfg.ASR.ModelDir, cfg.ASR.Encoder)
+			asrConfig.ModelConfig.Transducer.Decoder = join(cfg.ASR.ModelDir, cfg.ASR.Decoder)
+			asrConfig.ModelConfig.Transducer.Joiner = join(cfg.ASR.ModelDir, cfg.ASR.Joiner)
+			asrConfig.ModelConfig.Tokens = join(cfg.ASR.ModelDir, cfg.ASR.Tokens)
+		}
+
+		asrConfig.ModelConfig.NumThreads = cfg.ASR.NumThreads
+		asrConfig.ModelConfig.Provider = "cpu"
+		asrConfig.DecodingMethod = cfg.ASR.DecodingMethod
+		asrConfig.MaxActivePaths = cfg.ASR.MaxActivePaths
+		asrConfig.EnableEndpoint = cfg.ASR.EnableEndpoint
+		asrConfig.Rule1MinTrailingSilence = cfg.ASR.Rule1MinTrailingSilence
+		asrConfig.Rule2MinTrailingSilence = cfg.ASR.Rule2MinTrailingSilence
+		asrConfig.Rule3MinUtteranceLength = cfg.ASR.Rule3MinUtteranceLength
+
+		recognizer = sherpa.NewOnlineRecognizer(&asrConfig)
+		if recognizer == nil {
+			log.Fatal("Failed to create ASR recognizer")
+		}
+		defer sherpa.DeleteOnlineRecognizer(recognizer)
+
+		asrStream = sherpa.NewOnlineStream(recognizer)
+		if asrStream == nil {
+			log.Fatal("Failed to create ASR stream")
+		}
+		defer sherpa.DeleteOnlineStream(asrStream)
+		log.Println("[ASR] Streaming recognizer ready")
 	}
-
-	asrConfig.ModelConfig.NumThreads = cfg.ASR.NumThreads
-	asrConfig.ModelConfig.Provider = "cpu"
-	asrConfig.DecodingMethod = cfg.ASR.DecodingMethod
-	asrConfig.MaxActivePaths = cfg.ASR.MaxActivePaths
-	asrConfig.EnableEndpoint = cfg.ASR.EnableEndpoint
-	asrConfig.Rule1MinTrailingSilence = cfg.ASR.Rule1MinTrailingSilence
-	asrConfig.Rule2MinTrailingSilence = cfg.ASR.Rule2MinTrailingSilence
-	asrConfig.Rule3MinUtteranceLength = cfg.ASR.Rule3MinUtteranceLength
-
-	recognizer := sherpa.NewOnlineRecognizer(&asrConfig)
-	if recognizer == nil {
-		log.Fatal("Failed to create ASR recognizer")
-	}
-	defer sherpa.DeleteOnlineRecognizer(recognizer)
-
-	asrStream := sherpa.NewOnlineStream(recognizer)
-	if asrStream == nil {
-		log.Fatal("Failed to create ASR stream")
-	}
-	defer sherpa.DeleteOnlineStream(asrStream)
-
-	log.Println("[ASR] Streaming recognizer ready")
 
 	// 4. Initialize TTS
 	ttsConfig := sherpa.OfflineTtsConfig{}
@@ -290,6 +315,7 @@ func main() {
 
 	var isSpeaking bool
 	var lastResponseTime time.Time
+	var sessionSamples []float32
 	capture := newAudioCapture(16000, 1)
 	defer capture.Close()
 
@@ -372,8 +398,10 @@ func main() {
 		case StateWakeWord:
 			// If in follow-up window, allow VAD to trigger listening
 			if time.Since(lastResponseTime) < 10*time.Second {
-				// Feed to ASR continuously so we capture what the user says
-				asrStream.AcceptWaveform(16000, samples)
+				// Feed to ASR continuously if streaming
+				if asrStream != nil {
+					asrStream.AcceptWaveform(16000, samples)
+				}
 
 				// Feed to VAD buffer for speech detection
 				vadBuffer.Push(samples)
@@ -394,11 +422,24 @@ func main() {
 					}
 					sessionText = ""
 					lastText = ""
+					sessionSamples = nil
+					if recognizer != nil {
+						recognizer.Reset(asrStream)
+					}
 					return
 				}
 			}
 
+			// Feed to Keyword Spotter
 			kwsStream.AcceptWaveform(16000, samples)
+
+			if asrStream != nil {
+				asrStream.AcceptWaveform(16000, samples)
+			} else {
+				// For offline models, we still want to keep track of the audio 
+				// if we might be in a follow-up window.
+				// However, we don't buffer HERE yet, because we haven't switched to StateListening.
+			}
 
 			// Volume check (RMS)
 			var sum float32
@@ -421,8 +462,11 @@ func main() {
 					log.Println("\n[WAKE] Detected! Listening...")
 					state = StateListening
 					sessionText = "" // Reset session text
+					sessionSamples = nil
 					vadBuffer = sherpa.NewCircularBuffer(10 * 16000)
-					recognizer.Reset(asrStream)
+					if recognizer != nil {
+						recognizer.Reset(asrStream)
+					}
 					lastText = ""
 					return
 				}
@@ -439,14 +483,20 @@ func main() {
 			}
 
 			// Feed to ASR
-			asrStream.AcceptWaveform(16000, samples)
-			for recognizer.IsReady(asrStream) {
-				recognizer.Decode(asrStream)
-			}
-			text := recognizer.GetResult(asrStream).Text
-			if text != "" && text != lastText {
-				lastText = text
-				fmt.Printf("\r[ASR] Live: %s%s", sessionText, text)
+			if asrStream != nil {
+				asrStream.AcceptWaveform(16000, samples)
+				for recognizer.IsReady(asrStream) {
+					recognizer.Decode(asrStream)
+				}
+				text := recognizer.GetResult(asrStream).Text
+				if text != "" && text != lastText {
+					lastText = text
+					fmt.Printf("\r[ASR] Live: %s%s", sessionText, text)
+				}
+			} else {
+				// Offline ASR - buffer audio samples
+				sessionSamples = append(sessionSamples, samples...)
+				fmt.Printf("\r[ASR] Listening... (buffered %d samples)", len(sessionSamples))
 			}
 
 			// Check VAD for speech end
@@ -454,8 +504,24 @@ func main() {
 				vadDetector.Pop()
 
 				// When a segment ends, add it to our session buffer
-				if text != "" {
-					sessionText += text + " "
+				if asrStream != nil {
+					text := recognizer.GetResult(asrStream).Text
+					if text != "" {
+						sessionText += text + " "
+					}
+				} else if offlineRecognizer != nil {
+					// Process full buffer with Offline ASR
+					log.Println("\n[ASR] Processing segment with Offline Qwen3...")
+					offlineStream := sherpa.NewOfflineStream(offlineRecognizer)
+					if cfg.ASR.Language != "" {
+						offlineStream.SetOption("language", cfg.ASR.Language)
+					}
+					offlineStream.AcceptWaveform(16000, sessionSamples)
+					offlineRecognizer.Decode(offlineStream)
+					result := offlineStream.GetResult()
+					sessionText = result.Text
+					sherpa.DeleteOfflineStream(offlineStream)
+					sessionSamples = nil // Clear buffer
 				}
 
 				log.Println("\n[VAD] End of segment detected.")
@@ -465,7 +531,9 @@ func main() {
 					workerChan <- Task{Text: sessionText}
 					state = StateWakeWord
 					sessionText = ""
-					recognizer.Reset(asrStream)
+					if recognizer != nil {
+						recognizer.Reset(asrStream)
+					}
 					lastText = ""
 					return
 				}
