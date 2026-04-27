@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -280,7 +281,13 @@ func main() {
 		}
 	}()
 
+	// Initialize automation system
+	auto := NewAutomation()
+	executor := NewActionExecutor(auto)
+	log.Println("[AUTO] Automation system ready")
+
 	// 5. Initialize audio capture
+
 	var isSpeaking bool
 	var lastResponseTime time.Time
 	capture := newAudioCapture(16000, 1)
@@ -288,22 +295,47 @@ func main() {
 
 	log.Println("[AUDIO] Capture initialized")
 
-	// 6. Pipeline Worker (LLM + TTS)
+	// 6. Pipeline Worker (LLM + TTS + Actions)
 	type Task struct {
 		Text string
 	}
 	workerChan := make(chan Task, 10)
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for task := range workerChan {
 			isSpeaking = true // Pause ASR while thinking and talking
 			log.Printf("[LLM] Thinking about: %s", task.Text)
 
-			response, err := generateOllamaResponse(cfg, task.Text)
-			if err != nil {
-				log.Printf("[LLM] Error: %v", err)
-				isSpeaking = false
-				continue
+			// Try to parse and execute automation action
+			executed, feedback, actionErr := executor.ParseAndExecute(task.Text)
+			if actionErr != nil {
+				log.Printf("[ACTION] Error executing action: %v", actionErr)
 			}
+
+			var response string
+			var err error
+
+			if executed {
+				// Action was executed - ask LLM for natural response with context
+				log.Printf("[ACTION] Executed: %s", feedback)
+				prompt := fmt.Sprintf("User said: %q. I just did this: %s. Respond very briefly and naturally (1 sentence).", task.Text, feedback)
+				response, err = generateOllamaResponse(cfg, prompt)
+				if err != nil {
+					log.Printf("[LLM] Error generating contextual response: %v", err)
+					response = feedback // Fallback to simple feedback
+				}
+			} else {
+				// No action detected - normal LLM flow
+				response, err = generateOllamaResponse(cfg, task.Text)
+				if err != nil {
+					log.Printf("[LLM] Error: %v", err)
+					isSpeaking = false
+					continue
+				}
+			}
+
 			log.Printf("[LLM] Response received. Starting TTS...")
 
 			// TTS
@@ -453,8 +485,10 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-
 	log.Println("\nShutting down...")
+	capture.Stop()
+	close(workerChan)
+	wg.Wait()
 }
 
 // startOllama starts the ollama serve process and returns a function to kill it.
