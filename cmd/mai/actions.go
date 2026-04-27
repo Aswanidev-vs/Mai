@@ -82,12 +82,26 @@ func NewActionParser() *ActionParser {
 				confidence: 0.95,
 			},
 
-			// Send message: "send hello to whatsapp", "message john hello"
+			// Send message to contact on app: "send hello to john on whatsapp", "sent hello to john on whatsapp"
 			{
-				pattern:    regexp.MustCompile(`(?i)^send\s+(.+?)\s+to\s+(.+)$`),
+				pattern:    regexp.MustCompile(`(?i)^(?:send|sent|message|messaged)\s+(.+?)\s+to\s+(.+?)\s+on\s+(.+)$`),
+				actionType: ActionSendMsg,
+				paramKeys:  []string{"text", "contact", "app"},
+				confidence: 0.95,
+			},
+			// Alternative: "message john on whatsapp hello"
+			{
+				pattern:    regexp.MustCompile(`(?i)^(?:message|messaged)\s+(.+?)\s+on\s+(.+?)\s+(.+)$`),
+				actionType: ActionSendMsg,
+				paramKeys:  []string{"contact", "app", "text"},
+				confidence: 0.90,
+			},
+			// Simple send: "send hello to whatsapp", "message telegram hello"
+			{
+				pattern:    regexp.MustCompile(`(?i)^(?:send|sent|message|messaged)\s+(.+?)\s+to\s+(.+)$`),
 				actionType: ActionSendMsg,
 				paramKeys:  []string{"text", "app"},
-				confidence: 0.90,
+				confidence: 0.85,
 			},
 			// Alternative send: "message whatsapp hello world"
 			{
@@ -125,6 +139,8 @@ func NewActionParser() *ActionParser {
 func (p *ActionParser) Parse(text string) Action {
 	text = strings.TrimSpace(text)
 	text = strings.ToLower(text)
+	text = strings.TrimSuffix(text, ".") // Remove trailing period from ASR
+	text = strings.TrimSuffix(text, "?")
 
 	for _, rule := range p.rules {
 		matches := rule.pattern.FindStringSubmatch(text)
@@ -406,11 +422,17 @@ func (e *ActionExecutor) Execute(action Action) (string, error) {
 	case ActionSendMsg:
 		app, ok1 := action.Params["app"].(string)
 		text, ok2 := action.Params["text"].(string)
+		contact, _ := action.Params["contact"].(string) // Optional contact
 		if !ok1 || !ok2 {
 			return "", fmt.Errorf("missing app or text")
 		}
-		if err := e.auto.SendMessage(app, text); err != nil {
+		// Fuzzy match app name
+		app = fuzzyMatchAppName(app)
+		if err := e.auto.SendMessage(app, contact, text); err != nil {
 			return "", err
+		}
+		if contact != "" {
+			return fmt.Sprintf("Sent message to %s on %s.", contact, app), nil
 		}
 		return fmt.Sprintf("Sent message to %s.", app), nil
 

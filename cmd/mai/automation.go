@@ -418,6 +418,15 @@ func (a *Automation) PressKey(keyCombo string) error {
 		// Last part is the main key, rest are modifiers
 		mainKey := parts[len(parts)-1]
 		modifiers := parts[:len(parts)-1]
+		// Normalize modifiers
+		for i, mod := range modifiers {
+			mod = strings.ToLower(strings.TrimSpace(mod))
+			if mod == "control" {
+				modifiers[i] = "ctrl"
+			} else {
+				modifiers[i] = mod
+			}
+		}
 		robotgo.KeyTap(mainKey, modifiers)
 	}
 
@@ -439,26 +448,48 @@ func (a *Automation) FocusWindow(title string) error {
 	return nil
 }
 
-// SendMessage automates sending a message in a text-based UI.
-// It focuses the app window, types the text, and presses Enter.
-func (a *Automation) SendMessage(app, text string) error {
-	log.Printf("[AUTO] Sending message to %s: %q", app, text)
+// SendMessage automates sending a message in a specific messaging app.
+// If a contact is provided, it attempts to search for that contact first.
+func (a *Automation) SendMessage(app, contact, text string) error {
+	log.Printf("[AUTO] Sending message on %s to %q: %q", app, contact, text)
+	appLower := strings.ToLower(app)
 
-	// Try to focus the app window
-	if err := a.FocusWindow(app); err != nil {
-		log.Printf("[AUTO] Could not focus %s, continuing anyway: %v", app, err)
-		// Don't fail - user might already have the window focused
+	// Step 1: Ensure app is open and focused
+	if err := a.OpenApp(app); err != nil {
+		return fmt.Errorf("could not open %s: %v", app, err)
+	}
+	time.Sleep(1 * time.Second) // Give it time to fully come to foreground
+
+	// Step 2: If a contact is specified, search for them
+	if contact != "" {
+		log.Printf("[AUTO] Searching for contact: %s", contact)
+		// Most messaging apps (WhatsApp, Telegram, Discord) use Ctrl+F or Ctrl+N for search
+		if appLower == "whatsapp" || appLower == "telegram" || appLower == "discord" {
+			// Ensure we are focused on the app
+			a.FocusWindow(app)
+			time.Sleep(200 * time.Millisecond)
+
+			robotgo.KeyTap("f", "ctrl")
+			time.Sleep(500 * time.Millisecond)
+			
+			// Type contact name
+			robotgo.TypeStr(contact)
+			time.Sleep(1000 * time.Millisecond) // Wait for search results
+			
+			// Press Enter to select the first result
+			robotgo.KeyTap("enter")
+			time.Sleep(800 * time.Millisecond) // Wait for chat to open
+		}
 	}
 
-	// Type the message
-	if err := a.TypeText(text); err != nil {
-		return err
-	}
+	// Step 3: Type the message
+	log.Printf("[AUTO] Typing message...")
+	robotgo.TypeStr(text)
+	time.Sleep(200 * time.Millisecond)
 
-	// Press Enter to send
-	if err := a.PressKey("enter"); err != nil {
-		return err
-	}
+	// Step 4: Press Enter to send
+	robotgo.KeyTap("enter")
+	log.Printf("[AUTO] Message sent successfully")
 
 	return nil
 }
