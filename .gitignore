@@ -66,6 +66,8 @@ sherpa-onnx-streaming-zipformer-en-*/
 sherpa-onnx-supertonic-tts-*/
 sherpa-onnx-zipvoice-distill-*/
 sherpa-onnx-qwen3-asr-0.6B-int8-*/
+sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/
+
 
 # Test audio within model dirs
 test_wavs/
