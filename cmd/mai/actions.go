@@ -20,6 +20,8 @@ const (
 	ActionMouseClick ActionType = "system.mouse_click"
 	ActionMouseMove  ActionType = "system.mouse_move"
 	ActionScreenshot ActionType = "system.screenshot"
+	ActionWebSearch  ActionType = "web.search"
+	ActionPlayMedia  ActionType = "media.play"
 	ActionNone       ActionType = "none"
 )
 
@@ -48,6 +50,34 @@ type parseRule struct {
 func NewActionParser() *ActionParser {
 	return &ActionParser{
 		rules: []parseRule{
+			// Web search: "search interstellar on google", "look up weather on bing"
+			{
+				pattern:    regexp.MustCompile(`(?i)^(search|find|look\s*up)\s+(.+?)\s+(?:on|using)\s+(google|bing|yahoo|duckduckgo|youtube|wikipedia)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?`),
+				actionType: ActionWebSearch,
+				paramKeys:  []string{"_", "query", "platform", "browser"},
+				confidence: 0.95,
+			},
+			// Play media: "play interstellar on youtube", "play some music on spotify"
+			{
+				pattern:    regexp.MustCompile(`(?i)^(play|listen\s*to)\s+(.+?)\s+(?:on|using)\s+(youtube|spotify|soundcloud)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?`),
+				actionType: ActionPlayMedia,
+				paramKeys:  []string{"_", "query", "platform", "browser"},
+				confidence: 0.95,
+			},
+			// Combined: "open youtube and play interstellar"
+			{
+				pattern:    regexp.MustCompile(`(?i)^(?:open|go\s*to)\s+(youtube|spotify|soundcloud)\s+(?:and|to|for)\s+(?:play|search|find)\s+(.+?)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?$`),
+				actionType: ActionPlayMedia,
+				paramKeys:  []string{"platform", "query", "browser"},
+				confidence: 0.95,
+			},
+			// Open site: "open youtube", "go to github.com"
+			{
+				pattern:    regexp.MustCompile(`(?i)^(open|go\s*to)\s+(youtube|google|github|facebook|twitter|instagram|reddit|amazon|netflix|gmail|wikipedia)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?`),
+				actionType: ActionWebSearch,
+				paramKeys:  []string{"_", "platform", "browser"},
+				confidence: 0.90,
+			},
 			// Open application: "open chrome", "launch notepad", "start firefox"
 			// Captures 1-3 words after the command to avoid grabbing repeated commands
 			{
@@ -184,7 +214,7 @@ var knownAppNames = []string{
 	"chrome", "firefox", "edge", "notepad", "calculator",
 	"whatsapp", "telegram", "discord", "spotify", "vscode",
 	"terminal", "explorer", "cmd", "word", "excel", "powerpoint",
-	"settings", "photos", "mail", "store", "paint",
+	"settings", "photos", "mail", "store", "paint", "brave",
 }
 
 // phoneticAliases maps common ASR misrecognitions to the correct app name.
@@ -470,6 +500,33 @@ func (e *ActionExecutor) Execute(action Action) (string, error) {
 			return "", err
 		}
 		return "Screenshot taken.", nil
+
+	case ActionWebSearch:
+		platform, _ := action.Params["platform"].(string)
+		query, _ := action.Params["query"].(string)
+		browser, _ := action.Params["browser"].(string)
+		if platform == "" {
+			return "", fmt.Errorf("missing platform")
+		}
+		if err := e.auto.WebSearch(platform, query, browser); err != nil {
+			return "", err
+		}
+		if query != "" {
+			return fmt.Sprintf("Searching for %s on %s.", query, platform), nil
+		}
+		return fmt.Sprintf("Opened %s.", platform), nil
+
+	case ActionPlayMedia:
+		platform, _ := action.Params["platform"].(string)
+		query, _ := action.Params["query"].(string)
+		browser, _ := action.Params["browser"].(string)
+		if platform == "" || query == "" {
+			return "", fmt.Errorf("missing platform or query")
+		}
+		if err := e.auto.PlayMedia(platform, query, browser); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Playing %s on %s.", query, platform), nil
 
 	default:
 		return "", fmt.Errorf("unknown action type: %s", action.Type)

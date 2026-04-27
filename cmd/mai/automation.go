@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,6 +44,7 @@ type appInfo struct {
 var knownApps = map[string]appInfo{
 	"chrome":        {exeName: "chrome", windowTitle: "Google Chrome"},
 	"google chrome": {exeName: "chrome", windowTitle: "Google Chrome"},
+	"brave":         {exeName: "brave", windowTitle: "Brave"},
 	"firefox":       {exeName: "firefox", windowTitle: "Firefox"},
 	"edge":          {exeName: "msedge", windowTitle: "Microsoft Edge"},
 	"notepad":       {exeName: "notepad", windowTitle: "Notepad"},
@@ -182,10 +184,7 @@ func (a *Automation) OpenApp(name string) error {
 func (a *Automation) tryDirectOpen(exePath string) error {
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmdPath := `C:\Windows\System32\cmd.exe`
-		if _, err := os.Stat(cmdPath); os.IsNotExist(err) {
-			cmdPath = `C:\WINDOWS\system32\cmd.exe`
-		}
+		cmdPath := a.getCmdPath()
 		// Use start command for non-.exe paths (like UWP apps)
 		if !strings.HasSuffix(strings.ToLower(exePath), ".exe") && !strings.Contains(exePath, `\`) {
 			cmd = exec.Command(cmdPath, "/c", "start", "", exePath)
@@ -263,6 +262,13 @@ func (a *Automation) findExecutablePath(name string) string {
 		}
 
 		// Only add app-specific hardcoded paths when searching for that app
+		if nameLower == "brave" {
+			candidates = append(candidates,
+				filepath.Join(programFiles, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+				filepath.Join(programFilesX86, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+				filepath.Join(localAppData, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+			)
+		}
 		if nameLower == "telegram" {
 			candidates = append(candidates,
 				filepath.Join(localAppData, "Telegram Desktop", "Telegram.exe"),
@@ -542,4 +548,169 @@ func (a *Automation) CloseApp(title string) error {
 // Wait pauses execution for the default delay duration.
 func (a *Automation) Wait() {
 	time.Sleep(a.defaultDelay)
+}
+
+// WebSearch opens a platform-specific search or site.
+func (a *Automation) WebSearch(platform, query, browser string) error {
+	platform = strings.ToLower(platform)
+	var urlStr string
+
+	switch platform {
+	case "google":
+		if query != "" {
+			urlStr = "https://www.google.com/search?q=" + url.QueryEscape(query)
+		} else {
+			urlStr = "https://www.google.com"
+		}
+	case "youtube":
+		if query != "" {
+			urlStr = "https://www.youtube.com/results?search_query=" + url.QueryEscape(query)
+		} else {
+			urlStr = "https://www.youtube.com"
+		}
+	case "bing":
+		if query != "" {
+			urlStr = "https://www.bing.com/search?q=" + url.QueryEscape(query)
+		} else {
+			urlStr = "https://www.bing.com"
+		}
+	case "github":
+		if query != "" {
+			urlStr = "https://github.com/search?q=" + url.QueryEscape(query)
+		} else {
+			urlStr = "https://github.com"
+		}
+	case "wikipedia":
+		if query != "" {
+			urlStr = "https://en.wikipedia.org/wiki/Special:Search?search=" + url.QueryEscape(query)
+		} else {
+			urlStr = "https://en.wikipedia.org"
+		}
+	case "spotify":
+		if query != "" {
+			urlStr = "https://open.spotify.com/search/" + url.QueryEscape(query)
+		} else {
+			urlStr = "https://open.spotify.com"
+		}
+	case "soundcloud":
+		if query != "" {
+			urlStr = "https://soundcloud.com/search?q=" + url.QueryEscape(query)
+		} else {
+			urlStr = "https://soundcloud.com"
+		}
+	default:
+		// If it looks like a domain, open it directly
+		if strings.Contains(platform, ".") {
+			urlStr = "https://" + platform
+			if query != "" {
+				urlStr += "/search?q=" + url.QueryEscape(query)
+			}
+		} else {
+			// Fallback to Google search
+			urlStr = "https://www.google.com/search?q=" + url.QueryEscape(platform+" "+query)
+		}
+	}
+
+	return a.OpenURL(urlStr, browser)
+}
+
+// PlayMedia attempts to play content on a specific platform.
+func (a *Automation) PlayMedia(platform, query, browser string) error {
+	log.Printf("[AUTO] Playing %q on %s", query, platform)
+	platform = strings.ToLower(platform)
+
+	if platform == "youtube" {
+		// Use a 'video only' filter (&sp=EgIQAQ%253D%253D) to make the first result a video
+		urlStr := "https://www.youtube.com/results?search_query=" + url.QueryEscape(query) + "&sp=EgIQAQ%253D%253D"
+		err := a.OpenURL(urlStr, browser)
+		if err != nil {
+			return err
+		}
+
+		// Wait for browser to open and load (increased for reliability)
+		time.Sleep(5 * time.Second)
+
+		// Try to ensure the window is focused
+		// We use a broad check for "YouTube" or the browser name
+		kw := "YouTube"
+		if browser != "" {
+			kw = browser
+		}
+		
+		// Focus the window to ensure keys go to the browser
+		robotgo.ActiveName(kw) 
+		time.Sleep(500 * time.Millisecond)
+
+		// Heuristic: On YouTube results page, Tab focuses the first video, Enter plays it
+		log.Printf("[AUTO] Sending play command to YouTube...")
+		robotgo.KeyTap("tab")
+		time.Sleep(200 * time.Millisecond)
+		robotgo.KeyTap("enter")
+		return nil
+	}
+
+	// Fallback to regular search for other platforms
+	return a.WebSearch(platform, query, browser)
+}
+
+// OpenURL opens a URL in a specific browser or the default one.
+func (a *Automation) OpenURL(urlStr, browser string) error {
+	browser = strings.ToLower(strings.TrimSpace(browser))
+	exeName := ""
+
+	if browser != "" {
+		if info, ok := knownApps[browser]; ok {
+			exeName = info.exeName
+		} else {
+			exeName = browser
+		}
+	}
+
+	if exeName != "" {
+		log.Printf("[AUTO] Opening URL in %s: %s", exeName, urlStr)
+		// Check if we can find the full path for the browser
+		if fullPath := a.findExecutablePath(exeName); fullPath != "" {
+			exeName = fullPath
+		}
+		
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			// Use start to launch the browser with the URL
+			cmd = exec.Command(a.getCmdPath(), "/c", "start", "", exeName, urlStr)
+		} else {
+			cmd = exec.Command(exeName, urlStr)
+		}
+		return cmd.Start()
+	}
+
+	// Default browser
+	log.Printf("[AUTO] Opening URL in default browser: %s", urlStr)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command(a.getCmdPath(), "/c", "start", "", urlStr)
+	} else if runtime.GOOS == "darwin" {
+		cmd = exec.Command("open", urlStr)
+	} else {
+		cmd = exec.Command("xdg-open", urlStr)
+	}
+	return cmd.Start()
+}
+
+// getCmdPath returns the full path to cmd.exe on Windows.
+func (a *Automation) getCmdPath() string {
+	if runtime.GOOS != "windows" {
+		return "sh"
+	}
+	// Try standard locations
+	paths := []string{
+		`C:\Windows\System32\cmd.exe`,
+		`C:\WINDOWS\system32\cmd.exe`,
+		filepath.Join(os.Getenv("SystemRoot"), "System32", "cmd.exe"),
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "cmd" // Fallback to PATH
 }
