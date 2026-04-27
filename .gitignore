@@ -65,6 +65,7 @@ sherpa-onnx-pocket-tts-*/
 sherpa-onnx-streaming-zipformer-en-*/
 sherpa-onnx-supertonic-tts-*/
 sherpa-onnx-zipvoice-distill-*/
+sherpa-onnx-qwen3-asr-0.6B-int8-*/
 
 # Test audio within model dirs
 test_wavs/
