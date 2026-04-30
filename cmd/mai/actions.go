@@ -495,11 +495,10 @@ func (e *ActionExecutor) Execute(action Action) (string, error) {
 		return fmt.Sprintf("Moved mouse to %s, %s.", x, y), nil
 
 	case ActionScreenshot:
-		_, err := e.auto.TakeScreenshot()
-		if err != nil {
+		if err := e.auto.TakeScreenshot("screen.png"); err != nil {
 			return "", err
 		}
-		return "Screenshot taken.", nil
+		return "Screenshot saved as screen.png.", nil
 
 	case ActionWebSearch:
 		platform, _ := action.Params["platform"].(string)
