@@ -119,6 +119,27 @@ func NewActionParser() *ActionParser {
 				paramKeys:  []string{"text", "contact", "app"},
 				confidence: 0.95,
 			},
+			// Flexible variation: "send a message to john on whatsapp saying hello"
+			{
+				pattern:    regexp.MustCompile(`(?i)^(?:send|message)\s+(?:a\s+)?(?:message|text)\s+to\s+(.+?)\s+on\s+(\w+)\s+(?:saying|that|says)\s+(.+)$`),
+				actionType: ActionSendMsg,
+				paramKeys:  []string{"contact", "app", "text"},
+				confidence: 0.98,
+			},
+			// New Pattern: "find john on whatsapp and tell him hello"
+			{
+				pattern:    regexp.MustCompile(`(?i)^find\s+(.+?)\s+on\s+(\w+)\s+(?:and|to)\s+(?:tell|send|message)(?:\s+him|\s+her|\s+them)?\s+(.+)$`),
+				actionType: ActionSendMsg,
+				paramKeys:  []string{"contact", "app", "text"},
+				confidence: 0.98,
+			},
+			// New Pattern: "tell john on whatsapp hello"
+			{
+				pattern:    regexp.MustCompile(`(?i)^tell\s+(.+?)\s+on\s+(\w+)\s+(.+)$`),
+				actionType: ActionSendMsg,
+				paramKeys:  []string{"contact", "app", "text"},
+				confidence: 0.98,
+			},
 			// Alternative: "message john on whatsapp hello"
 			{
 				pattern:    regexp.MustCompile(`(?i)^(?:message|messaged)\s+(.+?)\s+on\s+(.+?)\s+(.+)$`),
@@ -126,6 +147,7 @@ func NewActionParser() *ActionParser {
 				paramKeys:  []string{"contact", "app", "text"},
 				confidence: 0.90,
 			},
+
 			// Simple send: "send hello to whatsapp", "message telegram hello"
 			{
 				pattern:    regexp.MustCompile(`(?i)^(?:send|sent|message|messaged)\s+(.+?)\s+to\s+(.+)$`),
@@ -199,6 +221,66 @@ func (p *ActionParser) Parse(text string) Action {
 	return Action{Type: ActionNone, Confidence: 0.0}
 }
 
+// ParseFromAnywhere searches for action patterns anywhere in the text.
+// It tries each sentence/phrase independently, since ASR may concatenate
+// TTS output with the user's actual command.
+func (p *ActionParser) ParseFromAnywhere(text string) Action {
+	// 1. Try the normal anchored parse first (fast path)
+	action := p.Parse(text)
+	if action.Type != ActionNone {
+		return action
+	}
+
+	// 2. Split into sentences and try each one
+	// Use multiple delimiters: . ? !
+	sentences := splitSentences(text)
+
+	// Try from last to first — commands are typically at the end
+	for i := len(sentences) - 1; i >= 0; i-- {
+		action = p.Parse(sentences[i])
+		if action.Type != ActionNone {
+			return action
+		}
+	}
+
+	return Action{Type: ActionNone, Confidence: 0.0}
+}
+
+// splitSentences splits text into sentence-like chunks.
+func splitSentences(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+
+	// Split on sentence terminators and common command conjunctions
+	var sentences []string
+	
+	// First split by punctuation
+	parts := strings.FieldsFunc(text, func(r rune) bool {
+		return r == '.' || r == '?' || r == '!' || r == ';'
+	})
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		
+		// Sub-split by common conjunctions like " and " or " then " 
+		// which often separate multiple commands in a single ASR stream.
+		subParts := strings.Split(part, " and ")
+		for _, sp := range subParts {
+			sp = strings.TrimSpace(sp)
+			if sp != "" {
+				sentences = append(sentences, sp)
+			}
+		}
+	}
+
+	return sentences
+}
+
 // isDestructive returns true if the action could cause data loss or system changes.
 func isDestructive(actionType ActionType) bool {
 	switch actionType {
@@ -221,45 +303,45 @@ var knownAppNames = []string{
 // This is especially important for Indian English accents and similar variations.
 var phoneticAliases = map[string]string{
 	// WhatsApp variations
-	"whats up":    "whatsapp",
-	"what's up":   "whatsapp",
-	"whats app":   "whatsapp",
-	"what sap":    "whatsapp",
-	"what's app":  "whatsapp",
-	"watsapp":     "whatsapp",
-	"wats up":     "whatsapp",
-	"whatapp":     "whatsapp",
-	"whatsap":     "whatsapp",
+	"whats up":   "whatsapp",
+	"what's up":  "whatsapp",
+	"whats app":  "whatsapp",
+	"what sap":   "whatsapp",
+	"what's app": "whatsapp",
+	"watsapp":    "whatsapp",
+	"wats up":    "whatsapp",
+	"whatapp":    "whatsapp",
+	"whatsap":    "whatsapp",
 	// Chrome variations
-	"crome":       "chrome",
-	"krome":       "chrome",
-	"chrom":       "chrome",
-	"google":      "chrome",
+	"crome":  "chrome",
+	"krome":  "chrome",
+	"chrom":  "chrome",
+	"google": "chrome",
 	// Discord variations
-	"dis cord":    "discord",
-	"this cord":   "discord",
+	"dis cord":  "discord",
+	"this cord": "discord",
 	// Telegram variations
-	"tele gram":   "telegram",
+	"tele gram": "telegram",
 	// VSCode variations
-	"vs code":     "vscode",
-	"v s code":    "vscode",
+	"vs code":            "vscode",
+	"v s code":           "vscode",
 	"visual studio code": "vscode",
 	// Notepad variations
-	"note pad":    "notepad",
-	"not pad":     "notepad",
+	"note pad": "notepad",
+	"not pad":  "notepad",
 	// Calculator variations
-	"calc":        "calculator",
-	"calcualtor":  "calculator",
-	"calculater":  "calculator",
+	"calc":       "calculator",
+	"calcualtor": "calculator",
+	"calculater": "calculator",
 	// Explorer variations
 	"file explorer": "explorer",
-	"files":       "explorer",
+	"files":         "explorer",
 	// Spotify variations
-	"spot ify":    "spotify",
-	"sportify":    "spotify",
-	"spotfy":      "spotify",
+	"spot ify": "spotify",
+	"sportify": "spotify",
+	"spotfy":   "spotify",
 	// Settings
-	"setting":     "settings",
+	"setting": "settings",
 }
 
 // levenshteinDistance calculates the edit distance between two strings.
@@ -381,7 +463,7 @@ func (e *ActionExecutor) SetMinConfidence(c float64) {
 // ParseAndExecute parses text and immediately executes if confidence is high enough.
 // Returns (executed bool, feedback string, err error).
 func (e *ActionExecutor) ParseAndExecute(text string) (bool, string, error) {
-	action := e.parser.Parse(text)
+	action := e.parser.ParseFromAnywhere(text)
 
 	if action.Type == ActionNone {
 		return false, "", nil

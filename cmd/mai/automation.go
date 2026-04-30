@@ -460,6 +460,10 @@ func (a *Automation) FocusWindow(title string) error {
 // SendMessage automates sending a message in a specific messaging app.
 // If a contact is provided, it attempts to search for that contact first.
 func (a *Automation) SendMessage(app, contact, text string) error {
+	// Clean up quotes that might have been captured or added by LLM/ASR
+	text = strings.Trim(strings.TrimSpace(text), "\"'")
+	contact = strings.Trim(strings.TrimSpace(contact), "\"'")
+
 	log.Printf("[AUTO] Sending message on %s to %q: %q", app, contact, text)
 	appLower := strings.ToLower(app)
 
@@ -467,27 +471,44 @@ func (a *Automation) SendMessage(app, contact, text string) error {
 	if err := a.OpenApp(app); err != nil {
 		return fmt.Errorf("could not open %s: %v", app, err)
 	}
-	time.Sleep(1 * time.Second) // Give it time to fully come to foreground
+	time.Sleep(1500 * time.Millisecond) // Give it time to fully come to foreground
+
+	// Resolve the correct window title for focusing
+	windowTitle := app
+	if info, ok := knownApps[strings.ToLower(app)]; ok {
+		windowTitle = info.windowTitle
+	}
 
 	// Step 2: If a contact is specified, search for them
 	if contact != "" {
 		log.Printf("[AUTO] Searching for contact: %s", contact)
-		// Most messaging apps (WhatsApp, Telegram, Discord) use Ctrl+F or Ctrl+N for search
+		// Most messaging apps (WhatsApp, Telegram, Discord) 
 		if appLower == "whatsapp" || appLower == "telegram" || appLower == "discord" {
-			// Ensure we are focused on the app
-			a.FocusWindow(app)
-			time.Sleep(200 * time.Millisecond)
-
-			robotgo.KeyTap("f", "ctrl")
+			// Ensure we are focused on the correct window
+			a.FocusWindow(windowTitle)
 			time.Sleep(500 * time.Millisecond)
 
-			// Type contact name
+			// User specifically requested Ctrl+F for search
+			searchKey := "f"
+			
+			log.Printf("[AUTO] Triggering search with Ctrl+%s", searchKey)
+			robotgo.KeyTap(searchKey, "ctrl")
+			time.Sleep(1000 * time.Millisecond)
+
+			// Clear any previous search and type contact name
+			log.Printf("[AUTO] Clearing search bar...")
+			robotgo.KeyTap("a", "ctrl")
+			robotgo.KeyTap("backspace")
+			time.Sleep(400 * time.Millisecond)
+			
+			log.Printf("[AUTO] Typing contact name: %s", contact)
 			robotgo.TypeStr(contact)
-			time.Sleep(1000 * time.Millisecond) // Wait for search results
+			time.Sleep(2000 * time.Millisecond) // Wait for search results to populate
 
 			// Press Enter to select the first result
+			log.Printf("[AUTO] Selecting contact and opening chat...")
 			robotgo.KeyTap("enter")
-			time.Sleep(800 * time.Millisecond) // Wait for chat to open
+			time.Sleep(1500 * time.Millisecond) // Wait for chat to open
 		}
 	}
 
@@ -623,15 +644,15 @@ func (a *Automation) PlayMedia(platform, query, browser string) error {
 	platform = strings.ToLower(platform)
 
 	if platform == "youtube" {
-		// Use a 'video only' filter (&sp=EgIQAQ%253D%253D) to make the first result a video
-		urlStr := "https://www.youtube.com/results?search_query=" + url.QueryEscape(query) + "&sp=EgIQAQ%253D%253D"
+		// Use a combination of search and autoplay flags to encourage immediate playback
+		urlStr := "https://www.youtube.com/results?search_query=" + url.QueryEscape(query) + "&autoplay=1"
 		err := a.OpenURL(urlStr, browser)
 		if err != nil {
 			return err
 		}
 
-		// Wait for browser to open and load
-		time.Sleep(5 * time.Second)
+		// Wait for browser to open and load initial elements
+		time.Sleep(4 * time.Second)
 
 		// Vision-Assisted Detection of "Shorts" (only if enabled)
 		if a.vision != nil && a.visionEnabled {
@@ -659,16 +680,13 @@ func (a *Automation) PlayMedia(platform, query, browser string) error {
 		robotgo.ActiveName(kw)
 		time.Sleep(500 * time.Millisecond)
 
-		// Deeper Jump: Esc to clear, PageDown to skip shorts, 9 Tabs to reach video
-		log.Printf("[AUTO] Sending deep-jump play sequence...")
-		robotgo.KeyTap("esc")
-		time.Sleep(200 * time.Millisecond)
-
-		for i := 0; i < 13; i++ {
-			robotgo.KeyTap("tab")
-			time.Sleep(50 * time.Millisecond)
-		}
-		robotgo.KeyTap("enter")
+		// Heuristic: Use 'k' (YouTube's play/pause key) and 'Enter' 
+		// We tap 'k' first in case the video is loaded but not playing,
+		// then a few tabs + enter to catch the first result if it didn't autoplay.
+		log.Printf("[AUTO] Sending play command...")
+		robotgo.KeyTap("k") // Toggle play if already loaded
+		time.Sleep(500 * time.Millisecond)
+		robotgo.KeyTap("enter") // Select first search result
 		return nil
 	}
 

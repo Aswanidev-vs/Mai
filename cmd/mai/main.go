@@ -11,6 +11,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -27,107 +28,18 @@ import (
 	"time"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
+	"github.com/user/mai/internal/agent"
+	"github.com/user/mai/internal/cognition"
+	"github.com/user/mai/internal/events"
+	"github.com/user/mai/internal/llm"
+	"github.com/user/mai/internal/memory"
+	"github.com/user/mai/internal/perception"
+	"github.com/user/mai/internal/tools"
+	"github.com/user/mai/internal/tools/adapters"
+	"github.com/user/mai/pkg/interfaces"
+	"github.com/user/mai/pkg/models"
 	"gopkg.in/yaml.v3"
 )
-
-// Config holds all settings.
-type Config struct {
-	Audio struct {
-		SampleRate      int `yaml:"sample_rate"`
-		CaptureBufferMs int `yaml:"capture_buffer_ms"`
-	} `yaml:"audio"`
-	KWS struct {
-		ModelDir   string  `yaml:"model_dir"`
-		Encoder    string  `yaml:"encoder"`
-		Decoder    string  `yaml:"decoder"`
-		Joiner     string  `yaml:"joiner"`
-		Tokens     string  `yaml:"tokens"`
-		Keywords   string  `yaml:"keywords"`
-		NumThreads int     `yaml:"num_threads"`
-		CooldownMs int     `yaml:"cooldown_ms"`
-		Threshold  float32 `yaml:"confidence_threshold"`
-	} `yaml:"kws"`
-	VAD struct {
-		Model              string  `yaml:"model"`
-		WindowSize         int     `yaml:"window_size"`
-		Threshold          float32 `yaml:"threshold"`
-		MinSilenceDuration float32 `yaml:"min_silence_duration"`
-		MinSpeechDuration  float32 `yaml:"min_speech_duration"`
-		MaxSpeechDuration  float32 `yaml:"max_speech_duration"`
-		NumThreads         int     `yaml:"num_threads"`
-	} `yaml:"vad"`
-	ASR struct {
-		Type                    string  `yaml:"type"`
-		ModelDir                string  `yaml:"model_dir"`
-		Encoder                 string  `yaml:"encoder"`
-		Decoder                 string  `yaml:"decoder"`
-		Joiner                  string  `yaml:"joiner"`
-		Tokens                  string  `yaml:"tokens"`
-		ConvFrontend            string  `yaml:"conv_frontend"`
-		Tokenizer               string  `yaml:"tokenizer"`
-		Language                string  `yaml:"language"`
-		DecodingMethod          string  `yaml:"decoding_method"`
-		MaxActivePaths          int     `yaml:"max_active_paths"`
-		EnableEndpoint          int     `yaml:"enable_endpoint"`
-		Rule1MinTrailingSilence float32 `yaml:"rule1_min_trailing_silence"`
-		Rule2MinTrailingSilence float32 `yaml:"rule2_min_trailing_silence"`
-		Rule3MinUtteranceLength float32 `yaml:"rule3_min_utterance_length"`
-		NumThreads              int     `yaml:"num_threads"`
-	} `yaml:"asr"`
-	TTS struct {
-		ActiveModel string `yaml:"active_model"`
-		NumThreads  int    `yaml:"num_threads"`
-		Supertonic  struct {
-			ModelDir          string  `yaml:"model_dir"`
-			DurationPredictor string  `yaml:"duration_predictor"`
-			TextEncoder       string  `yaml:"text_encoder"`
-			VectorEstimator   string  `yaml:"vector_estimator"`
-			Vocoder           string  `yaml:"vocoder"`
-			TTSJson           string  `yaml:"tts_json"`
-			UnicodeIndexer    string  `yaml:"unicode_indexer"`
-			VoiceStyle        string  `yaml:"voice_style"`
-			Sid               int     `yaml:"sid"`
-			NumSteps          int     `yaml:"num_steps"`
-			Speed             float32 `yaml:"speed"`
-		} `yaml:"supertonic"`
-		Pocket struct {
-			ModelDir        string `yaml:"model_dir"`
-			LmFlow          string `yaml:"lm_flow"`
-			LmMain          string `yaml:"lm_main"`
-			Encoder         string `yaml:"encoder"`
-			Decoder         string `yaml:"decoder"`
-			TextConditioner string `yaml:"text_conditioner"`
-			VocabJson       string `yaml:"vocab_json"`
-			TokenScoresJson string `yaml:"token_scores_json"`
-		} `yaml:"pocket"`
-		ZipVoice struct {
-			ModelDir string `yaml:"model_dir"`
-			Encoder  string `yaml:"encoder"`
-			Decoder  string `yaml:"decoder"`
-			DataDir  string `yaml:"data_dir"`
-			Lexicon  string `yaml:"lexicon"`
-			Tokens   string `yaml:"tokens"`
-			Vocoder  string `yaml:"vocoder"`
-		} `yaml:"zipvoice"`
-		VoiceCloning struct {
-			Enabled        bool   `yaml:"enabled"`
-			Model          string `yaml:"model"`
-			ReferenceAudio string `yaml:"reference_audio"`
-		} `yaml:"voice_cloning"`
-	} `yaml:"tts"`
-	LLM struct {
-		Provider     string `yaml:"provider"`
-		Model        string `yaml:"model"`
-		URL          string `yaml:"url"`
-		AutoStart    bool   `yaml:"auto_start"`
-		SystemPrompt string `yaml:"system_prompt"`
-	} `yaml:"llm"`
-	Vision struct {
-		Enabled bool   `yaml:"enabled"`
-		Model   string `yaml:"model"`
-		URL     string `yaml:"url"`
-	} `yaml:"vision"`
-}
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -141,10 +53,25 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to read config: %v", err)
 	}
-	var cfg Config
+	var cfg models.Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		log.Fatalf("Failed to parse config: %v", err)
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var isSpeaking bool
+	var lastResponseTime time.Time
+	var lastDetected time.Time = time.Now().Add(-time.Hour)
+	var sessionSamples []float32
+	var ttsMu sync.Mutex    // Mutex for thread-safe TTS
+	var sherpaMu sync.Mutex // Mutex for all other Sherpa-ONNX calls
+
+	// Audio Lookback Buffer (1.5s at 16000Hz = 24000 samples)
+	lookbackSize := 24000
+	lookbackBuffer := make([]float32, lookbackSize)
+	lookbackIdx := 0
 
 	// Start Ollama if needed
 	if cfg.LLM.AutoStart && cfg.LLM.Provider == "ollama" {
@@ -314,13 +241,70 @@ func main() {
 	// Initialize automation system
 	auto := NewAutomation(cfg.Vision.Model, cfg.Vision.URL, cfg.Vision.Enabled)
 	executor := NewActionExecutor(auto)
+
+	// 0. Initialize Agentic Architecture if enabled
+	var agentBridge *perception.Bridge
+	if cfg.Agentic.Enabled {
+		log.Println("[BOOT] Initializing Agentic Architecture...")
+		bus := events.NewBus()
+
+		// Memory
+		workingMem := memory.NewWorkingMemory(10)
+		episodicMem, _ := memory.NewEpisodicStore("data/memory/episodic.db")
+		memManager := memory.NewMemoryManager(workingMem, episodicMem, nil, nil) // Stubs for others
+
+		// LLM
+		llmFactory := llm.NewFactory(cfg)
+		llmProvider, err := llmFactory.CreateHybridProvider()
+		if err != nil {
+			log.Fatalf("[BOOT] Failed to create LLM provider: %v", err)
+		}
+
+		// Tools
+		registry := tools.NewRegistry()
+		registry.Register(&adapters.ShellTool{})
+		registry.Register(&adapters.WebSearchTool{})
+		registry.Register(&adapters.OpenAppTool{})
+		registry.Register(&adapters.YouTubeTool{})
+		registry.Register(adapters.NewDeepSearchTool())
+		registry.Register(&adapters.FileWriteTool{})
+		registry.Register(&adapters.ClockTool{})
+		registry.Register(&adapters.WhatsAppTool{})
+		registry.Register(&adapters.AutomationTool{})
+
+		// Cognition
+		react := cognition.NewReActLoop(llmProvider, registry, workingMem)
+
+		// Orchestrator
+		orch := agent.NewOrchestrator(bus, memManager, llmProvider, registry, react)
+		orch.DirectAction = executor.ParseAndExecute // Wire up the legacy highly-reliable regex parser
+		go orch.Start(ctx)
+
+		// Bridge for Perception
+		agentBridge = perception.NewBridge(bus)
+
+		// Bridge for TTS
+		bus.Subscribe("action.tts.request", func(event interfaces.Event) {
+			text, _ := event.Payload["text"].(string)
+			log.Printf("[AGENT] Speaking: %s", text)
+			isSpeaking = true
+			ttsMu.Lock()
+			audio := tts.Generate(text, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
+			ttsMu.Unlock()
+			if audio != nil {
+				playAudio(audio.Samples, audio.SampleRate)
+			}
+			time.Sleep(400 * time.Millisecond) // Wait for room echo to die down
+			isSpeaking = false
+			lastResponseTime = time.Now()
+			log.Printf("[FOLLOW-UP] Listening for follow-up (15s window)...")
+		})
+	}
 	log.Println("[AUTO] Automation system ready")
 
 	// 5. Initialize audio capture
 
-	var isSpeaking bool
-	var lastResponseTime time.Time
-	var sessionSamples []float32
+	// 5. Initialize audio capture
 	capture := newAudioCapture(16000, 1)
 	defer capture.Close()
 
@@ -352,14 +336,14 @@ func main() {
 				// Action was executed - ask LLM for natural response with context
 				log.Printf("[ACTION] Executed: %s", feedback)
 				prompt := fmt.Sprintf("User said: %q. I just did this: %s. Respond very briefly and naturally (1 sentence).", task.Text, feedback)
-				response, err = generateOllamaResponse(cfg, prompt)
+				response, err = generateOllamaResponse(ctx, cfg, prompt)
 				if err != nil {
 					log.Printf("[LLM] Error generating contextual response: %v", err)
 					response = feedback // Fallback to simple feedback
 				}
 			} else {
 				// No action detected - normal LLM flow
-				response, err = generateOllamaResponse(cfg, task.Text)
+				response, err = generateOllamaResponse(ctx, cfg, task.Text)
 				if err != nil {
 					log.Printf("[LLM] Error: %v", err)
 					isSpeaking = false
@@ -370,15 +354,18 @@ func main() {
 			log.Printf("[LLM] Response received. Starting TTS...")
 
 			// TTS
+			ttsMu.Lock()
 			audio := tts.Generate(response, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
+			ttsMu.Unlock()
 			if audio != nil {
 				log.Println("[TTS] Playing response...")
 				playAudio(audio.Samples, audio.SampleRate)
 			}
 
+			time.Sleep(400 * time.Millisecond) // Wait for room echo to die down
 			isSpeaking = false // Resume ASR
 			lastResponseTime = time.Now()
-			log.Println("[FOLLOW-UP] Listening for follow-up (10s window)...")
+			log.Println("[FOLLOW-UP] Listening for follow-up (15s window)...")
 		}
 	}()
 
@@ -390,19 +377,21 @@ func main() {
 	)
 
 	state := StateWakeWord
-	lastDetected := time.Now().Add(-time.Hour)
 	var lastText string
 	var sessionText string
 
 	// Audio callback
 	capture.onSamples = func(samples []float32) {
+		sherpaMu.Lock()
+		defer sherpaMu.Unlock()
+
 		if isSpeaking {
 			return // Ignore samples while Mai is talking
 		}
 		switch state {
 		case StateWakeWord:
 			// If in follow-up window, allow VAD to trigger listening
-			if time.Since(lastResponseTime) < 10*time.Second {
+			if time.Since(lastResponseTime) < 15*time.Second {
 				// Feed to ASR continuously if streaming
 				if asrStream != nil {
 					asrStream.AcceptWaveform(16000, samples)
@@ -410,38 +399,60 @@ func main() {
 
 				// Feed to VAD buffer for speech detection
 				vadBuffer.Push(samples)
+				var lastChunk []float32
 				for vadBuffer.Size() >= cfg.VAD.WindowSize {
 					head := vadBuffer.Head()
-					chunk := vadBuffer.Get(head, cfg.VAD.WindowSize)
+					lastChunk = vadBuffer.Get(head, cfg.VAD.WindowSize)
 					vadBuffer.Pop(cfg.VAD.WindowSize)
-					vadDetector.AcceptWaveform(chunk)
+					vadDetector.AcceptWaveform(lastChunk)
 				}
 
 				// Check if VAD has detected speech segments
 				if !vadDetector.IsEmpty() {
-					log.Println("[FOLLOW-UP] Speech detected! Skipping wake word.")
-					state = StateListening
-					// Clear VAD segments - they were just for start detection
-					for !vadDetector.IsEmpty() {
-						vadDetector.Pop()
+					// Check RMS level to ensure it's not just silence/noise
+					var sum float32
+					for _, s := range samples {
+						sum += s * s
 					}
-					sessionText = ""
-					lastText = ""
-					sessionSamples = nil
-					if recognizer != nil {
-						recognizer.Reset(asrStream)
+					rms := math.Sqrt(float64(sum / float32(len(samples))))
+
+					if rms > 0.001 { // Much more sensitive for follow-up
+						log.Printf("[FOLLOW-UP] Speech detected (Level %.4f)! Skipping wake word.", rms)
+						state = StateListening
+						
+						// Prepend the lookback buffer to catch the start of the sentence
+						preBuffer := make([]float32, lookbackSize)
+						for i := 0; i < lookbackSize; i++ {
+							preBuffer[i] = lookbackBuffer[(lookbackIdx+i)%lookbackSize]
+						}
+						sessionSamples = append(preBuffer, lastChunk...)
+						
+						sessionText = ""
+						lastText = ""
+						if recognizer != nil {
+							recognizer.Reset(asrStream)
+						}
+						// Clear VAD segments
+						for !vadDetector.IsEmpty() {
+							vadDetector.Pop()
+						}
+						return
 					}
-					return
 				}
 			}
 
-			// Feed to Keyword Spotter
+			for _, s := range samples {
+				lookbackBuffer[lookbackIdx] = s
+				lookbackIdx = (lookbackIdx + 1) % lookbackSize
+			}
+
+			// Feed to KWS/VAD buffer
 			kwsStream.AcceptWaveform(16000, samples)
 
 			if asrStream != nil {
 				asrStream.AcceptWaveform(16000, samples)
 			} else {
-				// For offline models, we still want to keep track of the audio 
+				// For offline models, we still want to keep track of the audio
 				// if we might be in a follow-up window.
 				// However, we don't buffer HERE yet, because we haven't switched to StateListening.
 			}
@@ -465,6 +476,24 @@ func main() {
 					spotter.Reset(kwsStream)
 					lastDetected = time.Now()
 					log.Println("\n[WAKE] Detected! Listening...")
+
+					// JARVIS-style acknowledgement
+					go func() {
+						// JARVIS-style acknowledgment (more sophisticated)
+						greetings := []string{
+							"Yes Sir. How can I assist you?",
+							"At your service. What is the objective?",
+							"I'm here. What do you need?",
+						}
+						greet := greetings[time.Now().UnixNano()%int64(len(greetings))]
+						ttsMu.Lock()
+						audio := tts.Generate(greet, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
+						ttsMu.Unlock()
+						if audio != nil {
+							playAudio(audio.Samples, audio.SampleRate)
+						}
+					}()
+
 					state = StateListening
 					sessionText = "" // Reset session text
 					sessionSamples = nil
@@ -524,7 +553,9 @@ func main() {
 					offlineStream.AcceptWaveform(16000, sessionSamples)
 					offlineRecognizer.Decode(offlineStream)
 					result := offlineStream.GetResult()
-					sessionText = result.Text
+					if result != nil {
+						sessionText = result.Text
+					}
 					sherpa.DeleteOfflineStream(offlineStream)
 					sessionSamples = nil // Clear buffer
 				}
@@ -532,8 +563,14 @@ func main() {
 				log.Println("\n[VAD] End of segment detected.")
 
 				if sessionText != "" {
-					log.Println("[PIPELINE] Processing full sentence...")
-					workerChan <- Task{Text: sessionText}
+					if agentBridge != nil {
+						log.Println("[AGENT] Routing to cognitive orchestrator...")
+						// Use a goroutine to avoid blocking the audio thread
+						go agentBridge.PublishTranscription(sessionText)
+					} else {
+						log.Println("[PIPELINE] Routing to legacy pipeline...")
+						workerChan <- Task{Text: sessionText}
+					}
 					state = StateWakeWord
 					sessionText = ""
 					if recognizer != nil {
@@ -558,10 +595,25 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	log.Println("\nShutting down...")
+	log.Println("\n[SYSTEM] Shutting down immediately...")
+	
+	cancel() // Cancel the background context (stops Ollama requests, etc.)
 	capture.Stop()
 	close(workerChan)
-	wg.Wait()
+
+	// Wait briefly for cleanup, then force exit
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("[SYSTEM] Graceful shutdown complete.")
+	case <-time.After(2 * time.Second):
+		log.Println("[SYSTEM] Shutdown timeout - forcing exit.")
+	}
 }
 
 // startOllama starts the ollama serve process and returns a function to kill it.
@@ -581,8 +633,8 @@ func startOllama() func() {
 }
 
 // generateOllamaResponse sends text to Ollama and returns the generated text.
-func generateOllamaResponse(cfg Config, prompt string) (string, error) {
-	client := &http.Client{Timeout: 5 * time.Minute} // Increased to 5 minutes
+func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt string) (string, error) {
+	client := &http.Client{} 
 
 	requestBody, _ := json.Marshal(map[string]interface{}{
 		"model":  cfg.LLM.Model,
@@ -592,7 +644,9 @@ func generateOllamaResponse(cfg Config, prompt string) (string, error) {
 	})
 
 	log.Printf("[OLLAMA] Requesting response from %s...", cfg.LLM.Model)
-	resp, err := client.Post(cfg.LLM.URL, "application/json", bytes.NewBuffer(requestBody))
+	req, _ := http.NewRequestWithContext(ctx, "POST", cfg.LLM.URL, bytes.NewBuffer(requestBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("ollama post: %w", err)
 	}
