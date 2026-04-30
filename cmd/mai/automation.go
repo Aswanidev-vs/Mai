@@ -623,15 +623,15 @@ func (a *Automation) PlayMedia(platform, query, browser string) error {
 	platform = strings.ToLower(platform)
 
 	if platform == "youtube" {
-		// Use a 'video only' filter (&sp=EgIQAQ%253D%253D) to make the first result a video
-		urlStr := "https://www.youtube.com/results?search_query=" + url.QueryEscape(query) + "&sp=EgIQAQ%253D%253D"
+		// Use a combination of search and autoplay flags to encourage immediate playback
+		urlStr := "https://www.youtube.com/results?search_query=" + url.QueryEscape(query) + "&autoplay=1"
 		err := a.OpenURL(urlStr, browser)
 		if err != nil {
 			return err
 		}
 
-		// Wait for browser to open and load
-		time.Sleep(5 * time.Second)
+		// Wait for browser to open and load initial elements
+		time.Sleep(4 * time.Second)
 
 		// Vision-Assisted Detection of "Shorts" (only if enabled)
 		if a.vision != nil && a.visionEnabled {
@@ -659,16 +659,13 @@ func (a *Automation) PlayMedia(platform, query, browser string) error {
 		robotgo.ActiveName(kw)
 		time.Sleep(500 * time.Millisecond)
 
-		// Deeper Jump: Esc to clear, PageDown to skip shorts, 9 Tabs to reach video
-		log.Printf("[AUTO] Sending deep-jump play sequence...")
-		robotgo.KeyTap("esc")
-		time.Sleep(200 * time.Millisecond)
-
-		for i := 0; i < 13; i++ {
-			robotgo.KeyTap("tab")
-			time.Sleep(50 * time.Millisecond)
-		}
-		robotgo.KeyTap("enter")
+		// Heuristic: Use 'k' (YouTube's play/pause key) and 'Enter' 
+		// We tap 'k' first in case the video is loaded but not playing,
+		// then a few tabs + enter to catch the first result if it didn't autoplay.
+		log.Printf("[AUTO] Sending play command...")
+		robotgo.KeyTap("k") // Toggle play if already loaded
+		time.Sleep(500 * time.Millisecond)
+		robotgo.KeyTap("enter") // Select first search result
 		return nil
 	}
 
