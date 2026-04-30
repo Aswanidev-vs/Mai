@@ -48,8 +48,6 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 
 ## Features
 
-### ✅ Currently Implemented
-
 | Feature | Status | Description |
 |---------|--------|-------------|
 | **Wake Word Detection** | ✅ Ready | Continuous listening for "Mai", "Hey Mai" using Zipformer KWS |
@@ -59,6 +57,9 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 | **Multi-Model TTS** | ✅ Ready | Switch between Supertonic, Pocket, and ZipVoice synthesizers |
 | **Follow-Up Queries** | ✅ Ready | 10-second conversation window without repeating the wake word |
 | **Interruptible Playback** | ✅ Ready | Speak during TTS to interrupt and redirect |
+| **Structured Action Parser** | ✅ Ready | High-reliability regex parser (Fast Path) + LLM-based action fallback |
+| **System Automation** | ✅ Ready | UI automation via RoboGo (WhatsApp, Telegram, YouTube, App Control) |
+| **Agentic Architecture** | ✅ Ready | ReAct-based reasoning engine with multi-step tool execution |
 | **YAML Configuration** | ✅ Ready | Single config file controls all speech and LLM components |
 | **Audio I/O** | ✅ Ready | Cross-platform microphone capture and speaker playback via miniaudio |
 
@@ -67,14 +68,10 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 | Feature | Status | Description |
 |---------|--------|-------------|
 | **Voice Cloning** | 🚧 Config only | TTS model configs prepared; not yet wired into the live pipeline |
-| **Structured Action Parser** | 🚧 Planned | Parse commands into JSON actions (open apps, send messages, etc.) |
-| **System Automation** | 🚧 Planned | UI automation via RoboGo (app control, typing, messaging) |
-| **Memory System** | 🚧 Planned | SQLite short-term memory + Markdown long-term memory |
-| **Vision / OCR** | 🚧 Planned | On-demand screen capture and text extraction |
+| **Memory System** | 🚧 In Progress| SQLite short-term memory + Semantic Vector Store (RAG) |
+| **Vision / OCR** | 🚧 In Progress| Continuous screen monitoring and text extraction |
 | **Emotion Engine** | 🚧 Planned | Detect user tone and adapt response style |
 | **Web Search** | 🚧 Planned | Optional opt-in web knowledge (breaks offline mode) |
-
-> **Current behavior**: Transcribed speech is sent directly to the LLM as raw text. Structured command parsing and action execution are not yet active.
 
 
 ---
@@ -382,6 +379,14 @@ IDLE (Wake Word Listen)
                           Playback done ──▶ IDLE
 ```
 
+### Agentic Orchestrator & Routing
+
+Mai uses a sophisticated two-tier execution model to balance speed and intelligence:
+
+1.  **Fast Path (Legacy Action Parser)**: High-reliability, sub-millisecond regex matching for common system tasks (Open App, WhatsApp, Media). If a match is found, the Reasoning Engine is bypassed entirely for instant execution.
+2.  **Reasoning Path (ReAct Loop)**: For complex, abstract, or multi-step requests, the system engages a full ReAct (Reasoning + Acting) loop using the LLM.
+3.  **Fallback Mechanism**: If the Fast Path misses but the LLM identifies a command intent, it can trigger the high-reliability executor via a special `[ACTION]` tag, ensuring even conversational requests result in precise automation.
+
 ---
 
 ## Performance
@@ -446,14 +451,14 @@ Then open `http://localhost:8080` in your browser to test different TTS voices.
 | 5 | TTS Integration | ✅ Complete | Supertonic / Pocket / ZipVoice model support |
 | 6 | Voice Pipeline Orchestration | ✅ Complete | State machine, follow-up mode, interruptible playback |
 | 7 | LLM Integration | ✅ Complete | Ollama client with auto-start; raw text prompts |
-| 7b | Command Parser & Action System | 🚧 Planned | Structured JSON action parsing from LLM output |
-| 8 | Automation (RoboGo) | 🚧 Planned | Open apps, type text, send messages |
-| 9 | Memory System (SQLite + Markdown) | 🚧 Planned | Session history, user profile, persistent notes |
-| 10 | Vision (Screen OCR) | 🚧 Planned | On-demand screen capture + Tesseract OCR |
+| 7b | Command Parser & Action System | ✅ Complete | High-reliability regex (Fast Path) + LLM fallback |
+| 8 | Automation (RoboGo) | ✅ Complete | WhatsApp, Telegram, YouTube, and System App control |
+| 9 | Memory System (SQLite + Vector Store) | 🚧 In Progress | Short-term session context + Long-term Semantic RAG |
+| 10 | Vision (Screen OCR) | ✅ Complete | Continuous screen monitoring and text extraction bridge |
 | 11 | Emotion Engine | 🚧 Planned | Tone detection, adaptive TTS speed/pitch |
 | 12 | Web Search (Opt-in) | 🚧 Planned | DuckDuckGo/SearXNG integration; disabled by default |
-| 13 | Polish & Performance Tuning | 🚧 Planned | Metrics, logging levels, build scripts |
-| 14 | Multi-step Task Planning | 🔮 Future | Complex multi-action sequences |
+| 13 | Polish & Performance Tuning | 🚧 In Progress | Routing optimization, latency reduction, stability fixes |
+| 14 | Multi-step Task Planning | ✅ Complete | ReAct reasoning engine for complex sequences |
 
 See [`todo.md`](todo.md) for detailed implementation tasks.
 

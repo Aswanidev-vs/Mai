@@ -553,7 +553,9 @@ func main() {
 					offlineStream.AcceptWaveform(16000, sessionSamples)
 					offlineRecognizer.Decode(offlineStream)
 					result := offlineStream.GetResult()
-					sessionText = result.Text
+					if result != nil {
+						sessionText = result.Text
+					}
 					sherpa.DeleteOfflineStream(offlineStream)
 					sessionSamples = nil // Clear buffer
 				}
@@ -563,7 +565,8 @@ func main() {
 				if sessionText != "" {
 					if agentBridge != nil {
 						log.Println("[AGENT] Routing to cognitive orchestrator...")
-						agentBridge.PublishTranscription(sessionText)
+						// Use a goroutine to avoid blocking the audio thread
+						go agentBridge.PublishTranscription(sessionText)
 					} else {
 						log.Println("[PIPELINE] Routing to legacy pipeline...")
 						workerChan <- Task{Text: sessionText}

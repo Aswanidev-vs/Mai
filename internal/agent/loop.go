@@ -117,18 +117,33 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	lowerText := strings.ToLower(text)
 
 	// 2. Check if it requires the Reasoning Engine (creative / analytical tasks ONLY)
-	// NOTE: Action commands (send, play, open, etc.) are handled by DirectAction above.
-	// We only trigger ReAct for tasks that need multi-step reasoning or creativity.
+	// NOTE: Action commands (send, play, open, etc.) are prioritized by DirectAction above.
+	// We only trigger ReAct for tasks that need multi-step reasoning or creative problem solving.
+	
+	// Optimization: If it looks like a direct tool command, skip the reasoning engine check
+	// to avoid slow and unnecessary multi-step reasoning for simple tasks.
+	commandTriggers := []string{"send", "message", "play", "open", "close", "launch", "type", "press", "search", "find", "whatsapp", "youtube", "spotify"}
+	isLikelyCommand := false
+	for _, cmd := range commandTriggers {
+		if strings.Contains(lowerText, cmd) {
+			isLikelyCommand = true
+			break
+		}
+	}
+
 	reasoningKeywords := []string{
 		"invent", "create", "solve", "design", "think", "analyze", "plan",
 		"research", "investigate", "calculate", "compare", "evaluate",
 		"why is", "how does", "explain", "what if", "summarize",
 	}
+	
 	requiresReasoning := false
-	for _, kw := range reasoningKeywords {
-		if strings.Contains(lowerText, kw) {
-			requiresReasoning = true
-			break
+	if !isLikelyCommand {
+		for _, kw := range reasoningKeywords {
+			if strings.Contains(lowerText, kw) {
+				requiresReasoning = true
+				break
+			}
 		}
 	}
 
@@ -144,9 +159,11 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	// 3. Conversational / Fast-track
 	log.Printf("[Agent] Fast-tracking conversational input: %s", text)
 
-	// Prepend an anti-hallucination boundary
+	// Prepend an anti-hallucination boundary and tool-use instructions
+	// This serves as the "Fallback Mechanism" requested by the user.
 	safePrompt := fmt.Sprintf(`You are Mai, a helpful AI assistant.
-CRITICAL RULE: If the user asks why something failed or asks about an error, DO NOT invent a fake error (like a segmentation fault). Admit that you don't have the logs in your immediate memory.
+CRITICAL RULE: If the user asks to perform a simple task (open app, send message, play media, search), start your response with "[ACTION] " followed by the command.
+Example: "[ACTION] open chrome" or "[ACTION] send hello to manu on whatsapp"
 
 User: %s`, text)
 
@@ -154,6 +171,22 @@ User: %s`, text)
 	if err != nil {
 		return nil, err
 	}
+
+	// Fallback Execution: If the LLM identified an action, run it through the high-reliability executor
+	if strings.Contains(response, "[ACTION]") {
+		parts := strings.Split(response, "[ACTION]")
+		actionCmd := strings.TrimSpace(parts[len(parts)-1])
+		log.Printf("[Agent] Fallback mechanism triggered: %s", actionCmd)
+		
+		if o.DirectAction != nil {
+			executed, feedback, err := o.DirectAction(actionCmd)
+			if err == nil && executed {
+				return &interfaces.AgentResponse{Text: feedback, Success: true}, nil
+			}
+			log.Printf("[Agent] Fallback execution failed or was not an action: %v", err)
+		}
+	}
+
 	return &interfaces.AgentResponse{Text: response, Success: true}, nil
 }
 

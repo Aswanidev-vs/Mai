@@ -119,6 +119,13 @@ func NewActionParser() *ActionParser {
 				paramKeys:  []string{"text", "contact", "app"},
 				confidence: 0.95,
 			},
+			// Flexible variation: "send a message to john on whatsapp saying hello"
+			{
+				pattern:    regexp.MustCompile(`(?i)^(?:send|message)\s+(?:a\s+)?(?:message|text)\s+to\s+(.+?)\s+on\s+(\w+)\s+(?:saying|that|says)\s+(.+)$`),
+				actionType: ActionSendMsg,
+				paramKeys:  []string{"contact", "app", "text"},
+				confidence: 0.98,
+			},
 			// New Pattern: "find john on whatsapp and tell him hello"
 			{
 				pattern:    regexp.MustCompile(`(?i)^find\s+(.+?)\s+on\s+(\w+)\s+(?:and|to)\s+(?:tell|send|message)(?:\s+him|\s+her|\s+them)?\s+(.+)$`),
@@ -246,16 +253,28 @@ func splitSentences(text string) []string {
 		return nil
 	}
 
-	// Split on sentence terminators
+	// Split on sentence terminators and common command conjunctions
 	var sentences []string
+	
+	// First split by punctuation
 	parts := strings.FieldsFunc(text, func(r rune) bool {
-		return r == '.' || r == '?' || r == '!'
+		return r == '.' || r == '?' || r == '!' || r == ';'
 	})
 
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		if part != "" {
-			sentences = append(sentences, part)
+		if part == "" {
+			continue
+		}
+		
+		// Sub-split by common conjunctions like " and " or " then " 
+		// which often separate multiple commands in a single ASR stream.
+		subParts := strings.Split(part, " and ")
+		for _, sp := range subParts {
+			sp = strings.TrimSpace(sp)
+			if sp != "" {
+				sentences = append(sentences, sp)
+			}
 		}
 	}
 

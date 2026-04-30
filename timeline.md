@@ -6,12 +6,12 @@ This document tracks the progress of evolving Mai into a JARVIS/FRIDAY-class age
 
 | Phase | Goal | Status | Date |
 |-------|------|--------|------|
-| **Phase 0: Foundation** | Refactor existing code into interfaces, establish project structure | In Progress | 2026-04-30 |
-| **Phase 1: Coexistence** | Event bus, persistent memory hierarchy, tool registry foundation | Pending | |
-| **Phase 2: Cognitive Layer** | ReAct + CoT reasoning, goal management, agentic mode | Pending | |
-| **Phase 3: Multi-Modal Fusion** | Continuous vision, emotional prosody, proactive monitoring | Pending | |
-| **Phase 4: Ecosystem** | MCP tool discovery, autonomous API learning, self-improvement | Pending | |
-| **Phase 5: Polish** | Optimization, latency reduction, edge case handling | Pending | |
+| **Phase 0: Foundation** | Refactor existing code into interfaces, establish project structure | ✅ Complete | 2026-04-30 |
+| **Phase 1: Coexistence** | Event bus, persistent memory hierarchy, tool registry foundation | ✅ Complete | 2026-04-30 |
+| **Phase 2: Cognitive Layer** | ReAct + CoT reasoning, goal management, agentic mode | ✅ Complete | 2026-04-30 |
+| **Phase 3: Multi-Modal Fusion** | Continuous vision, emotional prosody, proactive monitoring | ✅ Complete | 2026-04-30 |
+| **Phase 4: Ecosystem** | MCP tool discovery, autonomous API learning, self-improvement | ✅ Complete | 2026-04-30 |
+| **Phase 5: Polish** | Optimization, latency reduction, edge case handling | In Progress | 2026-04-30 |
 
 ## Task Log
 
@@ -34,7 +34,11 @@ This document tracks the progress of evolving Mai into a JARVIS/FRIDAY-class age
 - [x] Implement Vision Processor Bridge (Phase 3).
 - [x] Implement MCP Client stub for tool discovery (Phase 4).
 - [x] Implement Reflexion (Self-Correction) in ReAct Loop (Phase 4).
-- [ ] Performance Optimization and Polish (Phase 5).
+- [x] **Optimized Routing**: Implemented Fast Path to bypass ReAct for direct commands (WhatsApp, YouTube, etc.).
+- [x] **Robust Automation**: Enhanced WhatsApp/Telegram messaging with Ctrl+F/Ctrl+E search and contact selection.
+- [x] **Action Fallback**: Added conversational fallback where LLM can trigger legacy actions via `[ACTION]` tags.
+- [x] **Stability Fixes**: Resolved nil-pointer panics in offline ASR and moved agent tasks to background threads.
+- [ ] Final Performance Optimization and Latency Tuning (Phase 5).
 
 ---
 
