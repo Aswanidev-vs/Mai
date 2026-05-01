@@ -57,6 +57,27 @@ func NewActionParser() *ActionParser {
 				paramKeys:  []string{"_", "query", "platform", "browser"},
 				confidence: 0.95,
 			},
+			// Play media with browser first: "play interstellar on brave on youtube"
+			{
+				pattern:    regexp.MustCompile(`(?i)^(play|listen\s*to)\s+(.+?)\s+(?:on|using|in)\s+(chrome|brave|firefox|edge)(?:\s+browser)?\s+(?:on|using)\s+(youtube|spotify|soundcloud)`),
+				actionType: ActionPlayMedia,
+				paramKeys:  []string{"_", "query", "browser", "platform"},
+				confidence: 0.95,
+			},
+			// Play media: "play interstellar on youtube", "play some music on spotify"
+			{
+				pattern:    regexp.MustCompile(`(?i)^(play|listen\s*to)\s+(.+?)\s+(?:on|using)\s+(youtube|spotify|soundcloud)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?`),
+				actionType: ActionPlayMedia,
+				paramKeys:  []string{"_", "query", "platform", "browser"},
+				confidence: 0.95,
+			},
+			// Combined: "open youtube and play interstellar"
+			{
+				pattern:    regexp.MustCompile(`(?i)^(?:open|go\s*to)\s+(youtube|spotify|soundcloud)\s+(?:and|to|for)\s+(?:play|search|find)\s+(.+?)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?`),
+				actionType: ActionPlayMedia,
+				paramKeys:  []string{"platform", "query", "browser"},
+				confidence: 0.95,
+			},
 			// Play media: "play interstellar on youtube", "play some music on spotify"
 			{
 				pattern:    regexp.MustCompile(`(?i)^(play|listen\s*to)\s+(.+?)\s+(?:on|using)\s+(youtube|spotify|soundcloud)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?`),

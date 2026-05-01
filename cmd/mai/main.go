@@ -248,17 +248,20 @@ func main() {
 		log.Println("[BOOT] Initializing Agentic Architecture...")
 		bus := events.NewBus()
 
-		// Memory
-		workingMem := memory.NewWorkingMemory(10)
-		episodicMem, _ := memory.NewEpisodicStore("data/memory/episodic.db")
-		memManager := memory.NewMemoryManager(workingMem, episodicMem, nil, nil) // Stubs for others
-
-		// LLM
+		// LLM (create first — memory needs it for embeddings)
 		llmFactory := llm.NewFactory(cfg)
 		llmProvider, err := llmFactory.CreateHybridProvider()
 		if err != nil {
 			log.Fatalf("[BOOT] Failed to create LLM provider: %v", err)
 		}
+
+		// Memory
+		workingMem := memory.NewWorkingMemory(10)
+		episodicMem, _ := memory.NewEpisodicStore("data/memory/episodic.db")
+		semanticMem := memory.NewSemanticStore(llmProvider, "data/vector")
+		proceduralMem, _ := memory.NewProceduralStore("data/memory")
+		memManager := memory.NewMemoryManager(workingMem, episodicMem, semanticMem, proceduralMem)
+		memManager.SetRAGProvider(llmProvider)
 
 		// Tools
 		registry := tools.NewRegistry()

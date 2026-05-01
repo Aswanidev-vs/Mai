@@ -640,58 +640,79 @@ func (a *Automation) WebSearch(platform, query, browser string) error {
 
 // PlayMedia attempts to play content on a specific platform.
 func (a *Automation) PlayMedia(platform, query, browser string) error {
-	log.Printf("[AUTO] Playing %q on %s", query, platform)
+	log.Printf("[AUTO] Playing %q on %s (browser: %s)", query, platform, browser)
 	platform = strings.ToLower(platform)
 
 	if platform == "youtube" {
-		// Use a combination of search and autoplay flags to encourage immediate playback
-		urlStr := "https://www.youtube.com/results?search_query=" + url.QueryEscape(query) + "&autoplay=1"
+		urlStr := "https://www.youtube.com/results?search_query=" + url.QueryEscape(query)
 		err := a.OpenURL(urlStr, browser)
 		if err != nil {
 			return err
 		}
 
-		// Wait for browser to open and load initial elements
+		// Wait for browser to open and load search results
 		time.Sleep(4 * time.Second)
 
-		// Vision-Assisted Detection of "Shorts" (only if enabled)
-		if a.vision != nil && a.visionEnabled {
-			log.Println("[AUTO] Checking for Shorts shelf using vision...")
-			tmpFile := "temp_screen.png"
-			if err := a.TakeScreenshot(tmpFile); err == nil {
-				// If we find the word "Shorts", it usually means the shelf is at the top
-				// Using FindElement for specific text detection
-				if _, _, err := a.vision.FindElement(tmpFile, "Shorts"); err == nil {
-					log.Println("[AUTO] Shorts detected! Scrolling down to find real videos...")
-					a.Scroll(-800) // Scroll down (negative on most systems for down)
-					time.Sleep(1500 * time.Millisecond)
-				}
-			}
-		}
-
-		// Fallback to Keyboard Heuristic
-		log.Println("[AUTO] Playing video via keyboard heuristic.")
-		kw := "YouTube"
+		// Focus the browser window using the known window title
 		if browser != "" {
-			kw = browser
+			browserLower := strings.ToLower(browser)
+			if info, ok := knownApps[browserLower]; ok {
+				robotgo.ActiveName(info.windowTitle)
+			} else {
+				robotgo.ActiveName(browser)
+			}
+		} else {
+			robotgo.ActiveName("YouTube")
 		}
-
-		// Focus the window to ensure keys go to the browser
-		robotgo.ActiveName(kw)
 		time.Sleep(500 * time.Millisecond)
 
-		// Heuristic: Use 'k' (YouTube's play/pause key) and 'Enter' 
-		// We tap 'k' first in case the video is loaded but not playing,
-		// then a few tabs + enter to catch the first result if it didn't autoplay.
-		log.Printf("[AUTO] Sending play command...")
-		robotgo.KeyTap("k") // Toggle play if already loaded
-		time.Sleep(500 * time.Millisecond)
-		robotgo.KeyTap("enter") // Select first search result
-		return nil
+		return a.clickFirstYouTubeVideo()
 	}
 
 	// Fallback to regular search for other platforms
 	return a.WebSearch(platform, query, browser)
+}
+
+// clickFirstYouTubeVideo attempts to click the first video on a YouTube
+// search results page using multiple strategies.
+func (a *Automation) clickFirstYouTubeVideo() error {
+	screenW, screenH := a.GetScreenSize()
+
+	// Strategy 1: Click on the first video thumbnail.
+	// YouTube search results layout (with sidebar collapsed):
+	//   - Top bar:          ~5% height
+	//   - Filter chips row: ~5-15% height
+	//   - First video card: starts ~18% height, thumbnail at ~30% width
+	// We target the center of the first video thumbnail at 30% X, 35% Y
+	// which sits well below the filter chips ("All", "Videos", "Shorts", "Unwatched").
+	clickX := screenW * 30 / 100
+	clickY := screenH * 35 / 100
+	log.Printf("[AUTO] Strategy 1: Clicking first video thumbnail at (%d, %d) on %dx%d screen", clickX, clickY, screenW, screenH)
+	a.MouseClick(clickX, clickY)
+	time.Sleep(2 * time.Second)
+
+	// Strategy 2: Tab-navigate from the search bar to the first video link.
+	// On YouTube search results, pressing Tab from the page body cycles through
+	// interactive elements. The first video link is typically 3-5 tabs away from
+	// the search bar (past filter chips). We press Tab several times then Enter.
+	log.Println("[AUTO] Strategy 2: Tab-navigating to first video and pressing Enter...")
+	robotgo.KeyTap("tab")
+	time.Sleep(200 * time.Millisecond)
+	robotgo.KeyTap("tab")
+	time.Sleep(200 * time.Millisecond)
+	robotgo.KeyTap("tab")
+	time.Sleep(200 * time.Millisecond)
+	robotgo.KeyTap("tab")
+	time.Sleep(200 * time.Millisecond)
+	robotgo.KeyTap("tab")
+	time.Sleep(200 * time.Millisecond)
+	robotgo.KeyTap("enter")
+	time.Sleep(2 * time.Second)
+
+	// Press 'k' to toggle play/pause (YouTube keyboard shortcut).
+	// This works on the video watch page to ensure playback started.
+	robotgo.KeyTap("k")
+	return nil
 }
 
 // OpenURL opens a URL in a specific browser or the default one.

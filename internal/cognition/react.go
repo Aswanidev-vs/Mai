@@ -40,6 +40,13 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 	steps := []ReActStep{}
 	toolCalled := false // Track whether ANY tool has been executed
 
+	// Track tool call history to detect loops
+	type toolCall struct {
+		action string
+		params string
+	}
+	callHistory := []toolCall{}
+
 	for i := 0; i < r.maxIterations; i++ {
 		// 1. Build the prompt
 		prompt := r.buildPrompt(goal, steps)
@@ -77,6 +84,27 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 		// RULE 1: If the LLM provided an action, ALWAYS execute it first,
 		//         even if it also provided a final_answer. The action takes priority.
 		if step.Action != "" {
+			// LOOP DETECTION: Check if this exact tool+params was already called
+			paramsStr := string(step.ActionInput)
+			currentCall := toolCall{action: step.Action, params: paramsStr}
+			loopCount := 0
+			for _, prev := range callHistory {
+				if prev.action == currentCall.action && prev.params == currentCall.params {
+					loopCount++
+				}
+			}
+
+			if loopCount >= 1 {
+				// Same tool called twice with same params — break the loop
+				log.Printf("[ReAct] LOOP DETECTED: %s called %d times with same params. Breaking loop.", step.Action, loopCount+1)
+				if toolCalled {
+					return fmt.Sprintf("I've determined the %s. No further action needed.", step.Action), nil
+				}
+				return step.Thought, nil
+			}
+
+			callHistory = append(callHistory, currentCall)
+
 			log.Printf("[ReAct] Action: %s(%s)", step.Action, step.ActionInput)
 
 			// Handle "naked" strings (LLM sending a bare string instead of a JSON object)
@@ -122,6 +150,10 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 		}
 
 		// RULE 3: No action AND no final_answer — the LLM is stuck.
+		// If a tool was already called, treat the thought as the final answer.
+		if toolCalled {
+			return step.Thought, nil
+		}
 		return "", fmt.Errorf("agent failed to provide action or final answer")
 	}
 
@@ -132,38 +164,28 @@ func (r *ReActLoop) buildPrompt(goal string, steps []ReActStep) string {
 	tools := r.registry.List()
 	toolsStr, _ := json.MarshalIndent(tools, "", "  ")
 
-	system := fmt.Sprintf(`You are an AI agent. Your goal: %s
+	system := fmt.Sprintf(`You are Mai's reasoning engine. Goal: %s
 
-You MUST respond with a single JSON object. You have these tools:
+Available tools:
 %s
 
-DECISION TABLE — pick the RIGHT tool:
-- "play X" or "YouTube" → youtube_play with {"query":"X","browser":"..."}
-- "open X" (app name) → open_application with {"app_name":"X"}
-- "what time" or "date" → get_system_time with {}
-- "search X" or "lookup X" → web_search with {"query":"X"}
-- "write/save to file" → file_write with {"path":"...","content":"..."}
-- "send WhatsApp" → whatsapp_send with {"message":"...","recipient":"..."}
-- "type X" or "press key" → ui_automation with {"action":"type","value":"X"}
-- "Ctrl+F" or shortcut → ui_automation with {"action":"shortcut","value":"f","modifier":"control"}
-
-EXAMPLES:
-User: "Play Perfect on YouTube"
-→ {"thought":"User wants to play Perfect on YouTube.","action":"youtube_play","action_input":{"query":"Perfect"},"final_answer":""}
-
-User: "What time is it?"
-→ {"thought":"User wants the current time.","action":"get_system_time","action_input":{},"final_answer":""}
-
-User: "Open WhatsApp"
-→ {"thought":"User wants to open WhatsApp.","action":"open_application","action_input":{"app_name":"whatsapp"},"final_answer":""}
-
 RULES:
-1. You MUST call a tool. Do NOT skip to final_answer.
-2. action_input MUST be a JSON object like {"key":"value"}, never a bare string.
-3. Leave final_answer EMPTY ("") when using an action.
-4. Only write final_answer AFTER you see an Observation from a tool.
+1. Pick the correct tool. Call it. Wait for the Observation. Then provide final_answer.
+2. NEVER call the same tool twice with the same parameters.
+3. action_input must be a JSON object: {"key":"value"}.
+4. Leave final_answer empty ("") until you have an Observation.
+5. After one tool call + observation, provide final_answer immediately.
 
-Respond with ONLY this JSON: {"thought":"...","action":"...","action_input":{...},"final_answer":""}
+Tool selection:
+- "play X on Y" → youtube_play {"query":"X","browser":"Y"}
+- "open X" → open_application {"app_name":"X"}
+- "what time" → get_system_time {}
+- "search X" → web_search {"query":"X"}
+- "send message" → whatsapp_send {"message":"...","recipient":"..."}
+- "type/press" → ui_automation {"action":"type","value":"X"}
+
+Respond: {"thought":"...","action":"tool_name","action_input":{...},"final_answer":""}
+OR after observation: {"thought":"...","action":"","action_input":{},"final_answer":"your answer"}
 
 Previous steps:
 `, goal, string(toolsStr))
