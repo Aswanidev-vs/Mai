@@ -2,30 +2,44 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"math"
+	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/user/mai/pkg/interfaces"
 )
 
-// SemanticStore implements interfaces.SemanticStore using local vector storage
-type SemanticStore struct {
-	mu      sync.RWMutex
-	facts   []interfaces.MemoryEntry
-	vectors [][]float32
-	llm     interfaces.LLMProvider
+type vectorEntry struct {
+	Fact   interfaces.MemoryEntry `json:"fact"`
+	Vector []float32              `json:"vector"`
 }
 
-func NewSemanticStore(llm interfaces.LLMProvider) *SemanticStore {
-	return &SemanticStore{
-		facts:   make([]interfaces.MemoryEntry, 0),
-		vectors: make([][]float32, 0),
-		llm:     llm,
+type SemanticStore struct {
+	mu       sync.RWMutex
+	entries  []vectorEntry
+	llm      interfaces.LLMProvider
+	filePath string
+}
+
+func NewSemanticStore(llm interfaces.LLMProvider, dataDir string) *SemanticStore {
+	if err := os.MkdirAll(dataDir, 0755); err == nil {
+		// ok
 	}
+
+	store := &SemanticStore{
+		entries:  make([]vectorEntry, 0),
+		llm:      llm,
+		filePath: filepath.Join(dataDir, "semantic_vectors.json"),
+	}
+
+	store.load()
+	return store
 }
 
 func (s *SemanticStore) AddFact(entry interfaces.MemoryEntry) error {
-	// 1. Generate embedding for the content
 	embedding, err := s.llm.Embed(context.Background(), entry.Content)
 	if err != nil {
 		return err
@@ -34,13 +48,11 @@ func (s *SemanticStore) AddFact(entry interfaces.MemoryEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.facts = append(s.facts, entry)
-	s.vectors = append(s.vectors, embedding)
-	return nil
+	s.entries = append(s.entries, vectorEntry{Fact: entry, Vector: embedding})
+	return s.save()
 }
 
 func (s *SemanticStore) SearchFacts(query string, k int) ([]interfaces.MemoryEntry, error) {
-	// 1. Generate embedding for the query
 	queryVec, err := s.llm.Embed(context.Background(), query)
 	if err != nil {
 		return nil, err
@@ -49,38 +61,49 @@ func (s *SemanticStore) SearchFacts(query string, k int) ([]interfaces.MemoryEnt
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if len(s.facts) == 0 {
+	if len(s.entries) == 0 {
 		return []interfaces.MemoryEntry{}, nil
 	}
 
-	// 2. Calculate cosine similarity
-	type result struct {
-		index float64
+	type scored struct {
+		index int
 		score float64
 	}
-	var scores []result
-
-	for i, vec := range s.vectors {
-		score := cosineSimilarity(queryVec, vec)
-		scores = append(scores, result{index: float64(i), score: score})
+	scores := make([]scored, len(s.entries))
+	for i, e := range s.entries {
+		scores[i] = scored{index: i, score: cosineSimilarity(queryVec, e.Vector)}
 	}
 
-	// 3. Sort and return top k
-	// Simple bubble sort or similar for now
-	for i := 0; i < len(scores); i++ {
-		for j := i + 1; j < len(scores); j++ {
-			if scores[i].score < scores[j].score {
-				scores[i], scores[j] = scores[j], scores[i]
-			}
-		}
-	}
+	sort.Slice(scores, func(i, j int) bool { return scores[i].score > scores[j].score })
 
 	var topK []interfaces.MemoryEntry
 	for i := 0; i < k && i < len(scores); i++ {
-		topK = append(topK, s.facts[int(scores[i].index)])
+		topK = append(topK, s.entries[scores[i].index].Fact)
 	}
 
 	return topK, nil
+}
+
+func (s *SemanticStore) Count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.entries)
+}
+
+func (s *SemanticStore) save() error {
+	data, err := json.MarshalIndent(s.entries, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.filePath, data, 0644)
+}
+
+func (s *SemanticStore) load() error {
+	data, err := os.ReadFile(s.filePath)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, &s.entries)
 }
 
 func cosineSimilarity(a, b []float32) float64 {
