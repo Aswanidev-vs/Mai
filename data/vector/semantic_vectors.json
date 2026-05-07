@@ -1,0 +1,15 @@
+[
+  {
+    "fact": {
+      "id": "meta_1777697794",
+      "type": "meta_analysis",
+      "content": "Bottleneck detected: handle_input averaging 17.78134599s. Consider optimizing or using an alternative approach.",
+      "metadata": {
+        "success_rate": 0.7777777777777778,
+        "total_actions": 9
+      },
+      "timestamp": 1777697794
+    },
+    "vector": null
+  }
+]

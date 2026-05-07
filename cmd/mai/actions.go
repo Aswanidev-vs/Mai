@@ -50,23 +50,23 @@ type parseRule struct {
 func NewActionParser() *ActionParser {
 	return &ActionParser{
 		rules: []parseRule{
-			// Web search: "search interstellar on google", "look up weather on bing"
+			// Web search with platform: "search interstellar on google", "look up weather on bing"
 			{
 				pattern:    regexp.MustCompile(`(?i)^(search|find|look\s*up)\s+(.+?)\s+(?:on|using)\s+(google|bing|yahoo|duckduckgo|youtube|wikipedia)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?`),
 				actionType: ActionWebSearch,
 				paramKeys:  []string{"_", "query", "platform", "browser"},
 				confidence: 0.95,
 			},
-			// Play media with browser first: "play interstellar on brave on youtube"
+			// Play media with browser first: "play interstellar on brave on youtube", "play perfect in brave on youtube"
 			{
-				pattern:    regexp.MustCompile(`(?i)^(play|listen\s*to)\s+(.+?)\s+(?:on|using|in)\s+(chrome|brave|firefox|edge)(?:\s+browser)?\s+(?:on|using)\s+(youtube|spotify|soundcloud)`),
+				pattern:    regexp.MustCompile(`(?i)^(play|listen\s*to)\s+(.+?)\s+(?:on|using|in)\s+(chrome|brave|firefox|edge)(?:\s+browser)?\s+(?:on|using|in)\s+(youtube|spotify|soundcloud)`),
 				actionType: ActionPlayMedia,
 				paramKeys:  []string{"_", "query", "browser", "platform"},
 				confidence: 0.95,
 			},
-			// Play media: "play interstellar on youtube", "play some music on spotify"
+			// Play media: "play interstellar on youtube", "play some music on spotify", "play perfect in youtube on brave"
 			{
-				pattern:    regexp.MustCompile(`(?i)^(play|listen\s*to)\s+(.+?)\s+(?:on|using)\s+(youtube|spotify|soundcloud)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?`),
+				pattern:    regexp.MustCompile(`(?i)^(play|listen\s*to)\s+(.+?)\s+(?:on|using|in)\s+(youtube|spotify|soundcloud)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?`),
 				actionType: ActionPlayMedia,
 				paramKeys:  []string{"_", "query", "platform", "browser"},
 				confidence: 0.95,
@@ -78,20 +78,6 @@ func NewActionParser() *ActionParser {
 				paramKeys:  []string{"platform", "query", "browser"},
 				confidence: 0.95,
 			},
-			// Play media: "play interstellar on youtube", "play some music on spotify"
-			{
-				pattern:    regexp.MustCompile(`(?i)^(play|listen\s*to)\s+(.+?)\s+(?:on|using)\s+(youtube|spotify|soundcloud)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?`),
-				actionType: ActionPlayMedia,
-				paramKeys:  []string{"_", "query", "platform", "browser"},
-				confidence: 0.95,
-			},
-			// Combined: "open youtube and play interstellar"
-			{
-				pattern:    regexp.MustCompile(`(?i)^(?:open|go\s*to)\s+(youtube|spotify|soundcloud)\s+(?:and|to|for)\s+(?:play|search|find)\s+(.+?)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?$`),
-				actionType: ActionPlayMedia,
-				paramKeys:  []string{"platform", "query", "browser"},
-				confidence: 0.95,
-			},
 			// Open site: "open youtube", "go to github.com"
 			{
 				pattern:    regexp.MustCompile(`(?i)^(open|go\s*to)\s+(youtube|google|github|facebook|twitter|instagram|reddit|amazon|netflix|gmail|wikipedia)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?`),
@@ -99,12 +85,11 @@ func NewActionParser() *ActionParser {
 				paramKeys:  []string{"_", "platform", "browser"},
 				confidence: 0.90,
 			},
-			// Open application: "open chrome", "launch notepad", "start firefox"
-			// Captures 1-3 words after the command to avoid grabbing repeated commands
+			// Open application: "open chrome", "launch notepad", "start firefox", "open spotify in brave"
 			{
-				pattern:    regexp.MustCompile(`(?i)^(open|launch|start)\s+([^\s]+(?:\s+[^\s]+){0,2})`),
+				pattern:    regexp.MustCompile(`(?i)^(open|launch|start)\s+(.+?)(?:\s+(?:in|using|on)\s+(chrome|brave|firefox|edge))?$`),
 				actionType: ActionOpenApp,
-				paramKeys:  []string{"_", "name"},
+				paramKeys:  []string{"_", "name", "browser"},
 				confidence: 0.95,
 			},
 
@@ -515,10 +500,14 @@ func (e *ActionExecutor) Execute(action Action) (string, error) {
 		if !ok {
 			return "", fmt.Errorf("missing app name")
 		}
+		browser, _ := action.Params["browser"].(string)
 		// Fuzzy match to handle ASR misheard words due to accent
 		name = fuzzyMatchAppName(name)
-		if err := e.auto.OpenApp(name); err != nil {
+		if err := e.auto.OpenAppWithBrowser(name, browser); err != nil {
 			return "", err
+		}
+		if browser != "" {
+			return fmt.Sprintf("Opened %s in %s.", name, browser), nil
 		}
 		return fmt.Sprintf("Opened %s.", name), nil
 
@@ -608,7 +597,7 @@ func (e *ActionExecutor) Execute(action Action) (string, error) {
 		query, _ := action.Params["query"].(string)
 		browser, _ := action.Params["browser"].(string)
 		if platform == "" {
-			return "", fmt.Errorf("missing platform")
+			platform = "google"
 		}
 		if err := e.auto.WebSearch(platform, query, browser); err != nil {
 			return "", err

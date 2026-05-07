@@ -69,10 +69,53 @@ var knownApps = map[string]appInfo{
 	"photos":        {exeName: "ms-photos:", windowTitle: "Photos", protocol: "ms-photos:"},
 }
 
+// webFallback maps app names to their web URLs.
+// When a desktop app is not installed, OpenApp opens the web version instead.
+var webFallback = map[string]string{
+	"spotify":    "https://open.spotify.com",
+	"instagram":  "https://www.instagram.com",
+	"facebook":   "https://www.facebook.com",
+	"twitter":    "https://x.com",
+	"x":          "https://x.com",
+	"reddit":     "https://www.reddit.com",
+	"youtube":    "https://www.youtube.com",
+	"whatsapp":   "https://web.whatsapp.com",
+	"telegram":   "https://web.telegram.org",
+	"discord":    "https://discord.com/app",
+	"netflix":    "https://www.netflix.com",
+	"amazon":     "https://www.amazon.com",
+	"gmail":      "https://mail.google.com",
+	"github":     "https://github.com",
+	"linkedin":   "https://www.linkedin.com",
+	"pinterest":  "https://www.pinterest.com",
+	"tiktok":     "https://www.tiktok.com",
+	"twitch":     "https://www.twitch.tv",
+	"slack":      "https://slack.com",
+	"notion":     "https://www.notion.so",
+	"figma":      "https://www.figma.com",
+	"canva":      "https://www.canva.com",
+	"chatgpt":    "https://chat.openai.com",
+	"claude":     "https://claude.ai",
+	"google":     "https://www.google.com",
+	"maps":       "https://maps.google.com",
+	"drive":      "https://drive.google.com",
+	"calendar":   "https://calendar.google.com",
+	"word":       "https://www.office.com",
+	"excel":      "https://www.office.com",
+	"powerpoint": "https://www.office.com",
+	"outlook":    "https://outlook.live.com",
+}
+
 // OpenApp opens an application by name.
-// Strategy order: Protocol URI → AppID (Get-StartApps) → Direct exe → PATH search → Windows Search (last resort).
+// If the app is not installed and has a web version, opens it in the browser.
 func (a *Automation) OpenApp(name string) error {
-	log.Printf("[AUTO] Opening application: %s", name)
+	return a.OpenAppWithBrowser(name, "")
+}
+
+// OpenAppWithBrowser opens an application by name, with optional browser for web fallback.
+// Strategy: Desktop app → Protocol URI → AppID → Direct exe → PATH → Windows Search → Web fallback.
+func (a *Automation) OpenAppWithBrowser(name string, browser string) error {
+	log.Printf("[AUTO] Opening application: %s (browser: %s)", name, browser)
 	nameLower := strings.ToLower(strings.TrimSpace(name))
 
 	// Resolve known app info
@@ -178,6 +221,15 @@ func (a *Automation) OpenApp(name string) error {
 			robotgo.KeyTap("escape")
 			time.Sleep(200 * time.Millisecond)
 		}
+	}
+
+	// Strategy 6: Web fallback — app not installed, open web version in browser
+	if webURL, hasWeb := webFallback[nameLower]; hasWeb {
+		log.Printf("[AUTO] App '%s' not installed. Opening web version: %s", name, webURL)
+		if browser != "" {
+			return a.OpenURL(webURL, browser)
+		}
+		return a.OpenURL(webURL, "")
 	}
 
 	return fmt.Errorf("could not open application: %s", name)

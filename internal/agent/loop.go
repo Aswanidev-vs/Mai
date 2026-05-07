@@ -14,19 +14,21 @@ import (
 )
 
 type Orchestrator struct {
-	bus       interfaces.EventBus
-	memory    *memory.Manager
-	llm       interfaces.LLMProvider
-	registry  interfaces.ToolRegistry
-	react     *cognition.ReActLoop
-	planner   *cognition.Planner
-	goals     *GoalManager
-	emotion   *personality.EmotionDetector
-	meta      *MetaCognition
+	bus      interfaces.EventBus
+	memory   *memory.Manager
+	llm      interfaces.LLMProvider
+	registry interfaces.ToolRegistry
+	react    *cognition.ReActLoop
+	planner  *cognition.Planner
+	goals    *GoalManager
+	emotion  *personality.EmotionDetector
+	meta     *MetaCognition
 
 	status       interfaces.AgentStatus
 	cancel       context.CancelFunc
 	lastUserTime time.Time
+	lastSpoken   string    // Track last TTS output to detect echo
+	lastSpokenAt time.Time // When the last TTS finished
 
 	DirectAction func(text string) (bool, string, error)
 }
@@ -39,16 +41,16 @@ func NewOrchestrator(
 	reactLoop *cognition.ReActLoop,
 ) *Orchestrator {
 	return &Orchestrator{
-		bus:       bus,
-		memory:    mem,
-		llm:       llm,
-		registry:  registry,
-		react:     reactLoop,
-		planner:   cognition.NewPlanner(llm),
-		goals:     NewGoalManager(),
-		emotion:   personality.NewEmotionDetector(),
-		meta:      NewMetaCognition(),
-		status:    interfaces.StatusIdle,
+		bus:      bus,
+		memory:   mem,
+		llm:      llm,
+		registry: registry,
+		react:    reactLoop,
+		planner:  cognition.NewPlanner(llm),
+		goals:    NewGoalManager(),
+		emotion:  personality.NewEmotionDetector(),
+		meta:     NewMetaCognition(),
+		status:   interfaces.StatusIdle,
 	}
 }
 
@@ -148,7 +150,7 @@ func (o *Orchestrator) selfImprove(ctx context.Context) {
 		Content:   analysis,
 		Timestamp: time.Now().Unix(),
 		Metadata: map[string]interface{}{
-			"success_rate": report.ActionSuccessRate,
+			"success_rate":  report.ActionSuccessRate,
 			"total_actions": report.TotalActions,
 		},
 	})
@@ -176,6 +178,16 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	text, ok := input["text"].(string)
 	if !ok {
 		return nil, fmt.Errorf("input must contain 'text' field")
+	}
+
+	// --- ECHO DETECTION ---
+	// If ASR text is similar to what was just spoken by TTS, it's echo — ignore it.
+	if time.Since(o.lastSpokenAt) < 5*time.Second && o.lastSpoken != "" {
+		inputLower := strings.ToLower(text)
+		if isEcho(inputLower, o.lastSpoken) {
+			log.Printf("[Agent] Echo detected — ignoring: %q (matches TTS: %q)", text, o.lastSpoken)
+			return &interfaces.AgentResponse{Text: "", Success: true}, nil
+		}
 	}
 
 	o.status = interfaces.StatusThinking
@@ -208,9 +220,27 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	})
 
 	// --- SMART ROUTING ---
+	lowerText := strings.ToLower(text)
 
 	// 1. Try legacy ActionExecutor first (regex — fastest, most reliable)
-	if o.DirectAction != nil {
+	//    BUT: skip regex for "search X" without a platform — we want deep_search (fetches results)
+	//         instead of web_search (just opens a browser).
+	searchPlatforms := []string{"google", "bing", "yahoo", "duckduckgo", "wikipedia", "youtube"}
+	isSearchWithoutPlatform := false
+	if strings.HasPrefix(lowerText, "search ") || strings.HasPrefix(lowerText, "find ") || strings.HasPrefix(lowerText, "look up ") || strings.HasPrefix(lowerText, "look ") {
+		hasPlatform := false
+		for _, p := range searchPlatforms {
+			if strings.Contains(lowerText, " on "+p) || strings.Contains(lowerText, " using "+p) {
+				hasPlatform = true
+				break
+			}
+		}
+		if !hasPlatform {
+			isSearchWithoutPlatform = true
+		}
+	}
+
+	if o.DirectAction != nil && !isSearchWithoutPlatform {
 		executed, feedback, err := o.DirectAction(text)
 		if err != nil {
 			o.meta.RecordActionResult(false)
@@ -221,9 +251,14 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 			log.Printf("[Agent] Executed via regex parser.")
 			return &interfaces.AgentResponse{Text: feedback, Success: true}, nil
 		}
+	} else if isSearchWithoutPlatform {
+		log.Printf("[Agent] Search without platform detected — routing to deep_search via ReAct")
+		response, err := o.react.Execute(ctx, text)
+		if err != nil {
+			return nil, err
+		}
+		return &interfaces.AgentResponse{Text: response, Success: true}, nil
 	}
-
-	lowerText := strings.ToLower(text)
 
 	// 2. Determine if this is a command, reasoning task, or conversation
 	isLikelyCommand := false
@@ -233,6 +268,25 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 			isLikelyCommand = true
 			break
 		}
+	}
+
+	// "list/show/top/best" + knowledge request → route to ReAct (deep_search) directly
+	// This avoids the slow conversational LLM call for things that need web results.
+	knowledgeTriggers := []string{"list me", "list the", "top ", "best ", "show me", "recommend", "what are the", "what is the best", "what are some"}
+	isKnowledgeRequest := false
+	for _, kw := range knowledgeTriggers {
+		if strings.Contains(lowerText, kw) {
+			isKnowledgeRequest = true
+			break
+		}
+	}
+	if isKnowledgeRequest && !isLikelyCommand {
+		log.Printf("[Agent] Knowledge request detected, routing to ReAct: %s", text)
+		response, err := o.react.Execute(ctx, text)
+		if err != nil {
+			return nil, err
+		}
+		return &interfaces.AgentResponse{Text: response, Success: true}, nil
 	}
 
 	// Multi-step indicators → use planner
@@ -253,6 +307,7 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		"invent", "create", "solve", "design", "think", "analyze", "plan",
 		"research", "investigate", "calculate", "compare", "evaluate",
 		"why is", "how does", "explain", "what if", "summarize", "write",
+		"what time", "what date", "what day", "tell me the time", "current time", "what is the date",
 	}
 
 	requiresReasoning := false
@@ -347,6 +402,14 @@ Otherwise, respond naturally as Mai.%s`, fullPrompt)
 				o.meta.RecordActionResult(true)
 				return &interfaces.AgentResponse{Text: feedback, Success: true}, nil
 			}
+		}
+
+		// DirectAction failed — route to ReAct loop which has deep_search, youtube_play, etc.
+		log.Printf("[Agent] DirectAction failed for [ACTION] %q, routing to ReAct", actionCmd)
+		response, err := o.react.Execute(ctx, actionCmd)
+		if err == nil {
+			o.meta.RecordActionResult(true)
+			return &interfaces.AgentResponse{Text: response, Success: true}, nil
 		}
 	}
 
@@ -471,6 +534,9 @@ func (o *Orchestrator) selectRelevantTools(text string) []interfaces.ToolMetadat
 
 // --- EMOTIONAL ADAPTATION ---
 func (o *Orchestrator) adaptResponse(response string, emotion personality.EmotionState) string {
+	// Clean XML tags and artifacts first
+	response = cleanResponse(response)
+
 	if emotion.Type == personality.EmotionNeutral || emotion.Confidence < 0.4 {
 		return response
 	}
@@ -493,6 +559,8 @@ func (o *Orchestrator) adaptResponse(response string, emotion personality.Emotio
 }
 
 func (o *Orchestrator) publishTTS(text string) {
+	o.lastSpoken = strings.ToLower(text)
+	o.lastSpokenAt = time.Now()
 	o.bus.Publish(interfaces.Event{
 		Type:   "action.tts.request",
 		Source: "agent.orchestrator",
@@ -540,4 +608,67 @@ func (o *Orchestrator) handleVision(event interfaces.Event) {
 			Timestamp: time.Now().Unix(),
 		})
 	}
+}
+
+// isEcho checks if ASR input is likely an echo of recent TTS output.
+// Compares word overlap — if >50% of input words appear in the spoken text, it's echo.
+func isEcho(input, spoken string) bool {
+	inputWords := strings.Fields(input)
+	spokenWords := strings.Fields(spoken)
+
+	if len(inputWords) == 0 || len(spokenWords) == 0 {
+		return false
+	}
+
+	spokenSet := make(map[string]bool)
+	for _, w := range spokenWords {
+		spokenSet[w] = true
+	}
+
+	matchCount := 0
+	for _, w := range inputWords {
+		if spokenSet[w] {
+			matchCount++
+		}
+	}
+
+	// If >50% of input words were in the spoken text, it's echo
+	matchRatio := float64(matchCount) / float64(len(inputWords))
+	return matchRatio > 0.5
+}
+
+// cleanResponse strips XML tags, markdown artifacts, and other noise from LLM responses
+// before they're sent to TTS.
+func cleanResponse(s string) string {
+	// Strip XML-like tags: <environment_details>, <thinking>, <analysis>, etc.
+	for {
+		start := strings.Index(s, "<")
+		end := strings.Index(s, ">")
+		if start == -1 || end == -1 || end <= start {
+			break
+		}
+		// Check if it looks like an XML tag (not math like "x < 5")
+		tag := s[start : end+1]
+		if len(tag) > 1 && (tag[1] >= 'a' && tag[1] <= 'z' || tag[1] >= 'A' && tag[1] <= 'Z' || tag[1] == '/') {
+			s = s[:start] + s[end+1:]
+		} else {
+			break
+		}
+	}
+
+	// Strip markdown code fences
+	s = strings.ReplaceAll(s, "```json", "")
+	s = strings.ReplaceAll(s, "```", "")
+
+	// Strip [ACTION] tags (shouldn't reach here, but just in case)
+	if idx := strings.Index(s, "[ACTION]"); idx != -1 {
+		s = s[:idx]
+	}
+
+	// Collapse multiple newlines
+	for strings.Contains(s, "\n\n\n") {
+		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
+	}
+
+	return strings.TrimSpace(s)
 }

@@ -26,6 +26,10 @@ func NewOpenAIProvider(model, url, apiKey, systemPrompt string) *OpenAIProvider 
 	if url == "" {
 		url = "https://api.openai.com/v1/chat/completions"
 	}
+	// Auto-append /chat/completions if the URL looks like a base API path
+	if !strings.HasSuffix(url, "/chat/completions") && !strings.HasSuffix(url, "/completions") {
+		url = strings.TrimRight(url, "/") + "/chat/completions"
+	}
 	return &OpenAIProvider{
 		model:        model,
 		url:          url,
