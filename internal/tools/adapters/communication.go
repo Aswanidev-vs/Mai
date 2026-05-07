@@ -4,25 +4,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
-	"runtime"
-	"time"
 
-	"github.com/go-vgo/robotgo"
 	"github.com/user/mai/pkg/interfaces"
 )
 
-type WhatsAppTool struct{}
+// WhatsAppSendFunc is the signature for the legacy SendMessage function.
+// Injected from cmd/mai/automation.go at startup.
+type WhatsAppSendFunc func(app, contact, text string) error
+
+// WhatsAppTool wraps the legacy Automation.SendMessage as a tool.
+type WhatsAppTool struct {
+	Send WhatsAppSendFunc
+}
 
 func (t *WhatsAppTool) Metadata() interfaces.ToolMetadata {
 	return interfaces.ToolMetadata{
 		Name:        "whatsapp_send",
-		Description: "Opens a WhatsApp chat window with a specific message. Use this to send messages to people.",
+		Description: "Sends a message to a contact on WhatsApp. The contact and message are required.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
 				"message": { "type": "string", "description": "The message to send" },
-				"recipient": { "type": "string", "description": "Optional: Name or phone number (e.g., 'Manu' or '123456789')" }
+				"recipient": { "type": "string", "description": "Contact name or phone number" }
 			},
 			"required": ["message"]
 		}`),
@@ -38,42 +41,16 @@ func (t *WhatsAppTool) Execute(ctx context.Context, params json.RawMessage) (int
 		return interfaces.ToolResult{Error: err}, nil
 	}
 
-	// 1. Open WhatsApp
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, `C:\Windows\System32\cmd.exe`, "/c", "start", "whatsapp:")
-	} else {
-		cmd = exec.CommandContext(ctx, "open", "whatsapp:")
+	if t.Send == nil {
+		return interfaces.ToolResult{Error: fmt.Errorf("whatsapp send function not configured")}, nil
 	}
 
-	if err := cmd.Start(); err != nil {
+	err := t.Send("whatsapp", args.Recipient, args.Message)
+	if err != nil {
 		return interfaces.ToolResult{Error: err}, nil
 	}
 
-	// 2. Wait for WhatsApp to open and gain focus
-	time.Sleep(2000 * time.Millisecond)
-
-	// 3. Automate the UI if a recipient is provided
-	if args.Recipient != "" {
-		// Ctrl+F to focus search
-		robotgo.KeyTap("f", "control")
-		time.Sleep(500 * time.Millisecond)
-
-		// Type recipient name
-		robotgo.TypeStr(args.Recipient)
-		time.Sleep(1000 * time.Millisecond) // Wait for search results
-
-		// Press Enter to select the contact
-		robotgo.KeyTap("enter")
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	// 4. Type the message and send
-	robotgo.TypeStr(args.Message)
-	time.Sleep(200 * time.Millisecond)
-	robotgo.KeyTap("enter")
-
 	return interfaces.ToolResult{
-		Output: fmt.Sprintf("Opened WhatsApp and automated sending message to '%s'.", args.Recipient),
+		Output: fmt.Sprintf("Sent message to '%s' on WhatsApp: %s", args.Recipient, args.Message),
 	}, nil
 }

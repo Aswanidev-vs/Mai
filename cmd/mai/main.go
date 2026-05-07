@@ -36,6 +36,7 @@ import (
 	"github.com/user/mai/internal/perception"
 	"github.com/user/mai/internal/tools"
 	"github.com/user/mai/internal/tools/adapters"
+	"github.com/user/mai/internal/tools/mcp"
 	"github.com/user/mai/pkg/interfaces"
 	"github.com/user/mai/pkg/models"
 	"gopkg.in/yaml.v3"
@@ -44,8 +45,13 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
+	// Load .env file if present
+	loadEnvFile(".env")
+
 	var configPath string
+	var testCloud bool
 	flag.StringVar(&configPath, "config", "config.yaml", "Path to configuration file")
+	flag.BoolVar(&testCloud, "test-cloud", false, "Test cloud LLM provider and exit")
 	flag.Parse()
 
 	// Load config
@@ -56,6 +62,20 @@ func main() {
 	var cfg models.Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		log.Fatalf("Failed to parse config: %v", err)
+	}
+
+	// Resolve environment variable references in config
+	resolveConfigEnv(&cfg)
+
+	// Test cloud provider if requested
+	if testCloud {
+		log.Println("[TEST] Testing cloud LLM provider...")
+		factory := llm.NewFactory(cfg)
+		if err := factory.TestCloudProvider(); err != nil {
+			log.Fatalf("[TEST] Cloud provider test FAILED: %v", err)
+		}
+		log.Println("[TEST] Cloud provider test PASSED")
+		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -267,13 +287,41 @@ func main() {
 		registry := tools.NewRegistry()
 		registry.Register(&adapters.ShellTool{})
 		registry.Register(&adapters.WebSearchTool{})
-		registry.Register(&adapters.OpenAppTool{})
+		registry.Register(&adapters.OpenAppTool{
+			Open: func(name, browser string) error {
+				return auto.OpenAppWithBrowser(name, browser)
+			},
+		})
 		registry.Register(&adapters.YouTubeTool{})
 		registry.Register(adapters.NewDeepSearchTool())
 		registry.Register(&adapters.FileWriteTool{})
 		registry.Register(&adapters.ClockTool{})
-		registry.Register(&adapters.WhatsAppTool{})
+		registry.Register(&adapters.WhatsAppTool{
+			Send: func(app, contact, text string) error {
+				return auto.SendMessage(app, contact, text)
+			},
+		})
 		registry.Register(&adapters.AutomationTool{})
+
+		// MCP — auto-discover tools from configured servers
+		if cfg.MCP.Enabled {
+			for _, serverURL := range cfg.MCP.Servers {
+				mcpClient := mcp.NewClient(serverURL)
+				mcpTools, err := mcpClient.DiscoverTools(ctx)
+				if err != nil {
+					log.Printf("[MCP] Failed to discover tools from %s: %v", serverURL, err)
+					continue
+				}
+				for _, toolMeta := range mcpTools {
+					adapter := mcp.NewMCPToolAdapter(toolMeta, mcpClient)
+					if err := registry.Register(adapter); err != nil {
+						log.Printf("[MCP] Failed to register tool %s: %v", toolMeta.Name, err)
+					} else {
+						log.Printf("[MCP] Registered external tool: %s", toolMeta.Name)
+					}
+				}
+			}
+		}
 
 		// Cognition
 		react := cognition.NewReActLoop(llmProvider, registry, workingMem)
@@ -291,13 +339,14 @@ func main() {
 			text, _ := event.Payload["text"].(string)
 			log.Printf("[AGENT] Speaking: %s", text)
 			isSpeaking = true
+			time.Sleep(200 * time.Millisecond) // Drain any in-flight audio callback
 			ttsMu.Lock()
 			audio := tts.Generate(text, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
 			ttsMu.Unlock()
 			if audio != nil {
 				playAudio(audio.Samples, audio.SampleRate)
 			}
-			time.Sleep(400 * time.Millisecond) // Wait for room echo to die down
+			time.Sleep(1500 * time.Millisecond) // Wait for room echo to fully die down
 			isSpeaking = false
 			lastResponseTime = time.Now()
 			log.Printf("[FOLLOW-UP] Listening for follow-up (15s window)...")
@@ -683,4 +732,58 @@ func join(dir, file string) string {
 		return dir + file
 	}
 	return dir + "/" + file
+}
+
+// loadEnvFile loads KEY=VALUE pairs from a .env file into environment variables.
+func loadEnvFile(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // .env file is optional
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+
+		// Remove surrounding quotes
+		if len(value) >= 2 && (value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'') {
+			value = value[1 : len(value)-1]
+		}
+
+		os.Setenv(key, value)
+		log.Printf("[ENV] Loaded: %s", key)
+	}
+}
+
+// resolveConfigEnv replaces config values that match environment variable names
+// with the actual env var values. This lets users put "OPENROUTER_API" in config.yaml
+// and have it resolved from the .env file or system environment.
+func resolveConfigEnv(cfg *models.Config) {
+	cfg.LLM.APIKey = resolveEnv(cfg.LLM.APIKey)
+	cfg.LLM.Cloud.APIKey = resolveEnv(cfg.LLM.Cloud.APIKey)
+	cfg.LLM.URL = resolveEnv(cfg.LLM.URL)
+	cfg.LLM.Cloud.URL = resolveEnv(cfg.LLM.Cloud.URL)
+	cfg.Vision.APIKey = resolveEnv(cfg.Vision.APIKey)
+}
+
+func resolveEnv(val string) string {
+	if val == "" {
+		return val
+	}
+	// If the value looks like an env var name (uppercase, underscores, no spaces)
+	// and the env var exists, use the env var value
+	if envVal := os.Getenv(val); envVal != "" {
+		return envVal
+	}
+	return val
 }

@@ -68,19 +68,23 @@ func (t *ShellTool) Execute(ctx context.Context, params json.RawMessage) (interf
 	}, nil
 }
 
-// OpenAppTool wraps the existing app launching logic
+// OpenAppFunc is the signature for the legacy OpenAppWithBrowser function.
+type OpenAppFunc func(name, browser string) error
+
+// OpenAppTool wraps the legacy Automation.OpenAppWithBrowser as a tool.
 type OpenAppTool struct {
-	// We might need to pass the existing Automation struct here or replicate logic
+	Open OpenAppFunc
 }
 
 func (t *OpenAppTool) Metadata() interfaces.ToolMetadata {
 	return interfaces.ToolMetadata{
 		Name:        "open_application",
-		Description: "Opens a specific application by name",
+		Description: "Opens an application by name. If the app is not installed, opens its web version in the browser. Optionally specify a browser.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"app_name": { "type": "string", "description": "Name of the app (e.g., 'chrome', 'notepad')" }
+				"app_name": { "type": "string", "description": "Name of the app (e.g., 'spotify', 'notepad', 'instagram')" },
+				"browser": { "type": "string", "description": "Optional browser for web fallback: 'chrome', 'brave', 'edge', 'firefox'" }
 			},
 			"required": ["app_name"]
 		}`),
@@ -90,25 +94,23 @@ func (t *OpenAppTool) Metadata() interfaces.ToolMetadata {
 func (t *OpenAppTool) Execute(ctx context.Context, params json.RawMessage) (interfaces.ToolResult, error) {
 	var args struct {
 		AppName string `json:"app_name"`
+		Browser string `json:"browser"`
 	}
 	if err := json.Unmarshal(params, &args); err != nil {
-		return interfaces.ToolResult{}, err
+		return interfaces.ToolResult{Error: err}, nil
 	}
 
-	// For now, use a simple shell command as an adapter
-	// In the future, this should call the internal/tools/adapters/automation.go
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		// Use absolute path for cmd.exe and 'start' to handle protocols and apps reliably
-		cmd = exec.CommandContext(ctx, `C:\Windows\System32\cmd.exe`, "/c", "start", "", args.AppName)
-	} else {
-		cmd = exec.CommandContext(ctx, "open", args.AppName)
+	if t.Open == nil {
+		return interfaces.ToolResult{Error: fmt.Errorf("open app function not configured")}, nil
 	}
 
-	err := cmd.Start()
+	err := t.Open(args.AppName, args.Browser)
 	if err != nil {
 		return interfaces.ToolResult{Error: err}, nil
 	}
 
-	return interfaces.ToolResult{Output: fmt.Sprintf("Successfully opened %s", args.AppName)}, nil
+	if args.Browser != "" {
+		return interfaces.ToolResult{Output: fmt.Sprintf("Opened %s in %s", args.AppName, args.Browser)}, nil
+	}
+	return interfaces.ToolResult{Output: fmt.Sprintf("Opened %s", args.AppName)}, nil
 }
