@@ -14,7 +14,7 @@ kws:
   provider: "cpu"
   num_threads: 2
   debug: 0
-  model_dir: "./sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
+  model_dir: "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
   encoder: "encoder-epoch-12-avg-2-chunk-16-left-64.onnx"
   decoder: "decoder-epoch-12-avg-2-chunk-16-left-64.onnx"
   joiner: "joiner-epoch-12-avg-2-chunk-16-left-64.onnx"
@@ -28,7 +28,7 @@ vad:
   num_threads: 2
   debug: 0
   sample_rate: 16000
-  model: "./silero_vad.onnx"
+  model: "silero_vad.onnx"
 
   window_size: 512
   threshold: 0.6
@@ -42,10 +42,12 @@ asr:
   provider: "cpu"
   num_threads: 2
   debug: 0
-  model_dir: "./sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"
-  tokens: "tokens.txt"
-  hotwords_file: ""
-  hotwords_score_bias: 1.5
+  model_dir: "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"
+  conv_frontend: "conv_frontend.onnx"
+  encoder: "encoder.int8.onnx"
+  decoder: "decoder.int8.onnx"
+  tokenizer: "tokenizer"
+  language: "en"
   decoding_method: "greedy_search"
 
 tts:
@@ -58,7 +60,7 @@ tts:
   active_model: "supertonic"
 
   supertonic:
-    model_dir: "./sherpa-onnx-supertonic-tts-int8-2026-03-06"
+    model_dir: "sherpa-onnx-supertonic-tts-int8-2026-03-06"
     duration_predictor: "duration_predictor.int8.onnx"
     text_encoder: "text_encoder.int8.onnx"
     vector_estimator: "vector_estimator.int8.onnx"
@@ -72,7 +74,7 @@ tts:
     extra: '{"lang": "en"}'
 
   pocket:
-    model_dir: "./sherpa-onnx-pocket-tts-2026-01-26"
+    model_dir: "sherpa-onnx-pocket-tts-2026-01-26"
     lm_flow: "lm_flow.onnx"
     lm_main: "lm_main.onnx"
     encoder: "encoder.onnx"
@@ -83,13 +85,13 @@ tts:
     voice_embedding_cache_capacity: 50
 
   zipvoice:
-    model_dir: "./sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"
+    model_dir: "sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"
     encoder: "encoder.int8.onnx"
     decoder: "decoder.int8.onnx"
     data_dir: "espeak-ng-data"
     lexicon: "lexicon.txt"
     tokens: "tokens.txt"
-    vocoder: "./vocos_24khz.onnx"  # ⚠️ MUST DOWNLOAD: https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos_24khz.onnx
+    vocoder: "vocos_24khz.onnx"  # ⚠️ MUST DOWNLOAD: https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos_24khz.onnx
     num_steps: 4
     speed: 1.0
     extra: '{"min_char_in_sentence": 10}'
