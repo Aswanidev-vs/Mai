@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -81,8 +82,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var isSpeaking bool
+	var isSpeaking int32 // atomic: 1=speaking, 0=idle
 	var lastResponseTime time.Time
+	var lastResponseMu sync.Mutex
 	var lastDetected time.Time = time.Now().Add(-time.Hour)
 	var sessionSamples []float32
 	var ttsMu sync.Mutex    // Mutex for thread-safe TTS
@@ -338,7 +340,7 @@ func main() {
 		bus.Subscribe("action.tts.request", func(event interfaces.Event) {
 			text, _ := event.Payload["text"].(string)
 			log.Printf("[AGENT] Speaking: %s", text)
-			isSpeaking = true
+			atomic.StoreInt32(&isSpeaking, 1)
 			time.Sleep(200 * time.Millisecond) // Drain any in-flight audio callback
 			ttsMu.Lock()
 			audio := tts.Generate(text, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
@@ -347,8 +349,10 @@ func main() {
 				playAudio(audio.Samples, audio.SampleRate)
 			}
 			time.Sleep(1500 * time.Millisecond) // Wait for room echo to fully die down
-			isSpeaking = false
+			atomic.StoreInt32(&isSpeaking, 0)
+			lastResponseMu.Lock()
 			lastResponseTime = time.Now()
+			lastResponseMu.Unlock()
 			log.Printf("[FOLLOW-UP] Listening for follow-up (15s window)...")
 		})
 	}
@@ -366,13 +370,13 @@ func main() {
 	type Task struct {
 		Text string
 	}
-	workerChan := make(chan Task, 10)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for task := range workerChan {
-			isSpeaking = true // Pause ASR while thinking and talking
+		workerChan := make(chan Task, 10)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range workerChan {
+				atomic.StoreInt32(&isSpeaking, 1) // Pause ASR while thinking and talking
 			log.Printf("[LLM] Thinking about: %s", task.Text)
 
 			// Try to parse and execute automation action
@@ -398,7 +402,7 @@ func main() {
 				response, err = generateOllamaResponse(ctx, cfg, task.Text)
 				if err != nil {
 					log.Printf("[LLM] Error: %v", err)
-					isSpeaking = false
+					atomic.StoreInt32(&isSpeaking, 0)
 					continue
 				}
 			}
@@ -415,8 +419,10 @@ func main() {
 			}
 
 			time.Sleep(400 * time.Millisecond) // Wait for room echo to die down
-			isSpeaking = false // Resume ASR
+			atomic.StoreInt32(&isSpeaking, 0) // Resume ASR
+			lastResponseMu.Lock()
 			lastResponseTime = time.Now()
+			lastResponseMu.Unlock()
 			log.Println("[FOLLOW-UP] Listening for follow-up (15s window)...")
 		}
 	}()
@@ -437,7 +443,7 @@ func main() {
 		sherpaMu.Lock()
 		defer sherpaMu.Unlock()
 
-		if isSpeaking {
+		if atomic.LoadInt32(&isSpeaking) != 0 {
 			return // Ignore samples while Mai is talking
 		}
 		switch state {
