@@ -118,6 +118,9 @@ func (a *Automation) OpenAppWithBrowser(name string, browser string) error {
 	log.Printf("[AUTO] Opening application: %s (browser: %s)", name, browser)
 	nameLower := strings.ToLower(strings.TrimSpace(name))
 
+	// Normalize common ASR variants (e.g., "chat gpt" -> "chatgpt")
+	nameLower = strings.ReplaceAll(nameLower, " ", "")
+
 	// Resolve known app info
 	info, isKnown := knownApps[nameLower]
 	exeName := name
@@ -534,7 +537,7 @@ func (a *Automation) SendMessage(app, contact, text string) error {
 	// Step 2: If a contact is specified, search for them
 	if contact != "" {
 		log.Printf("[AUTO] Searching for contact: %s", contact)
-		// Most messaging apps (WhatsApp, Telegram, Discord) 
+		// Most messaging apps (WhatsApp, Telegram, Discord)
 		if appLower == "whatsapp" || appLower == "telegram" || appLower == "discord" {
 			// Ensure we are focused on the correct window
 			a.FocusWindow(windowTitle)
@@ -542,7 +545,7 @@ func (a *Automation) SendMessage(app, contact, text string) error {
 
 			// User specifically requested Ctrl+F for search
 			searchKey := "f"
-			
+
 			log.Printf("[AUTO] Triggering search with Ctrl+%s", searchKey)
 			robotgo.KeyTap(searchKey, "ctrl")
 			time.Sleep(1000 * time.Millisecond)
@@ -552,7 +555,7 @@ func (a *Automation) SendMessage(app, contact, text string) error {
 			robotgo.KeyTap("a", "ctrl")
 			robotgo.KeyTap("backspace")
 			time.Sleep(400 * time.Millisecond)
-			
+
 			log.Printf("[AUTO] Typing contact name: %s", contact)
 			robotgo.TypeStr(contact)
 			time.Sleep(2000 * time.Millisecond) // Wait for search results to populate
