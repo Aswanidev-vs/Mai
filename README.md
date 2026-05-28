@@ -20,6 +20,10 @@
 | **Cost** | Zero ongoing fees — run on your existing hardware | Subscription models or API metering |
 | **Customizability** | Swap LLMs, TTS voices, and wake words freely | Locked to vendor's ecosystem |
 | **Voice Cloning** | Built-in zero-shot cloning with 3-10s samples | Not available or requires expensive services |
+| **Emotional Intelligence** | Prosody-aware STT + emotion-adaptive TTS | No emotional awareness |
+| **Proactive Intelligence** | Pattern learning, anticipatory actions, idle reminders | Purely reactive |
+| **User Modeling** | Learns preferences, habits, frequent apps, topics | Generic interactions |
+| **Function Calling** | Structured JSON tool invocation from LLM | Raw text parsing only |
 | **Open Source** | Fully open — modify, audit, and extend | Black-box proprietary systems |
 
 Unlike browser-based or cloud-dependent assistants, Mai's entire pipeline — wake word detection, speech recognition, reasoning, and speech synthesis — runs locally using optimized ONNX models.
@@ -36,13 +40,20 @@ Mai operates in two modes, switchable at runtime via configuration:
 | **Agentic Mode** | Full cognitive loop with memory, planning, and proactivity | Complex multi-step tasks, autonomous monitoring |
 
 In **Agentic Mode**, Mai features:
-- **Autonomous Proactive Monitoring**: Periodic self-reflection loops (every 5 minutes) analyze context and decide if proactive assistance is needed
-- **Multi-Step Goal Reasoning (ReAct)**: Breaks complex objectives into thought-action-observation cycles, executing tools sequentially
+- **Dynamic Prompt Engine**: JARVIS personality with 8 task-tailored prompt templates (conversation, command, reasoning, creative, analysis, proactive, greeting, emergency)
+- **Function Calling**: LLM outputs structured JSON tool calls (`{"tool":"name","params":{}}`) instead of raw text
+- **Emotion-Aware Pipeline**: Prosody analysis from audio → emotion detection → adapted TTS speed/pitch/volume
+- **Proactive Intelligence**: Pattern learning (time-of-day, frequency), anticipatory suggestions, idle reminders
+- **User Modeling**: Learns preferences, tracks habits, extracts topics, persists to `data/user_profile.json`
+- **Interrupt Hierarchy**: 4-level priority system (critical > high > normal > low) with queue management
+- **Autonomous Proactive Monitoring**: Periodic self-reflection loops analyze context and decide if proactive assistance is needed
+- **Multi-Step Goal Reasoning (ReAct)**: Breaks complex objectives into thought-action-observation cycles
 - **Dual-Path Cognitive Routing**:
-  - **Fast Path**: Sub-millisecond regex matching for direct commands (open app, send message, etc.)
+  - **Fast Path**: Sub-millisecond regex matching for direct commands
+  - **Function Calling Path**: Structured JSON tool invocation via LLM
   - **Reasoning Path**: Deep ReAct cognitive loops for analytical problem-solving
 - **Self-Correction (Reflexion)**: If a tool call fails, analyzes the error and adjusts strategy automatically
-- **Multi-Modal Perception Fusion**: Combines streaming audio with vision input via the event bus
+- **Hierarchical Memory**: Working (10-entry ring buffer) + Episodic (SQLite) + Semantic (vector search) + Procedural (skill patterns) + RAG pipeline
 
 Enable Agentic Mode in `config.yaml`:
 ```yaml
@@ -94,33 +105,111 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 | **YAML Configuration** | ✅ Ready | Single config file controls all speech and LLM components |
 | **Audio I/O** | ✅ Ready | Cross-platform microphone capture and speaker playback via miniaudio |
 
-### Agentic Layer (Optional)
+### Agentic Layer — Reasoning & Cognition
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **Dynamic Prompt Engine** | ✅ Ready | JARVIS personality with 8 task-tailored prompt templates, emotion-aware tone directives |
+| **Function Calling** | ✅ Ready | Structured JSON tool invocation from LLM — single call and chain execution modes |
+| **ReAct Reasoning Engine** | ✅ Ready | Multi-step thought → action → observation loops with anti-hallucination |
+| **Task Planner** | ✅ Ready | LLM-based task decomposition with dependency tracking |
+| **Fact Verifier** | ✅ Ready | Claim verification and tool call result validation |
+| **Smart Routing** | ✅ Ready | Regex fast path → function calling → ReAct → planner → conversation |
+
+### Agentic Layer — Memory & Knowledge
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **Working Memory** | ✅ Ready | In-memory short-term context buffer (10-entry ring buffer) |
+| **Episodic Memory** | ✅ Ready | SQLite-backed conversation and event history |
+| **Semantic Memory** | ✅ Ready | JSON vector store with cosine similarity search |
+| **Procedural Memory** | ✅ Ready | Skill and tool usage pattern storage with success/failure tracking |
+| **RAG Pipeline** | ✅ Ready | Semantic + episodic retrieval → LLM answer generation with confidence scoring |
+| **Session Continuity** | ✅ Ready | Restores last 20 episodic entries into working memory on startup |
+
+### Agentic Layer — Emotional Intelligence
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **Text Emotion Detection** | ✅ Ready | Keyword-based emotion scoring (happy, sad, stressed, excited, frustrated, calm) |
+| **Prosody Analyzer** | ✅ Ready | Audio feature extraction: RMS energy, zero-crossing rate, spectral centroid, pitch, volume variance, pause ratio |
+| **Emotion-Aware TTS** | ✅ Ready | Adapts speed, pitch, volume, emphasis, and pause scale per detected emotion |
+| **Response Adaptation** | ✅ Ready | Shortens responses for stressed users, prefixes empathy for frustrated users |
+| **Tone Directives** | ✅ Ready | Prompt engine injects emotion-specific directives (e.g., "be calm and efficient") |
+
+### Agentic Layer — Proactive Intelligence
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **Pattern Learning** | ✅ Ready | Tracks time-of-day and frequency patterns in user actions |
+| **Predictive Actions** | ✅ Ready | Suggests actions based on learned patterns and current context |
+| **Idle Reminders** | ✅ Ready | Notifies user of pending goals after 15+ minutes of silence |
+| **Performance Monitoring** | ✅ Ready | Tracks action success rate, warns if below 50% |
+| **Self-Improvement Loop** | ✅ Ready | Analyzes strategy performance every 10 minutes, adjusts approach |
+
+### Agentic Layer — User Modeling
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **User Profile** | ✅ Ready | Persists name, preferences, frequent apps, topics to `data/user_profile.json` |
+| **Preference Learning** | ✅ Ready | Extracts and remembers user preferences from conversations |
+| **Habit Tracking** | ✅ Ready | Records interaction patterns by time of day and action type |
+| **Topic Extraction** | ✅ Ready | Identifies user interests (music, coding, work, food, etc.) from conversation |
+| **Context Injection** | ✅ Ready | User profile context injected into prompts for personalized responses |
+
+### Agentic Layer — Infrastructure
 
 | Feature | Status | Description |
 |---------|--------|-------------|
 | **Event Bus** | ✅ Ready | Async pub/sub communication between all components |
-| **ReAct Reasoning Engine** | ✅ Ready | Multi-step thought → action → observation loops |
-| **Tool Registry** | ✅ Ready | 10+ built-in tools with dynamic discovery |
-| **Working Memory** | ✅ Ready | In-memory short-term context buffer |
-| **Episodic Memory** | ✅ Ready | SQLite-backed conversation and event history |
-| **Multi-Provider LLM** | ✅ Ready | Ollama, OpenAI, Gemini, Claude + Hybrid mode |
+| **Tool Registry** | ✅ Ready | Dynamic tool discovery with categories, semantic search, runtime registration |
+| **Interrupt Hierarchy** | ✅ Ready | 4-level priority system (critical > high > normal > low) with queue management |
+| **Multi-Provider LLM** | ✅ Ready | Ollama, OpenAI, Gemini, Claude, OpenRouter, NVIDIA + Hybrid mode |
 | **Privacy Guard** | ✅ Ready | Sensitive data detection for hybrid cloud/local routing |
-| **Proactive Monitoring** | ✅ Ready | Self-reflection loops every 5 minutes |
-| **Meta-Cognition** | ✅ Ready | Performance tracking and strategy monitoring |
 | **Perception Bridge** | ✅ Ready | Audio transcription and vision event publishing |
+| **Meta-Cognition** | ✅ Ready | Performance tracking, strategy analysis, and self-improvement |
+| **MCP Client** | ✅ Ready | Model Context Protocol for external tool discovery |
 
-### 🚧 Planned / Not Yet Implemented
+---
 
-| Feature | Status | Description |
-|---------|--------|-------------|
-| **Semantic Memory** | 🚧 Stub | Vector DB (Chroma/Milvus) for RAG — interface exists, not wired |
-| **Procedural Memory** | 🚧 Stub | Skill and tool usage pattern storage — interface exists |
-| **Voice Cloning** | 🚧 Config only | TTS model configs prepared; not yet wired into live pipeline |
-| **Vision / OCR** | 🚧 Partial | Vision bridge exists; continuous screen monitoring needs enhancement |
-| **Emotion Engine** | 🚧 Planned | Detect user tone and adapt response style |
-| **MCP Client** | 🚧 Stub | Model Context Protocol client exists; not fully integrated |
-| **HTN Planner** | 🚧 Planned | Hierarchical Task Network for complex goal decomposition |
-| **Web Search** | 🚧 Planned | Optional opt-in web knowledge (breaks offline mode) |
+## Emotion-Adaptive Pipeline
+
+Mai detects user emotion from both text and audio prosody, then adapts its voice and responses:
+
+```
+User speaks → Audio samples → Prosody Analyzer → Emotion Detection
+                                     ↓
+Text transcript → Text Emotion Detection → Combined Emotion State
+                                     ↓
+                    ┌────────────────┼────────────────┐
+                    ↓                ↓                ↓
+            Prompt Engine      TTS Adapter      Response Adapter
+         (tone directives)  (speed/pitch/vol)  (length/empathy)
+```
+
+**TTS Adaptation by Emotion:**
+
+| Emotion | Speed | Pitch | Volume | Pauses | Style |
+|---------|-------|-------|--------|--------|-------|
+| **Stressed** | -15% | -5% | -10% | +30% | Calm, efficient |
+| **Frustrated** | -10% | -2% | -5% | +20% | Patient, steady |
+| **Sad** | -20% | -8% | -15% | +50% | Gentle, warm |
+| **Excited** | +15% | +5% | +10% | -20% | Energetic, upbeat |
+| **Happy** | +5% | +3% | +5% | -10% | Warm, positive |
+| **Calm** | -5% | -2% | -5% | +10% | Relaxed, measured |
+
+---
+
+## Interrupt Hierarchy
+
+Mai uses a priority-based interrupt system to handle concurrent requests:
+
+| Level | Examples | Behavior |
+|-------|----------|----------|
+| **CRITICAL** | "emergency", "help me", "danger" | Always interrupts — stops current task immediately |
+| **HIGH** | "important", "asap", "stop", "cancel" | Interrupts speaking or processing |
+| **NORMAL** | Regular requests | Queued if currently busy |
+| **LOW** | Background tasks | Processed only when idle |
 
 ---
 
@@ -226,6 +315,12 @@ Mai: "Alright."
 
 You: "Tell me a joke"
 Mai: "Why did the Go programmer go broke? Because he used up all his cache!"
+
+You: "Play lo-fi beats on YouTube"
+Mai: "Playing lo-fi beats on YouTube."  [emotion-adaptive TTS: warm, relaxed]
+
+You: "I'm feeling stressed about the deadline"
+Mai: "I understand. Let me help you prioritize. What's the most urgent task?"  [slower, calmer TTS]
 ```
 
 ### Follow-Up Mode
@@ -247,6 +342,8 @@ Mai supports multiple LLM backends through a unified interface:
 | **OpenAI** | Cloud | Set `api_key` and `url` |
 | **Gemini** | Cloud | Set `api_key` |
 | **Claude** | Cloud | Set `api_key` |
+| **OpenRouter** | Cloud | Set `api_key` (200+ models) |
+| **NVIDIA NIM** | Cloud | Set `api_key` |
 
 ### Hybrid Mode
 
@@ -275,60 +372,99 @@ privacy:
 
 ## Tool Registry
 
-Mai's agentic mode includes a universal tool registry. Built-in tools:
+Mai's agentic mode includes a universal tool registry with category-based discovery and semantic search. Built-in tools:
 
-| Tool | Description | Example |
-|------|-------------|---------|
-| `shell_execute` | Run shell commands | `"List files in current directory"` |
-| `open_application` | Launch apps by name | `"Open Chrome"` |
-| `web_search` | Open browser search | `"Search for Go programming"` |
-| `youtube_play` | Play YouTube videos | `"Play Perfect on YouTube"` |
-| `whatsapp_send` | Send WhatsApp messages | `"Send hello to Manu on WhatsApp"` |
-| `get_system_time` | Get current time/date | `"What time is it?"` |
-| `file_write` | Write to files | `"Save this note to todo.txt"` |
-| `deep_search` | Research with reasoning | `"Research quantum computing"` |
-| `ui_automation` | UI control (click, type) | `"Press Ctrl+F"` |
-| `media_control` | Play/pause/skip media | `"Pause the music"` |
+| Tool | Category | Description | Example |
+|------|----------|-------------|---------|
+| `shell_execute` | system | Run shell commands | `"List files in current directory"` |
+| `open_application` | system | Launch apps by name | `"Open Chrome"` |
+| `web_search` | web | Open browser search | `"Search for Go programming"` |
+| `deep_search` | web | Research with results | `"Research quantum computing"` |
+| `youtube_play` | media | Play YouTube videos | `"Play Perfect on YouTube"` |
+| `whatsapp_send` | communication | Send WhatsApp messages | `"Send hello to Manu on WhatsApp"` |
+| `get_system_time` | query | Get current time/date | `"What time is it?"` |
+| `file_write` | file | Write to files | `"Save this note to todo.txt"` |
+| `ui_automation` | automation | UI control (click, type) | `"Press Ctrl+F"` |
 
-Tools are dynamically discovered and executed by the ReAct reasoning engine.
+Tools are dynamically discovered by category and keyword relevance. The LLM uses structured function calling to invoke tools with JSON parameters.
 
 ---
 
 ## Memory System
 
-Mai implements a hierarchical memory architecture:
+Mai implements a hierarchical memory architecture with RAG support:
 
 | Layer | Storage | Purpose | Status |
 |-------|---------|---------|--------|
-| **Working Memory** | In-memory (10-100 KB) | Short-term context buffer | ✅ Implemented |
+| **Working Memory** | In-memory ring buffer (10 entries) | Short-term conversational context | ✅ Implemented |
 | **Episodic Memory** | SQLite (`data/memory/episodic.db`) | Conversation and event history | ✅ Implemented |
-| **Semantic Memory** | Vector DB (planned) | Long-term facts and knowledge | 🚧 Stub |
-| **Procedural Memory** | Compiled patterns (planned) | Skills and tool usage patterns | 🚧 Stub |
+| **Semantic Memory** | JSON vector store (`data/vector/`) | Long-term facts with cosine similarity search | ✅ Implemented |
+| **Procedural Memory** | JSON (`data/memory/procedural.json`) | Skills and tool usage patterns with success rates | ✅ Implemented |
+| **RAG Pipeline** | Semantic + Episodic → LLM | Retrieve-augmented generation with confidence scoring | ✅ Implemented |
+| **User Profile** | JSON (`data/user_profile.json`) | Preferences, habits, frequent apps, topics | ✅ Implemented |
 
-The memory manager provides unified retrieval across all layers for the ReAct loop.
+The memory manager provides unified retrieval across all layers for the ReAct loop and conversation handler.
 
 ---
 
 ## Architecture & Core Systems
 
-Mai is built on a high-concurrency, event-driven architecture designed for low-latency offline interaction. It consists of three primary layers:
+Mai is built on a high-concurrency, event-driven architecture designed for low-latency offline interaction.
+
+### Request Flow (Agentic Mode)
+
+```
+User Speech → ASR → Transcription
+    ↓
+Orchestrator.HandleInput()
+    ├── Echo Detection (ignore TTS echo)
+    ├── Emotion Detection (text keywords)
+    ├── User Model Recording (interaction, topics, patterns)
+    ├── Prosody Analysis (if audio samples available)
+    ├── Interrupt Classification (critical/high/normal/low)
+    ├── Memory Storage (working + episodic)
+    │
+    ├── SMART ROUTING:
+    │   ├── Regex Fast Path → DirectAction (legacy, most reliable)
+    │   ├── Knowledge Request → ReAct Loop (deep_search)
+    │   ├── Multi-Step Command → Planner → Sequential Execution
+    │   ├── Command → Function Calling (structured JSON tool calls)
+    │   ├── Reasoning → ReAct Loop (think → act → observe)
+    │   └── Conversation → Prompt Engine → LLM (JARVIS personality)
+    │
+    ├── Response Adaptation (emotion-aware truncation, prefix)
+    └── TTS with Emotion-Adaptive Parameters (speed, pitch, volume)
+```
 
 ### 1. Perception Layer (`internal/perception`)
 - **Audio Bridge**: Captures microphone input via `malgo` (miniaudio) and routes it through VAD (Silero) and ASR (NeMo/Zipformer/Qwen).
 - **Vision Bridge**: Performs periodic or on-demand screen understanding using local Vision LLMs (via Ollama).
 - **Event Bus**: An in-process pub/sub bus that decouples perception from cognition.
 
-### 2. Cognitive Layer (`internal/cognition` & `internal/agent`)
-- **BDI Orchestrator**: Manages the agent's Beliefs (Memory), Desires (Goals), and Intentions (Plans).
-- **ReAct Engine**: A Reasoning + Acting loop that uses structured LLM output to plan and execute multi-step tool sequences.
-- **Memory Manager**: Maintains Working Memory (short-term context) and Episodic Memory (long-term conversation history).
-- **Two-Tier Routing**:
-  - **Fast Path**: Sub-millisecond regex matching for direct commands.
-  - **Reasoning Path**: Deep cognitive loops for complex problem solving.
+### 2. Cognitive Layer (`internal/cognition`)
+- **Prompt Engine**: Dynamic, context-aware prompt generation with JARVIS personality. 8 task types with tailored templates. Emotion-aware tone directives.
+- **Function Caller**: LLM structured JSON tool invocation — single calls and chain execution.
+- **ReAct Engine**: Reasoning + Acting loop with anti-hallucination, loop detection, and reflexion.
+- **Planner**: LLM-based task decomposition with dependency tracking and sequential execution.
+- **Verifier**: Claim verification and tool call result validation.
 
-### 3. Action Layer (`internal/tools` & `cmd/mai`)
-- **Tool Registry**: A central hub for discovering and executing capabilities.
-- **Action Executor**: A high-reliability legacy system for precise UI control.
+### 3. Agent Layer (`internal/agent`)
+- **Orchestrator**: Central brain — routes inputs, manages state, coordinates all subsystems.
+- **User Model**: Profile persistence, preference learning, habit tracking, topic extraction.
+- **Proactive Engine**: Pattern analysis (time-of-day, frequency), anticipatory actions, idle reminders.
+- **Interrupt Manager**: 4-level priority system with queue management.
+- **Goal Manager**: Priority queue with heap for long-running task management.
+- **Meta-Cognition**: Performance tracking, strategy analysis, self-improvement loop.
+- **Privacy Guard**: Sensitive data detection for hybrid cloud/local routing.
+
+### 4. Emotional Layer (`internal/personality`)
+- **Emotion Detector**: Text-based keyword scoring + prosody-based arousal/valence mapping.
+- **Prosody Analyzer**: Audio feature extraction (RMS, ZCR, spectral centroid, pitch, volume variance, pause ratio) with template matching.
+- **TTS Adapter**: Emotion-aware parameter control — speed, pitch, volume, emphasis, pause scale.
+
+### 5. Action Layer (`internal/tools` & `cmd/mai`)
+- **Tool Registry**: Dynamic discovery with categories, semantic search, runtime registration/unregistration.
+- **Action Executor**: High-reliability legacy system for precise UI control.
 - **RobotGo Automation**: Direct OS-level control for typing, shortcut execution, and application management.
 
 ---
@@ -338,14 +474,17 @@ Mai is built on a high-concurrency, event-driven architecture designed for low-l
 | Package | Responsibility |
 |---------|----------------|
 | `cmd/mai/` | Entry point, audio drivers, and the high-reliability legacy automation core |
-| `internal/agent/` | Central orchestrator (BDI loop, goal manager, executive controller) |
-| `internal/cognition/` | ReAct loop, reasoning, and planning logic |
-| `internal/llm/` | Multi-provider LLM client (Ollama, OpenAI, Gemini, Claude, Hybrid) |
-| `internal/memory/` | Hierarchical memory system (Working, Episodic, Semantic, Procedural) |
-| `internal/tools/` | Tool definitions and adapters (Shell, Web, YouTube, WhatsApp, etc.) |
+| `internal/agent/` | Orchestrator, user model, proactive engine, interrupt manager, goal manager, meta-cognition, privacy guard |
+| `internal/cognition/` | Prompt engine, function caller, ReAct loop, planner, verifier |
+| `internal/personality/` | Emotion detector, prosody analyzer, TTS adapter |
+| `internal/llm/` | Multi-provider LLM client (Ollama, OpenAI, Gemini, Claude, OpenRouter, NVIDIA, Hybrid) |
+| `internal/memory/` | Hierarchical memory system (Working, Episodic, Semantic, Procedural, RAG) |
+| `internal/tools/` | Tool registry with category-based discovery and adapters (Shell, Web, YouTube, WhatsApp, etc.) |
 | `internal/perception/` | Bridges for ASR, VAD, and Vision data |
 | `internal/events/` | Async pub/sub event bus for decoupled communication |
+| `internal/observability/` | Metrics collector, structured logger, health checker |
 | `pkg/interfaces/` | Core interface definitions ensuring modularity and testability |
+| `pkg/models/` | Configuration structs (YAML mapping) |
 
 ---
 
@@ -355,8 +494,8 @@ Mai is built on a high-concurrency, event-driven architecture designed for low-l
 - **Inference**: ONNX Runtime (CPU-optimized for speech/VAD/ASR)
 - **Automation**: RobotGo (Cross-platform UI control)
 - **Audio**: Malgo (C-bindings for miniaudio)
-- **LLM Backends**: Ollama (default), llama.cpp, OpenAI, Gemini, Claude
-- **Memory**: SQLite (episodic), in-memory (working), Chroma/Milvus (semantic, planned)
+- **LLM Backends**: Ollama (default), llama.cpp, OpenAI, Gemini, Claude, OpenRouter, NVIDIA
+- **Memory**: SQLite (episodic), JSON vectors (semantic), JSON files (procedural, user profile)
 - **Models**: NeMo CTC, Silero VAD, Supertonic TTS, Qwen/Gemma LLMs
 
 ---
@@ -366,7 +505,8 @@ Mai is built on a high-concurrency, event-driven architecture designed for low-l
 | Metric | Target | Actual (Optimized) |
 |--------|--------|-------------------|
 | **Fast Path Latency** | < 100ms | ~20-50ms (Regex matching) |
-| **Reasoning Latency** | < 2s | ~1.2s (phi3:mini / gemma:2b) |
+| **Function Calling Latency** | < 3s | ~1.5-2.5s (LLM structured output) |
+| **Reasoning Latency** | < 5s | ~2-4s (ReAct multi-step) |
 | **ASR Accuracy** | > 95% | Excellent (NeMo / Qwen3) |
 | **TTS Jitter** | < 5ms | Near-zero (Buffered playback) |
 
@@ -437,7 +577,7 @@ tts:
 ### LLM
 ```yaml
 llm:
-  provider: "ollama"        # "ollama", "openai", "gemini", "claude", "llamacpp"
+  provider: "ollama"        # "ollama", "openai", "gemini", "claude", "openrouter", "nvidia", "llamacpp"
   model: "gemma2:2b"
   url: "http://localhost:11434/api/generate"
   auto_start: true
@@ -477,24 +617,27 @@ cmd/mai/
 ├── actions.go       # Regex-based action parser
 └── vision.go        # Vision processing via Ollama
 internal/
-├── agent/           # Orchestrator, BDI loop, meta-cognition, privacy guard
-├── cognition/       # ReAct loop and reasoning logic
+├── agent/           # Orchestrator, user model, proactive engine, interrupt manager, goals, meta-cognition
+├── cognition/       # Prompt engine, function caller, ReAct loop, planner, verifier
+├── personality/     # Emotion detector, prosody analyzer, TTS adapter
 ├── llm/             # Multi-provider LLM clients and factory
-├── memory/          # Working, episodic, semantic, procedural memory
+├── memory/          # Working, episodic, semantic, procedural memory + RAG pipeline
 ├── perception/      # Audio and vision bridges
-├── tools/           # Tool registry and adapters
+├── tools/           # Tool registry with categories and adapters
 ├── events/          # Pub/sub event bus
-└── config/          # Configuration management
+└── observability/   # Metrics, logging, health checks
 pkg/
-└── interfaces/      # Core Go interfaces (agent, cognition, llm, memory, tools, events)
+├── interfaces/      # Core Go interfaces (agent, cognition, llm, memory, tools, events)
+└── models/          # Configuration structs
 data/
-├── memory/          # SQLite databases
-├── vector/          # Vector DB files (future)
+├── memory/          # SQLite databases, procedural.json, user_profile.json
+├── vector/          # Semantic vector store (JSON)
 └── cache/           # Temporary caches
 config.example.yaml  # Configuration template
 go.mod / go.sum      # Go module definitions
 prd.md              # Product Requirements Document
 ROADMAP.md          # Implementation roadmap
+progress.md         # Implementation progress tracker
 ```
 
 ### Build Commands
@@ -508,6 +651,9 @@ go build -ldflags="-s -w" -o mai.exe ./cmd/mai
 
 # Run tests
 go test ./...
+
+# Static analysis
+go vet ./cmd/mai ./internal/... ./pkg/...
 ```
 
 ---
@@ -522,17 +668,21 @@ go test ./...
 | 4 | Streaming ASR | ✅ Complete | NeMo CTC + Zipformer + Qwen3 support |
 | 5 | TTS Integration | ✅ Complete | Supertonic / Pocket / ZipVoice model support |
 | 6 | Voice Pipeline Orchestration | ✅ Complete | State machine, follow-up mode, interruptible playback |
-| 7 | LLM Integration | ✅ Complete | Multi-provider: Ollama, OpenAI, Gemini, Claude, Hybrid |
+| 7 | LLM Integration | ✅ Complete | Multi-provider: Ollama, OpenAI, Gemini, Claude, OpenRouter, NVIDIA, Hybrid |
 | 7b | Command Parser & Action System | ✅ Complete | High-reliability regex (Fast Path) + LLM fallback |
 | 8 | Automation (RobotGo) | ✅ Complete | WhatsApp, Telegram, YouTube, and System App control |
-| 9 | Memory System | 🚧 Partial | Working + Episodic implemented; Semantic + Procedural stubs |
+| 9 | Memory System | ✅ Complete | Working + Episodic + Semantic + Procedural + RAG pipeline |
 | 10 | Vision (Screen OCR) | 🚧 Partial | Vision bridge exists; continuous monitoring needs work |
-| 11 | Emotion Engine | 🚧 Planned | Tone detection, adaptive TTS speed/pitch |
-| 12 | Web Search (Opt-in) | 🚧 Planned | DuckDuckGo/SearXNG integration; disabled by default |
-| 13 | Polish & Performance Tuning | 🚧 In Progress | Routing optimization, latency reduction, stability fixes |
-| 14 | Multi-step Task Planning | ✅ Complete | ReAct reasoning engine for complex sequences |
+| 11 | Emotion Engine | ✅ Complete | Text emotion detection, prosody analysis, emotion-adaptive TTS |
+| 12 | Dynamic Prompt Engine | ✅ Complete | JARVIS personality, 8 task types, emotion-aware tone directives |
+| 13 | Function Calling | ✅ Complete | Structured JSON tool invocation from LLM |
+| 14 | Multi-step Task Planning | ✅ Complete | ReAct reasoning engine + LLM planner for complex sequences |
+| 15 | User Modeling | ✅ Complete | Preference learning, habit tracking, topic extraction, persistent profile |
+| 16 | Proactive Intelligence | ✅ Complete | Pattern learning, anticipatory actions, idle reminders |
+| 17 | Interrupt Hierarchy | ✅ Complete | 4-level priority system with queue management |
+| 18 | Polish & Performance Tuning | 🚧 In Progress | Routing optimization, latency reduction, stability fixes |
 
-See [`ROADMAP.md`](ROADMAP.md) for detailed implementation tasks.
+See [`ROADMAP.md`](ROADMAP.md) for detailed implementation tasks. See [`progress.md`](progress.md) for implementation tracking.
 
 ---
 

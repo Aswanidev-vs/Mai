@@ -88,6 +88,7 @@ func main() {
 	var lastDetected time.Time = time.Now().Add(-time.Hour)
 	var sessionSamples []float32
 	var ttsMu sync.Mutex    // Mutex for thread-safe TTS
+	var ttsPlaying bool     // Flag to prevent ASR from capturing TTS output
 	var sherpaMu sync.Mutex // Mutex for all other Sherpa-ONNX calls
 
 	// Audio Lookback Buffer (1.5s at 16000Hz = 24000 samples)
@@ -336,19 +337,25 @@ func main() {
 		// Bridge for Perception
 		agentBridge = perception.NewBridge(bus)
 
-		// Bridge for TTS
+		// Bridge for TTS — with emotion-adaptive parameters
 		bus.Subscribe("action.tts.request", func(event interfaces.Event) {
 			text, _ := event.Payload["text"].(string)
-			log.Printf("[AGENT] Speaking: %s", text)
+			speed, _ := event.Payload["speed"].(float32)
+			if speed == 0 {
+				speed = cfg.TTS.Supertonic.Speed
+			}
+			log.Printf("[AGENT] Speaking (speed=%.2f): %s", speed, text)
 			atomic.StoreInt32(&isSpeaking, 1)
-			time.Sleep(200 * time.Millisecond) // Drain any in-flight audio callback
+			time.Sleep(200 * time.Millisecond)
 			ttsMu.Lock()
-			audio := tts.Generate(text, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
+			audio := tts.Generate(text, cfg.TTS.Supertonic.Sid, speed)
 			ttsMu.Unlock()
 			if audio != nil {
+				ttsPlaying = true
 				playAudio(audio.Samples, audio.SampleRate)
+				ttsPlaying = false
 			}
-			time.Sleep(1500 * time.Millisecond) // Wait for room echo to fully die down
+			time.Sleep(1500 * time.Millisecond)
 			atomic.StoreInt32(&isSpeaking, 0)
 			lastResponseMu.Lock()
 			lastResponseTime = time.Now()
@@ -370,13 +377,13 @@ func main() {
 	type Task struct {
 		Text string
 	}
-		workerChan := make(chan Task, 10)
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for task := range workerChan {
-				atomic.StoreInt32(&isSpeaking, 1) // Pause ASR while thinking and talking
+	workerChan := make(chan Task, 10)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for task := range workerChan {
+			atomic.StoreInt32(&isSpeaking, 1) // Pause ASR while thinking and talking
 			log.Printf("[LLM] Thinking about: %s", task.Text)
 
 			// Try to parse and execute automation action
@@ -415,11 +422,13 @@ func main() {
 			ttsMu.Unlock()
 			if audio != nil {
 				log.Println("[TTS] Playing response...")
+				ttsPlaying = true
 				playAudio(audio.Samples, audio.SampleRate)
+				ttsPlaying = false
 			}
 
-			time.Sleep(400 * time.Millisecond) // Wait for room echo to die down
-			atomic.StoreInt32(&isSpeaking, 0) // Resume ASR
+			time.Sleep(1500 * time.Millisecond) // Wait for room echo to fully die down
+			atomic.StoreInt32(&isSpeaking, 0)   // Resume ASR
 			lastResponseMu.Lock()
 			lastResponseTime = time.Now()
 			lastResponseMu.Unlock()
@@ -451,7 +460,7 @@ func main() {
 			// If in follow-up window, allow VAD to trigger listening
 			if time.Since(lastResponseTime) < 15*time.Second {
 				// Feed to ASR continuously if streaming
-				if asrStream != nil {
+				if asrStream != nil && !ttsPlaying {
 					asrStream.AcceptWaveform(16000, samples)
 				}
 
@@ -477,14 +486,14 @@ func main() {
 					if rms > 0.001 { // Much more sensitive for follow-up
 						log.Printf("[FOLLOW-UP] Speech detected (Level %.4f)! Skipping wake word.", rms)
 						state = StateListening
-						
+
 						// Prepend the lookback buffer to catch the start of the sentence
 						preBuffer := make([]float32, lookbackSize)
 						for i := 0; i < lookbackSize; i++ {
 							preBuffer[i] = lookbackBuffer[(lookbackIdx+i)%lookbackSize]
 						}
 						sessionSamples = append(preBuffer, lastChunk...)
-						
+
 						sessionText = ""
 						lastText = ""
 						if recognizer != nil {
@@ -507,7 +516,7 @@ func main() {
 			// Feed to KWS/VAD buffer
 			kwsStream.AcceptWaveform(16000, samples)
 
-			if asrStream != nil {
+			if asrStream != nil && !ttsPlaying {
 				asrStream.AcceptWaveform(16000, samples)
 			} else {
 				// For offline models, we still want to keep track of the audio
@@ -537,6 +546,8 @@ func main() {
 
 					// JARVIS-style acknowledgement
 					go func() {
+						atomic.StoreInt32(&isSpeaking, 1)  // Block mic processing during greeting
+						time.Sleep(200 * time.Millisecond) // Drain any in-flight audio callback
 						// JARVIS-style acknowledgment (more sophisticated)
 						greetings := []string{
 							"Yes Sir. How can I assist you?",
@@ -548,8 +559,12 @@ func main() {
 						audio := tts.Generate(greet, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
 						ttsMu.Unlock()
 						if audio != nil {
+							ttsPlaying = true
 							playAudio(audio.Samples, audio.SampleRate)
+							ttsPlaying = false
 						}
+						time.Sleep(1500 * time.Millisecond) // Wait for room echo to fully die down
+						atomic.StoreInt32(&isSpeaking, 0)
 					}()
 
 					state = StateListening
@@ -565,7 +580,10 @@ func main() {
 			}
 
 		case StateListening:
-			// Feed to VAD
+			// Feed to VAD — but skip if we're playing TTS to prevent feedback loop
+			if ttsPlaying {
+				return
+			}
 			vadBuffer.Push(samples)
 			for vadBuffer.Size() >= cfg.VAD.WindowSize {
 				head := vadBuffer.Head()
@@ -575,7 +593,7 @@ func main() {
 			}
 
 			// Feed to ASR
-			if asrStream != nil {
+			if asrStream != nil && !ttsPlaying {
 				asrStream.AcceptWaveform(16000, samples)
 				for recognizer.IsReady(asrStream) {
 					recognizer.Decode(asrStream)
@@ -654,7 +672,7 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	log.Println("\n[SYSTEM] Shutting down immediately...")
-	
+
 	cancel() // Cancel the background context (stops Ollama requests, etc.)
 	capture.Stop()
 	close(workerChan)
@@ -692,7 +710,7 @@ func startOllama() func() {
 
 // generateOllamaResponse sends text to Ollama and returns the generated text.
 func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt string) (string, error) {
-	client := &http.Client{} 
+	client := &http.Client{}
 
 	requestBody, _ := json.Marshal(map[string]interface{}{
 		"model":  cfg.LLM.Model,

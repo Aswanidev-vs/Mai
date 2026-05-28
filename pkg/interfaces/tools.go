@@ -5,11 +5,27 @@ import (
 	"encoding/json"
 )
 
+// ToolCategory classifies tools for discovery and routing
+type ToolCategory string
+
+const (
+	ToolCategorySystem      ToolCategory = "system"
+	ToolCategoryWeb         ToolCategory = "web"
+	ToolCategoryMedia       ToolCategory = "media"
+	ToolCategoryCommunication ToolCategory = "communication"
+	ToolCategoryFile        ToolCategory = "file"
+	ToolCategoryAutomation  ToolCategory = "automation"
+	ToolCategoryQuery       ToolCategory = "query"
+	ToolCategoryExternal    ToolCategory = "external"
+)
+
 // ToolMetadata describes a tool for discovery
 type ToolMetadata struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Parameters  json.RawMessage `json:"parameters"` // JSON Schema
+	Category    ToolCategory    `json:"category,omitempty"`
+	Keywords    []string        `json:"keywords,omitempty"`
 }
 
 // ToolResult represents the output of a tool execution
