@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -24,13 +25,22 @@ type Orchestrator struct {
 	emotion  *personality.EmotionDetector
 	meta     *MetaCognition
 
+	promptEngine   *cognition.PromptEngine
+	functionCaller *cognition.FunctionCaller
+	userModel      *UserModel
+	proactive      *ProactiveEngine
+	interrupts     *InterruptManager
+	prosody        *personality.ProsodyAnalyzer
+	ttsAdapter     *personality.TTSAdapter
+
 	status       interfaces.AgentStatus
 	cancel       context.CancelFunc
 	lastUserTime time.Time
-	lastSpoken   string    // Track last TTS output to detect echo
-	lastSpokenAt time.Time // When the last TTS finished
+	lastSpoken   string
+	lastSpokenAt time.Time
 
 	DirectAction func(text string) (bool, string, error)
+	TTSFunc      func(text string, speed float32)
 }
 
 func NewOrchestrator(
@@ -40,17 +50,27 @@ func NewOrchestrator(
 	registry interfaces.ToolRegistry,
 	reactLoop *cognition.ReActLoop,
 ) *Orchestrator {
+	userModel := NewUserModel("data")
+	proactive := NewProactiveEngine(userModel)
+
 	return &Orchestrator{
-		bus:      bus,
-		memory:   mem,
-		llm:      llm,
-		registry: registry,
-		react:    reactLoop,
-		planner:  cognition.NewPlanner(llm),
-		goals:    NewGoalManager(),
-		emotion:  personality.NewEmotionDetector(),
-		meta:     NewMetaCognition(),
-		status:   interfaces.StatusIdle,
+		bus:            bus,
+		memory:         mem,
+		llm:            llm,
+		registry:       registry,
+		react:          reactLoop,
+		planner:        cognition.NewPlanner(llm),
+		goals:          NewGoalManager(),
+		emotion:        personality.NewEmotionDetector(),
+		meta:           NewMetaCognition(),
+		promptEngine:   cognition.NewPromptEngine(),
+		functionCaller: cognition.NewFunctionCaller(llm, registry),
+		userModel:      userModel,
+		proactive:      proactive,
+		interrupts:     NewInterruptManager(),
+		prosody:        personality.NewProsodyAnalyzer(),
+		ttsAdapter:     personality.NewTTSAdapter(1.25, 1.0, 1.0),
+		status:         interfaces.StatusIdle,
 	}
 }
 
@@ -61,13 +81,21 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 	o.bus.Subscribe("perception.audio.transcription", o.handleTranscription)
 	o.bus.Subscribe("perception.vision.scene", o.handleVision)
 
-	// Restore session continuity: load recent episodic entries into working memory
+	o.interrupts.SetCallbacks(
+		func(message string) {
+			log.Printf("[Interrupt] Interrupting current task: %s", message)
+			o.publishTTS(message)
+		},
+		func(message string) {
+			o.publishTTS(message)
+		},
+	)
+
 	o.restoreSession()
 
-	// Proactive monitoring ticker — deterministic, no LLM calls
 	proactiveTicker := time.NewTicker(2 * time.Minute)
-	// Self-improvement analysis ticker
 	improveTicker := time.NewTicker(10 * time.Minute)
+	patternTicker := time.NewTicker(5 * time.Minute)
 
 	go func() {
 		for {
@@ -76,15 +104,18 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 				o.proactiveMonitor(agentCtx)
 			case <-improveTicker.C:
 				o.selfImprove(agentCtx)
+			case <-patternTicker.C:
+				o.analyzePatterns(agentCtx)
 			case <-agentCtx.Done():
 				proactiveTicker.Stop()
 				improveTicker.Stop()
+				patternTicker.Stop()
 				return
 			}
 		}
 	}()
 
-	log.Println("[Agent] Orchestrator started")
+	log.Println("[Agent] Orchestrator started with JARVIS-level capabilities")
 	o.status = interfaces.StatusIdle
 
 	<-agentCtx.Done()
@@ -98,18 +129,23 @@ func (o *Orchestrator) Stop() error {
 	return nil
 }
 
-// --- GAP 4: PROACTIVE MONITORING ---
-// Deterministic signal-based monitoring. No LLM calls. No hallucination.
+func (o *Orchestrator) analyzePatterns(ctx context.Context) {
+	events := o.proactive.AnalyzePatterns()
+	for _, event := range events {
+		if event.Priority >= 2 {
+			log.Printf("[Proactive] Pattern detected: %s", event.Message)
+		}
+	}
+}
+
 func (o *Orchestrator) proactiveMonitor(ctx context.Context) {
 	if o.status != interfaces.StatusIdle {
 		return
 	}
 
-	// Check 1: User has been silent for 15+ minutes during active hours
 	if !o.lastUserTime.IsZero() && time.Since(o.lastUserTime) > 15*time.Minute {
 		hour := time.Now().Hour()
 		if hour >= 9 && hour <= 22 {
-			// Check if there are pending goals
 			if o.goals.GetPendingCount() > 0 {
 				o.publishTTS(fmt.Sprintf("You have %d pending tasks. Shall I continue?", o.goals.GetPendingCount()))
 				return
@@ -117,23 +153,29 @@ func (o *Orchestrator) proactiveMonitor(ctx context.Context) {
 		}
 	}
 
-	// Check 2: Action success rate dropped below 50% — warn user
 	report := o.meta.GetReport()
 	if report.TotalActions >= 10 && report.ActionSuccessRate < 0.5 {
 		o.publishTTS("I've been struggling with recent tasks. You may want to try rephrasing your commands.")
 		return
 	}
 
-	// Check 3: High latency detected
 	if op, ok := report.Operations["handle_input"]; ok {
 		avg := op.TotalTime / time.Duration(op.Count)
 		if avg > 30*time.Second && op.Count >= 5 {
 			log.Printf("[Proactive] High average latency detected: %v", avg)
 		}
 	}
+
+	events := o.proactive.GetPendingEvents()
+	for _, event := range events {
+		if event.Priority >= 2 {
+			msg := o.proactive.GenerateProactiveMessage(ctx, event)
+			o.publishTTS(msg)
+			break
+		}
+	}
 }
 
-// --- GAP 6: SELF-IMPROVEMENT LOOP ---
 func (o *Orchestrator) selfImprove(ctx context.Context) {
 	analysis := o.meta.AnalyzeStrategy()
 	log.Printf("[SelfImprove] %s", analysis)
@@ -143,7 +185,6 @@ func (o *Orchestrator) selfImprove(ctx context.Context) {
 		return
 	}
 
-	// Store the analysis as a memory entry for future reference
 	o.memory.Store(ctx, interfaces.MemoryEntry{
 		ID:        fmt.Sprintf("meta_%d", time.Now().Unix()),
 		Type:      "meta_analysis",
@@ -155,13 +196,11 @@ func (o *Orchestrator) selfImprove(ctx context.Context) {
 		},
 	})
 
-	// If success rate is low, adjust strategy
 	if report.ActionSuccessRate < 0.6 && report.TotalActions >= 10 {
 		log.Printf("[SelfImprove] Low success rate (%.1f%%) — will prioritize regex parser and ask for clarification", report.ActionSuccessRate*100)
 	}
 }
 
-// --- GAP 8: SESSION CONTINUITY ---
 func (o *Orchestrator) restoreSession() {
 	events, err := o.memory.Episodic().QueryEvents("", 20)
 	if err != nil || len(events) == 0 {
@@ -180,12 +219,10 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return nil, fmt.Errorf("input must contain 'text' field")
 	}
 
-	// --- ECHO DETECTION ---
-	// If ASR text is similar to what was just spoken by TTS, it's echo — ignore it.
 	if time.Since(o.lastSpokenAt) < 5*time.Second && o.lastSpoken != "" {
 		inputLower := strings.ToLower(text)
 		if isEcho(inputLower, o.lastSpoken) {
-			log.Printf("[Agent] Echo detected — ignoring: %q (matches TTS: %q)", text, o.lastSpoken)
+			log.Printf("[Agent] Echo detected — ignoring: %q", text)
 			return &interfaces.AgentResponse{Text: "", Success: true}, nil
 		}
 	}
@@ -198,11 +235,11 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		o.meta.RecordLatency("handle_input", time.Since(startTime))
 	}()
 
-	// --- EMOTION DETECTION ---
 	emotionState := o.emotion.DetectFromText(text)
 	log.Printf("[Agent] Detected emotion: %s (%.2f)", emotionState.Type, emotionState.Confidence)
 
-	// --- STORE IN WORKING MEMORY ---
+	o.userModel.RecordInteraction(text, "")
+
 	o.memory.Working().Add(interfaces.MemoryEntry{
 		Type:      "user_input",
 		Content:   text,
@@ -210,7 +247,6 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		Metadata:  map[string]interface{}{"emotion": string(emotionState.Type)},
 	})
 
-	// --- PERSIST TO EPISODIC (session continuity) ---
 	o.memory.Episodic().StoreEvent(interfaces.MemoryEntry{
 		ID:        fmt.Sprintf("user_%d", time.Now().UnixMilli()),
 		Type:      "user_input",
@@ -219,12 +255,18 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		Metadata:  map[string]interface{}{"emotion": string(emotionState.Type)},
 	})
 
-	// --- SMART ROUTING ---
+	o.proactive.RecordAction(text, text)
+
+	if interruptLevel := ClassifyInterrupt(text); interruptLevel >= InterruptHigh {
+		o.interrupts.RequestInterrupt(InterruptRequest{
+			Level:   interruptLevel,
+			Source:  "user",
+			Message: text,
+		})
+	}
+
 	lowerText := strings.ToLower(text)
 
-	// 1. Try legacy ActionExecutor first (regex — fastest, most reliable)
-	//    BUT: skip regex for "search X" without a platform — we want deep_search (fetches results)
-	//         instead of web_search (just opens a browser).
 	searchPlatforms := []string{"google", "bing", "yahoo", "duckduckgo", "wikipedia", "youtube"}
 	isSearchWithoutPlatform := false
 	if strings.HasPrefix(lowerText, "search ") || strings.HasPrefix(lowerText, "find ") || strings.HasPrefix(lowerText, "look up ") || strings.HasPrefix(lowerText, "look ") {
@@ -248,6 +290,7 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		}
 		if executed {
 			o.meta.RecordActionResult(true)
+			o.userModel.RecordFrequentApp(text)
 			log.Printf("[Agent] Executed via regex parser.")
 			return &interfaces.AgentResponse{Text: feedback, Success: true}, nil
 		}
@@ -260,7 +303,6 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return &interfaces.AgentResponse{Text: response, Success: true}, nil
 	}
 
-	// 2. Determine if this is a command, reasoning task, or conversation
 	isLikelyCommand := false
 	commandTriggers := []string{"send", "message", "play", "open", "close", "launch", "type", "press", "search", "find", "whatsapp", "youtube", "spotify", "set a", "remind", "schedule"}
 	for _, cmd := range commandTriggers {
@@ -270,8 +312,6 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		}
 	}
 
-	// "list/show/top/best" + knowledge request → route to ReAct (deep_search) directly
-	// This avoids the slow conversational LLM call for things that need web results.
 	knowledgeTriggers := []string{"list me", "list the", "top ", "best ", "show me", "recommend", "what are the", "what is the best", "what are some"}
 	isKnowledgeRequest := false
 	for _, kw := range knowledgeTriggers {
@@ -289,7 +329,6 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return &interfaces.AgentResponse{Text: response, Success: true}, nil
 	}
 
-	// Multi-step indicators → use planner
 	multiStepIndicators := []string{"and then", "after that", "first", "also", "as well as", "do all", "prep ", "prepare", "set up"}
 	isMultiStep := false
 	for _, ind := range multiStepIndicators {
@@ -301,6 +340,13 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 
 	if isMultiStep && isLikelyCommand {
 		return o.handleMultiStep(ctx, text)
+	}
+
+	taskType := o.promptEngine.ClassifyTask(text, isLikelyCommand)
+
+	if taskType == cognition.TaskCommand && isLikelyCommand {
+		log.Printf("[Agent] Command detected, using function calling: %s", text)
+		return o.handleFunctionCall(ctx, text, emotionState)
 	}
 
 	reasoningKeywords := []string{
@@ -329,21 +375,57 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return &interfaces.AgentResponse{Text: o.adaptResponse(response, emotionState), Success: true}, nil
 	}
 
-	// 3. Conversational — use RAG + conversation history
 	log.Printf("[Agent] Conversational input: %s", text)
-	return o.handleConversation(ctx, text, emotionState)
+	return o.handleConversation(ctx, text, emotionState, taskType)
 }
 
-func (o *Orchestrator) handleConversation(ctx context.Context, text string, emotion personality.EmotionState) (*interfaces.AgentResponse, error) {
-	// Build context from memory
+func (o *Orchestrator) handleFunctionCall(ctx context.Context, text string, emotion personality.EmotionState) (*interfaces.AgentResponse, error) {
+	emotionHint := ""
+	if emotion.Type != personality.EmotionNeutral && emotion.Confidence > 0.3 {
+		emotionHint = fmt.Sprintf("User appears %s.", emotion.Type)
+	}
+
+	output, results, err := o.functionCaller.Execute(ctx, text, emotionHint)
+	if err != nil {
+		log.Printf("[FunctionCall] Error: %v, falling back to ReAct", err)
+		response, reactErr := o.react.Execute(ctx, text)
+		if reactErr != nil {
+			return nil, reactErr
+		}
+		return &interfaces.AgentResponse{Text: response, Success: true}, nil
+	}
+
+	if len(results) > 0 {
+		o.meta.RecordActionResult(results[0].Error == "")
+	}
+
+	if output == "" {
+		output = "Done."
+	}
+
+	o.memory.Working().Add(interfaces.MemoryEntry{
+		Type:      "assistant_response",
+		Content:   output,
+		Timestamp: time.Now().Unix(),
+	})
+
+	o.memory.Episodic().StoreEvent(interfaces.MemoryEntry{
+		ID:        fmt.Sprintf("mai_%d", time.Now().UnixMilli()),
+		Type:      "assistant_response",
+		Content:   output,
+		Timestamp: time.Now().Unix(),
+	})
+
+	return &interfaces.AgentResponse{Text: o.adaptResponse(output, emotion), Success: true}, nil
+}
+
+func (o *Orchestrator) handleConversation(ctx context.Context, text string, emotion personality.EmotionState, taskType cognition.TaskType) (*interfaces.AgentResponse, error) {
 	var contextParts []string
 
-	// Working memory (recent conversation)
 	if wm := o.memory.Working().GetContext(); wm != "" {
 		contextParts = append(contextParts, "Recent conversation:\n"+wm)
 	}
 
-	// RAG retrieval (relevant past knowledge)
 	if o.memory.RAG() != nil {
 		ragResult, err := o.memory.RAG().Query(ctx, text)
 		if err == nil && ragResult != nil && ragResult.Answer != "" && ragResult.Confidence > 0.3 {
@@ -351,44 +433,42 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		}
 	}
 
-	// Procedural memory (learned patterns)
 	if procStore, ok := o.memory.Procedural().(*memory.ProceduralStore); ok {
 		if pattern, score := procStore.GetBestPattern(text); pattern != "" && score > 0.7 {
 			contextParts = append(contextParts, "Learned pattern:\n"+pattern)
 		}
 	}
 
-	// Emotion-aware prompt
-	emotionHint := ""
-	if emotion.Type != personality.EmotionNeutral && emotion.Confidence > 0.4 {
-		emotionHint = fmt.Sprintf("\nUser appears %s. Adapt your tone accordingly.", emotion.Type)
+	toolsJSON := ""
+	if o.registry != nil {
+		tools := o.registry.List()
+		if len(tools) > 0 {
+			toolsData, _ := json.Marshal(tools)
+			toolsJSON = string(toolsData)
+		}
 	}
 
-	// Build final prompt
-	var fullPrompt string
+	promptCtx := cognition.PromptContext{
+		TaskType:       taskType,
+		UserInput:      text,
+		Emotion:        emotion,
+		WorkingMemory:  o.memory.Working().GetContext(),
+		RAGContext:     "",
+		UserProfile:    o.userModel.GetContextString(),
+		AvailableTools: toolsJSON,
+	}
+
 	if len(contextParts) > 0 {
-		fullPrompt = fmt.Sprintf("Context:\n%s\n%s\n\nUser: %s", strings.Join(contextParts, "\n---\n"), emotionHint, text)
-	} else {
-		fullPrompt = fmt.Sprintf("%s\n\nUser: %s", emotionHint, text)
+		promptCtx.RAGContext = strings.Join(contextParts, "\n---\n")
 	}
 
-	// Action escape hatch
-	actionPrompt := fmt.Sprintf(`If the user's message is a command (open, play, send, search, etc.), respond ONLY with:
-[ACTION] <command>
+	fullPrompt := o.promptEngine.BuildPrompt(promptCtx)
 
-Examples:
-- "[ACTION] play interstellar on brave on youtube"
-- "[ACTION] open chrome"
-- "[ACTION] send hello to manu on whatsapp"
-
-Otherwise, respond naturally as Mai.%s`, fullPrompt)
-
-	response, err := o.llm.Generate(ctx, actionPrompt, interfaces.GenerationOptions{})
+	response, err := o.llm.Generate(ctx, fullPrompt, interfaces.GenerationOptions{})
 	if err != nil {
 		return nil, err
 	}
 
-	// Check for [ACTION] escape hatch
 	if strings.Contains(response, "[ACTION]") {
 		parts := strings.Split(response, "[ACTION]")
 		actionCmd := strings.TrimSpace(parts[len(parts)-1])
@@ -404,7 +484,6 @@ Otherwise, respond naturally as Mai.%s`, fullPrompt)
 			}
 		}
 
-		// DirectAction failed — route to ReAct loop which has deep_search, youtube_play, etc.
 		log.Printf("[Agent] DirectAction failed for [ACTION] %q, routing to ReAct", actionCmd)
 		response, err := o.react.Execute(ctx, actionCmd)
 		if err == nil {
@@ -413,14 +492,12 @@ Otherwise, respond naturally as Mai.%s`, fullPrompt)
 		}
 	}
 
-	// Store response in working memory
 	o.memory.Working().Add(interfaces.MemoryEntry{
 		Type:      "assistant_response",
 		Content:   response,
 		Timestamp: time.Now().Unix(),
 	})
 
-	// Persist response to episodic (session continuity)
 	o.memory.Episodic().StoreEvent(interfaces.MemoryEntry{
 		ID:        fmt.Sprintf("mai_%d", time.Now().UnixMilli()),
 		Type:      "assistant_response",
@@ -432,12 +509,9 @@ Otherwise, respond naturally as Mai.%s`, fullPrompt)
 	return &interfaces.AgentResponse{Text: adapted, Success: true}, nil
 }
 
-// --- GAP 5: MULTI-STEP EXECUTION ---
 func (o *Orchestrator) handleMultiStep(ctx context.Context, text string) (*interfaces.AgentResponse, error) {
 	log.Printf("[Agent] Multi-step task detected, engaging planner...")
 
-	// --- GAP 7: CONTEXTUAL TOOL SELECTION ---
-	// Filter tools by relevance before sending to planner
 	relevantTools := o.selectRelevantTools(text)
 	plan, err := o.planner.Decompose(ctx, text, relevantTools)
 	if err != nil {
@@ -484,8 +558,6 @@ func (o *Orchestrator) handleMultiStep(ctx context.Context, text string) (*inter
 	return &interfaces.AgentResponse{Text: summary, Success: true}, nil
 }
 
-// --- GAP 7: CONTEXTUAL TOOL SELECTION ---
-// Filters tools by keyword relevance instead of dumping all tools to the LLM.
 func (o *Orchestrator) selectRelevantTools(text string) []interfaces.ToolMetadata {
 	allTools := o.registry.List()
 	lower := strings.ToLower(text)
@@ -495,13 +567,11 @@ func (o *Orchestrator) selectRelevantTools(text string) []interfaces.ToolMetadat
 		name := strings.ToLower(tool.Name)
 		desc := strings.ToLower(tool.Description)
 
-		// Always include utility tools
 		if name == "get_system_time" || name == "ui_automation" {
 			relevant = append(relevant, tool)
 			continue
 		}
 
-		// Check if tool name or description keywords match the input
 		keywords := strings.Fields(name)
 		for _, kw := range keywords {
 			if len(kw) > 2 && strings.Contains(lower, kw) {
@@ -510,7 +580,6 @@ func (o *Orchestrator) selectRelevantTools(text string) []interfaces.ToolMetadat
 			}
 		}
 
-		// Check description keywords (first 5 words)
 		descWords := strings.Fields(desc)
 		for i, kw := range descWords {
 			if i >= 5 {
@@ -523,7 +592,6 @@ func (o *Orchestrator) selectRelevantTools(text string) []interfaces.ToolMetadat
 		}
 	}
 
-	// If filtering was too aggressive, return all
 	if len(relevant) == 0 {
 		return allTools
 	}
@@ -532,9 +600,7 @@ func (o *Orchestrator) selectRelevantTools(text string) []interfaces.ToolMetadat
 	return relevant
 }
 
-// --- EMOTIONAL ADAPTATION ---
 func (o *Orchestrator) adaptResponse(response string, emotion personality.EmotionState) string {
-	// Clean XML tags and artifacts first
 	response = cleanResponse(response)
 
 	if emotion.Type == personality.EmotionNeutral || emotion.Confidence < 0.4 {
@@ -553,9 +619,35 @@ func (o *Orchestrator) adaptResponse(response string, emotion personality.Emotio
 		if !strings.Contains(strings.ToLower(response), "understand") && !strings.Contains(strings.ToLower(response), "sorry") {
 			return "I understand. " + response
 		}
+	case personality.EmotionSad:
+		if !strings.Contains(strings.ToLower(response), "here") {
+			return response
+		}
 	}
 
 	return response
+}
+
+func (o *Orchestrator) GetTTSParams(emotion personality.EmotionState, text string) personality.TTSParams {
+	isQuestion := strings.Contains(text, "?")
+	return o.ttsAdapter.AdaptToContext(emotion, len(text), isQuestion)
+}
+
+func (o *Orchestrator) AnalyzeProsody(samples []float32, sampleRate int) personality.EmotionState {
+	features := o.prosody.Analyze(samples, sampleRate)
+	return o.prosody.DetectEmotion(features)
+}
+
+func (o *Orchestrator) GetUserModel() *UserModel {
+	return o.userModel
+}
+
+func (o *Orchestrator) GetProactiveEngine() *ProactiveEngine {
+	return o.proactive
+}
+
+func (o *Orchestrator) GetInterruptManager() *InterruptManager {
+	return o.interrupts
 }
 
 func (o *Orchestrator) publishTTS(text string) {
@@ -597,7 +689,18 @@ func (o *Orchestrator) handleTranscription(event interfaces.Event) {
 		return
 	}
 
-	o.publishTTS(resp.Text)
+	emotion := o.emotion.GetCurrent()
+	ttsParams := o.GetTTSParams(emotion, resp.Text)
+
+	o.bus.Publish(interfaces.Event{
+		Type:   "action.tts.request",
+		Source: "agent.orchestrator",
+		Payload: map[string]interface{}{
+			"text":  resp.Text,
+			"speed": ttsParams.Speed,
+			"pitch": ttsParams.Pitch,
+		},
+	})
 }
 
 func (o *Orchestrator) handleVision(event interfaces.Event) {
@@ -610,8 +713,6 @@ func (o *Orchestrator) handleVision(event interfaces.Event) {
 	}
 }
 
-// isEcho checks if ASR input is likely an echo of recent TTS output.
-// Compares word overlap — if >50% of input words appear in the spoken text, it's echo.
 func isEcho(input, spoken string) bool {
 	inputWords := strings.Fields(input)
 	spokenWords := strings.Fields(spoken)
@@ -632,22 +733,17 @@ func isEcho(input, spoken string) bool {
 		}
 	}
 
-	// If >50% of input words were in the spoken text, it's echo
 	matchRatio := float64(matchCount) / float64(len(inputWords))
 	return matchRatio > 0.5
 }
 
-// cleanResponse strips XML tags, markdown artifacts, and other noise from LLM responses
-// before they're sent to TTS.
 func cleanResponse(s string) string {
-	// Strip XML-like tags: <environment_details>, <thinking>, <analysis>, etc.
 	for {
 		start := strings.Index(s, "<")
 		end := strings.Index(s, ">")
 		if start == -1 || end == -1 || end <= start {
 			break
 		}
-		// Check if it looks like an XML tag (not math like "x < 5")
 		tag := s[start : end+1]
 		if len(tag) > 1 && (tag[1] >= 'a' && tag[1] <= 'z' || tag[1] >= 'A' && tag[1] <= 'Z' || tag[1] == '/') {
 			s = s[:start] + s[end+1:]
@@ -656,16 +752,13 @@ func cleanResponse(s string) string {
 		}
 	}
 
-	// Strip markdown code fences
 	s = strings.ReplaceAll(s, "```json", "")
 	s = strings.ReplaceAll(s, "```", "")
 
-	// Strip [ACTION] tags (shouldn't reach here, but just in case)
 	if idx := strings.Index(s, "[ACTION]"); idx != -1 {
 		s = s[:idx]
 	}
 
-	// Collapse multiple newlines
 	for strings.Contains(s, "\n\n\n") {
 		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
 	}

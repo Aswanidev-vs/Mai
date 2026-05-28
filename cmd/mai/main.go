@@ -337,21 +337,25 @@ func main() {
 		// Bridge for Perception
 		agentBridge = perception.NewBridge(bus)
 
-		// Bridge for TTS
+		// Bridge for TTS — with emotion-adaptive parameters
 		bus.Subscribe("action.tts.request", func(event interfaces.Event) {
 			text, _ := event.Payload["text"].(string)
-			log.Printf("[AGENT] Speaking: %s", text)
+			speed, _ := event.Payload["speed"].(float32)
+			if speed == 0 {
+				speed = cfg.TTS.Supertonic.Speed
+			}
+			log.Printf("[AGENT] Speaking (speed=%.2f): %s", speed, text)
 			atomic.StoreInt32(&isSpeaking, 1)
-			time.Sleep(200 * time.Millisecond) // Drain any in-flight audio callback
+			time.Sleep(200 * time.Millisecond)
 			ttsMu.Lock()
-			audio := tts.Generate(text, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
+			audio := tts.Generate(text, cfg.TTS.Supertonic.Sid, speed)
 			ttsMu.Unlock()
 			if audio != nil {
 				ttsPlaying = true
 				playAudio(audio.Samples, audio.SampleRate)
 				ttsPlaying = false
 			}
-			time.Sleep(1500 * time.Millisecond) // Wait for room echo to fully die down
+			time.Sleep(1500 * time.Millisecond)
 			atomic.StoreInt32(&isSpeaking, 0)
 			lastResponseMu.Lock()
 			lastResponseTime = time.Now()
