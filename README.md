@@ -169,6 +169,7 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 | **Perception Bridge** | ✅ Ready | Audio transcription and vision event publishing |
 | **Meta-Cognition** | ✅ Ready | Performance tracking, strategy analysis, and self-improvement |
 | **MCP Client** | ✅ Ready | Model Context Protocol for external tool discovery |
+| **Companion Skills (Jarvis-like)** | ✅ Ready | Skill routing via `data/skills.json` (trigger phrases → skill execution) |
 
 ---
 
@@ -322,6 +323,22 @@ Mai: "Playing lo-fi beats on YouTube."  [emotion-adaptive TTS: warm, relaxed]
 You: "I'm feeling stressed about the deadline"
 Mai: "I understand. Let me help you prioritize. What's the most urgent task?"  [slower, calmer TTS]
 ```
+
+### Companion Skills (Proposal 1)
+Mai can route certain utterances to a **Companion Skill** before normal command/function/conversation routing.
+
+- Skills are defined in: `data/skills.json`
+- A skill matches when the user text **contains** one of the skill’s `triggers` (case-insensitive substring).
+- When matched, Mai:
+  - executes the skill using the existing ReAct pipeline
+  - stores an episodic memory entry: `Type: "skill_invoked"`
+
+Example trigger phrases (built-in starter skills):
+- “plan my day …” (Plan My Day)
+- “summarize …” (Summarize)
+- “weekly review …” (Weekly Review)
+
+To add your own skill, edit `data/skills.json` (see `guide.md` → “How to add your own Companion Skill”).
 
 ### Follow-Up Mode
 After Mai responds, you have **15 seconds** to ask a follow-up without saying the wake word again.
