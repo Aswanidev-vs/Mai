@@ -11,6 +11,7 @@ import (
 	"github.com/user/mai/internal/cognition"
 	"github.com/user/mai/internal/memory"
 	"github.com/user/mai/internal/personality"
+	"github.com/user/mai/internal/skills"
 	"github.com/user/mai/pkg/interfaces"
 )
 
@@ -41,6 +42,8 @@ type Orchestrator struct {
 
 	DirectAction func(text string) (bool, string, error)
 	TTSFunc      func(text string, speed float32)
+
+	skillsRunner *skills.Runner
 }
 
 func NewOrchestrator(
@@ -52,6 +55,9 @@ func NewOrchestrator(
 ) *Orchestrator {
 	userModel := NewUserModel("data")
 	proactive := NewProactiveEngine(userModel)
+
+	skillRegistry := skills.LoadRegistry()
+	skillsRunner := skills.NewRunner(skillRegistry, reactLoop, llm, mem)
 
 	return &Orchestrator{
 		bus:            bus,
@@ -71,6 +77,7 @@ func NewOrchestrator(
 		prosody:        personality.NewProsodyAnalyzer(),
 		ttsAdapter:     personality.NewTTSAdapter(1.25, 1.0, 1.0),
 		status:         interfaces.StatusIdle,
+		skillsRunner:   skillsRunner,
 	}
 }
 
@@ -263,6 +270,30 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 			Source:  "user",
 			Message: text,
 		})
+	}
+
+	// Companion Skills (Proposal 1): attempt skill routing before command/function execution.
+	if o.skillsRunner != nil {
+		// Note: runner uses its own matching; if it matches, return immediately.
+		if matched, skillResp, err := o.skillsRunner.TryRun(ctx, text, emotionState); err != nil {
+			log.Printf("[Skills] Error while executing skill: %v", err)
+			// fall back to normal pipeline
+		} else if matched && skillResp != "" {
+			o.memory.Working().Add(interfaces.MemoryEntry{
+				Type:      "assistant_response",
+				Content:   skillResp,
+				Timestamp: time.Now().Unix(),
+			})
+
+			o.memory.Episodic().StoreEvent(interfaces.MemoryEntry{
+				ID:        fmt.Sprintf("mai_%d", time.Now().UnixMilli()),
+				Type:      "assistant_response",
+				Content:   skillResp,
+				Timestamp: time.Now().Unix(),
+			})
+
+			return &interfaces.AgentResponse{Text: o.adaptResponse(skillResp, emotionState), Success: true}, nil
+		}
 	}
 
 	lowerText := strings.ToLower(text)

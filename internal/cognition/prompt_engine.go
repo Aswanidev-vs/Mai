@@ -11,16 +11,16 @@ import (
 type TaskType string
 
 const (
-	TaskConversation  TaskType = "conversation"
-	TaskCommand       TaskType = "command"
-	TaskReasoning     TaskType = "reasoning"
-	TaskCreative      TaskType = "creative"
-	TaskAnalysis      TaskType = "analysis"
-	TaskCode          TaskType = "code"
-	TaskMemory        TaskType = "memory"
-	TaskProactive     TaskType = "proactive"
-	TaskGreeting      TaskType = "greeting"
-	TaskEmergency     TaskType = "emergency"
+	TaskConversation TaskType = "conversation"
+	TaskCommand      TaskType = "command"
+	TaskReasoning    TaskType = "reasoning"
+	TaskCreative     TaskType = "creative"
+	TaskAnalysis     TaskType = "analysis"
+	TaskCode         TaskType = "code"
+	TaskMemory       TaskType = "memory"
+	TaskProactive    TaskType = "proactive"
+	TaskGreeting     TaskType = "greeting"
+	TaskEmergency    TaskType = "emergency"
 )
 
 type PromptContext struct {
@@ -34,6 +34,7 @@ type PromptContext struct {
 	TimeContext    string
 	SessionHistory string
 	ProactiveHint  string
+	ActiveSkill    string
 }
 
 type PromptEngine struct {
@@ -100,6 +101,10 @@ CORE TRAITS:
 	pe.appendMemoryContext(&b, ctx)
 	pe.appendUserContext(&b, ctx)
 	pe.appendProactiveHints(&b, ctx)
+
+	if ctx.ActiveSkill != "" {
+		b.WriteString(fmt.Sprintf("\nACTIVE SKILL: %s\n", ctx.ActiveSkill))
+	}
 
 	b.WriteString(fmt.Sprintf("\nUser: %s\n\nRespond as Mai (concise, natural, %s):",
 		ctx.UserInput, pe.getToneDirective(ctx.Emotion)))

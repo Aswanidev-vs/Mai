@@ -1,0 +1,16 @@
+{
+  "skills": [
+    {
+      "id": "meeting_action_items",
+      "name": "Meeting Action Items",
+      "description": "Extract action items, owners, and due dates from meeting notes; produce a clean checklist.",
+      "triggers": [
+        "action items",
+        "meeting action items",
+        "extract tasks from meeting",
+        "turn my notes into action items"
+      ],
+      "prompt_seed": "Extract action items with owner and due date if mentioned. If due date is missing, mark it as 'TBD'. If owner is missing, mark it as 'Unassigned'. Output as a numbered checklist."
+    }
+  ]
+}
