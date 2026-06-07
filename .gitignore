@@ -131,3 +131,5 @@ TODO.md
 
 #Ignore vscode AI rules
 .github\instructions\codacy.instructions.md
+
+data/user_profile.json
