@@ -87,8 +87,12 @@ func main() {
 	var lastResponseMu sync.Mutex
 	var lastDetected time.Time = time.Now().Add(-time.Hour)
 	var sessionSamples []float32
-	var ttsMu sync.Mutex    // Mutex for thread-safe TTS
-	var ttsPlaying bool     // Flag to prevent ASR from capturing TTS output
+	var ttsMu sync.Mutex // Mutex for thread-safe TTS
+
+	// atomic: 1=speaking/assistant-audio-muting, 0=idle
+	var ttsPlaying int32 // atomic: 1=playing TTS, 0=not
+	var lastMicRMS float64
+	var lastMicMu sync.Mutex
 	var sherpaMu sync.Mutex // Mutex for all other Sherpa-ONNX calls
 
 	// Audio Lookback Buffer (1.5s at 16000Hz = 24000 samples)
@@ -351,11 +355,35 @@ func main() {
 			audio := tts.Generate(text, cfg.TTS.Supertonic.Sid, speed)
 			ttsMu.Unlock()
 			if audio != nil {
-				ttsPlaying = true
-				playAudio(audio.Samples, audio.SampleRate)
-				ttsPlaying = false
+				atomic.StoreInt32(&ttsPlaying, 1)
+				_ = playAudio(audio.Samples, audio.SampleRate)
+				atomic.StoreInt32(&ttsPlaying, 0)
 			}
-			time.Sleep(1500 * time.Millisecond)
+
+			// Wait for mic silence instead of fixed echo tail.
+			const (
+				silenceRMS = 0.0015
+				consecN    = 5
+				checkEvery = 50 * time.Millisecond
+			)
+			consec := 0
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				lastMicMu.Lock()
+				rms := lastMicRMS
+				lastMicMu.Unlock()
+
+				if rms < silenceRMS {
+					consec++
+					if consec >= consecN {
+						break
+					}
+				} else {
+					consec = 0
+				}
+				time.Sleep(checkEvery)
+			}
+
 			atomic.StoreInt32(&isSpeaking, 0)
 			lastResponseMu.Lock()
 			lastResponseTime = time.Now()
@@ -422,13 +450,36 @@ func main() {
 			ttsMu.Unlock()
 			if audio != nil {
 				log.Println("[TTS] Playing response...")
-				ttsPlaying = true
-				playAudio(audio.Samples, audio.SampleRate)
-				ttsPlaying = false
+				atomic.StoreInt32(&ttsPlaying, 1)
+				_ = playAudio(audio.Samples, audio.SampleRate)
+				atomic.StoreInt32(&ttsPlaying, 0)
 			}
 
-			time.Sleep(1500 * time.Millisecond) // Wait for room echo to fully die down
-			atomic.StoreInt32(&isSpeaking, 0)   // Resume ASR
+			// Wait for mic silence instead of fixed echo tail.
+			const (
+				silenceRMS = 0.0015
+				consecN    = 5
+				checkEvery = 50 * time.Millisecond
+			)
+			consec := 0
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				lastMicMu.Lock()
+				rms := lastMicRMS
+				lastMicMu.Unlock()
+
+				if rms < silenceRMS {
+					consec++
+					if consec >= consecN {
+						break
+					}
+				} else {
+					consec = 0
+				}
+				time.Sleep(checkEvery)
+			}
+
+			atomic.StoreInt32(&isSpeaking, 0) // Resume ASR
 			lastResponseMu.Lock()
 			lastResponseTime = time.Now()
 			lastResponseMu.Unlock()
@@ -460,7 +511,7 @@ func main() {
 			// If in follow-up window, allow VAD to trigger listening
 			if time.Since(lastResponseTime) < 15*time.Second {
 				// Feed to ASR continuously if streaming
-				if asrStream != nil && !ttsPlaying {
+				if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
 					asrStream.AcceptWaveform(16000, samples)
 				}
 
@@ -516,13 +567,12 @@ func main() {
 			// Feed to KWS/VAD buffer
 			kwsStream.AcceptWaveform(16000, samples)
 
-			if asrStream != nil && !ttsPlaying {
+			if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
 				asrStream.AcceptWaveform(16000, samples)
-			} else {
-				// For offline models, we still want to keep track of the audio
-				// if we might be in a follow-up window.
-				// However, we don't buffer HERE yet, because we haven't switched to StateListening.
 			}
+			// For offline models, we still want to keep track of the audio
+			// if we might be in a follow-up window.
+			// However, we don't buffer HERE yet, because we haven't switched to StateListening.
 
 			// Volume check (RMS)
 			var sum float32
@@ -531,6 +581,9 @@ func main() {
 			}
 			rms := math.Sqrt(float64(sum / float32(len(samples))))
 			fmt.Printf("\r[AUDIO] Level: %.4f ", rms)
+			lastMicMu.Lock()
+			lastMicRMS = rms
+			lastMicMu.Unlock()
 
 			if time.Since(lastDetected) < time.Duration(cfg.KWS.CooldownMs)*time.Millisecond {
 				return
@@ -546,9 +599,9 @@ func main() {
 
 					// JARVIS-style acknowledgement
 					go func() {
-						atomic.StoreInt32(&isSpeaking, 1)  // Block mic processing during greeting
-						time.Sleep(200 * time.Millisecond) // Drain any in-flight audio callback
-						// JARVIS-style acknowledgment (more sophisticated)
+						atomic.StoreInt32(&isSpeaking, 1) // Block mic processing during greeting
+						time.Sleep(200 * time.Millisecond)
+
 						greetings := []string{
 							"Yes Sir. How can I assist you?",
 							"At your service. What is the objective?",
@@ -558,12 +611,37 @@ func main() {
 						ttsMu.Lock()
 						audio := tts.Generate(greet, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
 						ttsMu.Unlock()
+
 						if audio != nil {
-							ttsPlaying = true
-							playAudio(audio.Samples, audio.SampleRate)
-							ttsPlaying = false
+							atomic.StoreInt32(&ttsPlaying, 1)
+							_ = playAudio(audio.Samples, audio.SampleRate)
+							atomic.StoreInt32(&ttsPlaying, 0)
 						}
-						time.Sleep(1500 * time.Millisecond) // Wait for room echo to fully die down
+
+						// Wait for mic silence to reduce self-echo feedback.
+						const (
+							silenceRMS = 0.0015
+							consecN    = 5
+							checkEvery = 50 * time.Millisecond
+						)
+						consec := 0
+						deadline := time.Now().Add(3 * time.Second)
+						for time.Now().Before(deadline) {
+							lastMicMu.Lock()
+							rms := lastMicRMS
+							lastMicMu.Unlock()
+
+							if rms < silenceRMS {
+								consec++
+								if consec >= consecN {
+									break
+								}
+							} else {
+								consec = 0
+							}
+							time.Sleep(checkEvery)
+						}
+
 						atomic.StoreInt32(&isSpeaking, 0)
 					}()
 
@@ -580,8 +658,8 @@ func main() {
 			}
 
 		case StateListening:
-			// Feed to VAD — but skip if we're playing TTS to prevent feedback loop
-			if ttsPlaying {
+			// Feed to VAD — skip if we're playing TTS to prevent feedback loop
+			if atomic.LoadInt32(&ttsPlaying) != 0 {
 				return
 			}
 			vadBuffer.Push(samples)
@@ -593,7 +671,7 @@ func main() {
 			}
 
 			// Feed to ASR
-			if asrStream != nil && !ttsPlaying {
+			if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
 				asrStream.AcceptWaveform(16000, samples)
 				for recognizer.IsReady(asrStream) {
 					recognizer.Decode(asrStream)
