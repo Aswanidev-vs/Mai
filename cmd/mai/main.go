@@ -83,7 +83,7 @@ func main() {
 	defer cancel()
 
 	var isSpeaking int32 // atomic: 1=speaking, 0=idle
-	var lastResponseTime time.Time
+	var lastResponseTime = time.Now()
 	var lastResponseMu sync.Mutex
 	var lastDetected time.Time = time.Now().Add(-time.Hour)
 	var sessionSamples []float32
@@ -94,6 +94,32 @@ func main() {
 	var lastMicRMS float64
 	var lastMicMu sync.Mutex
 	var sherpaMu sync.Mutex // Mutex for all other Sherpa-ONNX calls
+
+	// waitForMicSilence blocks until the mic stays quiet (RMS < 0.0015 for 5 consecutive checks)
+	// or a 3-second deadline is reached. This prevents TTS echo from re-triggering ASR.
+	waitForMicSilence := func() {
+		const (
+			silenceRMS = 0.0015
+			consecN    = 5
+			checkEvery = 50 * time.Millisecond
+		)
+		consec := 0
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			lastMicMu.Lock()
+			rms := lastMicRMS
+			lastMicMu.Unlock()
+			if rms < silenceRMS {
+				consec++
+				if consec >= consecN {
+					break
+				}
+			} else {
+				consec = 0
+			}
+			time.Sleep(checkEvery)
+		}
+	}
 
 	// Audio Lookback Buffer (1.5s at 16000Hz = 24000 samples)
 	lookbackSize := 24000
@@ -361,28 +387,7 @@ func main() {
 			}
 
 			// Wait for mic silence instead of fixed echo tail.
-			const (
-				silenceRMS = 0.0015
-				consecN    = 5
-				checkEvery = 50 * time.Millisecond
-			)
-			consec := 0
-			deadline := time.Now().Add(3 * time.Second)
-			for time.Now().Before(deadline) {
-				lastMicMu.Lock()
-				rms := lastMicRMS
-				lastMicMu.Unlock()
-
-				if rms < silenceRMS {
-					consec++
-					if consec >= consecN {
-						break
-					}
-				} else {
-					consec = 0
-				}
-				time.Sleep(checkEvery)
-			}
+			waitForMicSilence()
 
 			atomic.StoreInt32(&isSpeaking, 0)
 			lastResponseMu.Lock()
@@ -391,6 +396,7 @@ func main() {
 			log.Printf("[FOLLOW-UP] Listening for follow-up (15s window)...")
 		})
 	}
+
 	log.Println("[AUTO] Automation system ready")
 
 	// 5. Initialize audio capture
@@ -456,28 +462,7 @@ func main() {
 			}
 
 			// Wait for mic silence instead of fixed echo tail.
-			const (
-				silenceRMS = 0.0015
-				consecN    = 5
-				checkEvery = 50 * time.Millisecond
-			)
-			consec := 0
-			deadline := time.Now().Add(3 * time.Second)
-			for time.Now().Before(deadline) {
-				lastMicMu.Lock()
-				rms := lastMicRMS
-				lastMicMu.Unlock()
-
-				if rms < silenceRMS {
-					consec++
-					if consec >= consecN {
-						break
-					}
-				} else {
-					consec = 0
-				}
-				time.Sleep(checkEvery)
-			}
+			waitForMicSilence()
 
 			atomic.StoreInt32(&isSpeaking, 0) // Resume ASR
 			lastResponseMu.Lock()
@@ -500,6 +485,11 @@ func main() {
 
 	// Audio callback
 	capture.onSamples = func(samples []float32) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[AUDIO] Panic recovered in audio callback: %v", r)
+			}
+		}()
 		sherpaMu.Lock()
 		defer sherpaMu.Unlock()
 
@@ -619,28 +609,7 @@ func main() {
 						}
 
 						// Wait for mic silence to reduce self-echo feedback.
-						const (
-							silenceRMS = 0.0015
-							consecN    = 5
-							checkEvery = 50 * time.Millisecond
-						)
-						consec := 0
-						deadline := time.Now().Add(3 * time.Second)
-						for time.Now().Before(deadline) {
-							lastMicMu.Lock()
-							rms := lastMicRMS
-							lastMicMu.Unlock()
-
-							if rms < silenceRMS {
-								consec++
-								if consec >= consecN {
-									break
-								}
-							} else {
-								consec = 0
-							}
-							time.Sleep(checkEvery)
-						}
+						waitForMicSilence()
 
 						atomic.StoreInt32(&isSpeaking, 0)
 					}()
@@ -648,6 +617,7 @@ func main() {
 					state = StateListening
 					sessionText = "" // Reset session text
 					sessionSamples = nil
+					sherpa.DeleteCircularBuffer(vadBuffer) // Free old C buffer before allocating new
 					vadBuffer = sherpa.NewCircularBuffer(10 * 16000)
 					if recognizer != nil {
 						recognizer.Reset(asrStream)
@@ -697,6 +667,7 @@ func main() {
 					if text != "" {
 						sessionText += text + " "
 					}
+					sessionSamples = nil // Reset buffer for streaming path
 				} else if offlineRecognizer != nil {
 					// Process full buffer with Offline ASR
 					log.Println("\n[ASR] Processing segment with Offline Qwen3...")
@@ -725,8 +696,9 @@ func main() {
 						log.Println("[PIPELINE] Routing to legacy pipeline...")
 						workerChan <- Task{Text: sessionText}
 					}
-					state = StateWakeWord
-					sessionText = ""
+				state = StateWakeWord
+				sessionText = ""
+				sessionSamples = nil // Reset buffer on state transition
 					if recognizer != nil {
 						recognizer.Reset(asrStream)
 					}

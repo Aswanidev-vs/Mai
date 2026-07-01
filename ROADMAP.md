@@ -175,17 +175,17 @@ var knownApps = map[string]appInfo{
 | Capability Domain | Current Maturity (1-10) | JARVIS Target (1-10) | Gap |
 |-------------------|------------------------|----------------------|-----|
 | Speech Recognition (ASR) | 7 | 8 | Small |
-| Text-to-Speech (TTS) | 6 | 9 | Medium |
+| Text-to-Speech (TTS) | 7 | 9 | Medium | *Upgraded to Supertonic 3 — improved voice quality* |
 | Wake Word Detection | 6 | 7 | Small |
 | Natural Language Understanding | 3 | 9 | **Critical** |
-| Reasoning & Planning | 1 | 10 | **Severe** |
-| Long-Term Memory | 0 | 10 | **Severe** |
+| Reasoning & Planning | 4 | 10 | **Critical** | *ReAct loop with verifier, timeout, anti-hallucination guards* |
+| Long-Term Memory | 3 | 10 | **Severe** | *Episodic + semantic + RAG pipeline active, QueryEvents fixed* |
 | Multi-Modal Fusion | 2 | 9 | **Critical** |
-| Tool Use & API Control | 3 | 10 | **Critical** |
-| Proactive Agency | 0 | 10 | **Severe** |
-| Emotional Intelligence | 0 | 8 | **Critical** |
-| Self-Monitoring & Improvement | 0 | 7 | **Severe** |
-| **Overall Agent Autonomy** | **2 / 10** | **10 / 10** | **Massive** |
+| Tool Use & API Control | 4 | 10 | **Critical** | *Tool registry + MCP client with race fix* |
+| Proactive Agency | 2 | 10 | **Severe** |
+| Emotional Intelligence | 4 | 8 | **Critical** | *TTSAdapter fully wired, prosody analyzer fixed, speech rate computed* |
+| Self-Monitoring & Improvement | 1 | 7 | **Severe** |
+| **Overall Agent Autonomy** | **3 / 10** | **10 / 10** | **Massive** |
 
 ---
 

@@ -684,11 +684,17 @@ func (o *Orchestrator) GetInterruptManager() *InterruptManager {
 func (o *Orchestrator) publishTTS(text string) {
 	o.lastSpoken = strings.ToLower(text)
 	o.lastSpokenAt = time.Now()
+
+	emotion := o.emotion.GetCurrent()
+	ttsParams := o.GetTTSParams(emotion, text)
+
 	o.bus.Publish(interfaces.Event{
 		Type:   "action.tts.request",
 		Source: "agent.orchestrator",
 		Payload: map[string]interface{}{
-			"text": text,
+			"text":  text,
+			"speed": ttsParams.Speed,
+			"pitch": ttsParams.Pitch,
 		},
 	})
 }

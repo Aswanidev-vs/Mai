@@ -109,6 +109,7 @@ func (pa *ProsodyAnalyzer) Analyze(samples []float32, sampleRate int) ProsodyFea
 	features.PitchMean = pa.estimatePitch(samples, sampleRate)
 	features.VolumeVariance = pa.calculateVolumeVariance(samples)
 	features.PauseRatio = pa.estimatePauseRatio(samples)
+	features.SpeechRate = pa.estimateSpeechRate(samples, sampleRate)
 
 	pa.mu.Lock()
 	pa.features = features
@@ -185,6 +186,10 @@ func (pa *ProsodyAnalyzer) calculateZeroCrossingRate(samples []float32) float64 
 }
 
 func (pa *ProsodyAnalyzer) calculateSpectralCentroid(samples []float32, sampleRate int) float64 {
+	// Time-domain approximation of spectral centroid.
+	// Computes an energy-weighted frequency estimate by dividing the spectrum
+	// into bins and weighting by magnitude. This is a rough proxy — a proper
+	// spectral centroid requires FFT-based frequency analysis.
 	windowSize := 1024
 	if len(samples) < windowSize {
 		windowSize = len(samples)
@@ -199,9 +204,16 @@ func (pa *ProsodyAnalyzer) calculateSpectralCentroid(samples []float32, sampleRa
 	}
 
 	if magnitudeSum == 0 {
-		return 0
+		return 0.5 // neutral default
 	}
-	return weightedSum / magnitudeSum / float64(sampleRate/2)
+
+	// Normalize by Nyquist frequency and scale to 0-1 range
+	centroid := weightedSum / magnitudeSum
+	normalized := centroid / (float64(sampleRate) / 2)
+	if normalized > 1.0 {
+		normalized = 1.0
+	}
+	return normalized
 }
 
 func (pa *ProsodyAnalyzer) estimatePitch(samples []float32, sampleRate int) float64 {
@@ -209,6 +221,9 @@ func (pa *ProsodyAnalyzer) estimatePitch(samples []float32, sampleRate int) floa
 		return 0
 	}
 
+	// Zero-crossing rate based pitch estimation.
+	// This is a coarse approximation valid only for near-pure tones.
+	// For real speech, an autocorrelation or cepstral method is preferred.
 	var crossings int
 	for i := 1; i < len(samples); i++ {
 		if (samples[i] >= 0 && samples[i-1] < 0) || (samples[i] < 0 && samples[i-1] >= 0) {
@@ -221,7 +236,69 @@ func (pa *ProsodyAnalyzer) estimatePitch(samples []float32, sampleRate int) floa
 	}
 
 	freq := float64(crossings) * float64(sampleRate) / float64(2*len(samples))
-	return freq / 500.0
+	// Clamp to typical speech range (50-500 Hz), normalize to 0-1
+	if freq < 50 {
+		return 0.1
+	}
+	if freq > 500 {
+		return 0.9
+	}
+	return (freq - 50) / 450.0
+}
+
+func (pa *ProsodyAnalyzer) estimateSpeechRate(samples []float32, sampleRate int) float64 {
+	if len(samples) < sampleRate/2 {
+		return 0.5 // default moderate rate for short segments
+	}
+
+	// Detect syllable-like energy peaks using envelope-based approach
+	// Divide audio into short frames, count transitions above threshold
+	frameSize := int(float64(sampleRate) * 0.01) // 10ms frames
+	if frameSize < 1 {
+		frameSize = 1
+	}
+	numFrames := len(samples) / frameSize
+	if numFrames < 1 {
+		return 0.5
+	}
+
+	// Compute RMS per frame
+	frameEnergies := make([]float64, numFrames)
+	for i := 0; i < numFrames; i++ {
+		var sum float64
+		start := i * frameSize
+		for j := 0; j < frameSize && start+j < len(samples); j++ {
+			s := float64(samples[start+j])
+			sum += s * s
+		}
+		frameEnergies[i] = math.Sqrt(sum / float64(frameSize))
+	}
+
+	// Count energy peaks (syllable nuclei)
+	peakCount := 0
+	threshold := 0.02
+	for i := 1; i < numFrames-1; i++ {
+		if frameEnergies[i] > frameEnergies[i-1] && frameEnergies[i] > frameEnergies[i+1] && frameEnergies[i] > threshold {
+			peakCount++
+		}
+	}
+
+	// Estimate syllables per second, normalize to 0-1 range
+	durationSec := float64(len(samples)) / float64(sampleRate)
+	if durationSec <= 0 {
+		return 0.5
+	}
+	syllablesPerSec := float64(peakCount) / durationSec
+
+	// Map typical speech rates (2-7 syllables/sec) to 0-1
+	rate := (syllablesPerSec - 1.0) / 7.0
+	if rate < 0 {
+		rate = 0
+	}
+	if rate > 1.0 {
+		rate = 1.0
+	}
+	return rate
 }
 
 func (pa *ProsodyAnalyzer) calculateVolumeVariance(samples []float32) float64 {
