@@ -248,7 +248,7 @@ All required ONNX models are included in the repository:
 | VAD | Silero VAD | `silero_vad.onnx` |
 | ASR | NeMo Streaming Fast Conformer | `sherpa-onnx-nemo-streaming-fast-conformer-ctc-en-480ms/` |
 | ASR | Qwen3 Offline ASR | `sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/` |
-| TTS | Supertonic | `sherpa-onnx-supertonic-tts-int8-2026-03-06/` |
+| TTS | Supertonic | `sherpa-onnx-supertonic-3-tts-int8-2026-05-11/` |
 | TTS | Pocket | `sherpa-onnx-pocket-tts-2026-01-26/` |
 | TTS | ZipVoice | `sherpa-onnx-zipvoice-distill-int8-zh-en-emilia/` |
 
@@ -581,7 +581,7 @@ tts:
   output_sample_rate: 44100
 
   supertonic:
-    model_dir: "./sherpa-onnx-supertonic-tts-int8-2026-03-06"
+    model_dir: "./sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
     speed: 1.25
     num_steps: 5
 

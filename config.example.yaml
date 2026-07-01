@@ -62,7 +62,7 @@ tts:
   active_model: "supertonic"
 
   supertonic:
-    model_dir: "./sherpa-onnx-supertonic-tts-int8-2026-03-06"
+    model_dir: "./sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
     duration_predictor: "duration_predictor.int8.onnx"
     text_encoder: "text_encoder.int8.onnx"
     vector_estimator: "vector_estimator.int8.onnx"
