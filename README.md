@@ -734,6 +734,15 @@ See [`ROADMAP.md`](ROADMAP.md) for detailed implementation tasks. See [`progress
 
 ## Recent Optimizations & Bug Fixes
 
+### Two-Way Communication — Barge-In, Thinking Chime, Reduced Dead Time
+- **Barge-in with VAD confirmation**: Speak during TTS playback to interrupt Mai. Uses a two-layer detector: RMS threshold as the first filter, then Silero VAD as the second layer to confirm the sound is actually human speech (not echo, fans, or door slams). This provides true noise immunity. Configurable via `audio.barge_in_enabled` and `audio.barge_in_threshold`.
+- **Thinking chime**: A subtle 80ms tone plays when LLM processing starts, so you know you've been heard. No more dead air. Configurable via `audio.thinking_chime`.
+- **`waitForMicSilence` reduced** from 3s max to 500ms max with 3 consecutive checks for faster turn-taking. On barge-in, skipped entirely since the user is already speaking.
+- **200ms pre-TTS sleep removed** — eliminates the defensive delay before every utterance.
+- **`playAudio` interruptible** — supports mid-stream cancellation via context + stop flag, checked in both the audio callback and poll loop.
+- **Audio callback restructured**: RMS computed once at callback entry, shared between barge-in detection and silence wait.
+- **TTS Voice Style**: The system prompt's tone (calm, warm, energetic, etc.) now automatically influences TTS speed, pitch, and volume. If your prompt says "be calm and composed", TTS will speak slower and softer. Override via `tts.voice_style` in config.
+
 ### Supertonic TTS v2 → v3 Migration
 - Upgraded from `sherpa-onnx-supertonic-tts-int8-2026-03-06` (Supertonic 2) to `sherpa-onnx-supertonic-3-tts-int8-2026-05-11` (Supertonic 3)
 - Zero code changes required — model files are fully backward-compatible
