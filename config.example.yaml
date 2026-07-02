@@ -8,7 +8,10 @@
 audio:
   sample_rate: 16000
   capture_buffer_ms: 100
-  playback_device: ""  # empty = default
+  playback_device: ""
+  barge_in_enabled: true
+  barge_in_threshold: 0.008
+  thinking_chime: true  # empty = default
 
 kws:
   provider: "cpu"
@@ -60,6 +63,7 @@ tts:
 
   # Select active model: "supertonic" | "pocket" | "zipvoice"
   active_model: "supertonic"
+  voice_style: ""  # Optional: "calm", "warm", "energetic", "serious", "soft"
 
   supertonic:
     model_dir: "./sherpa-onnx-supertonic-3-tts-int8-2026-05-11"

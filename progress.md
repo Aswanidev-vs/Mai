@@ -13,9 +13,10 @@ Tracking implementation of JARVIS-class capabilities across reasoning, tool use,
 |---|---|---|---|
 | No reasoning layer | DONE | `internal/cognition/prompt_engine.go`, `internal/agent/loop.go` | Chain-of-Thought reasoning engine with context-aware prompts |
 | No Chain-of-Thought | DONE | `internal/cognition/prompt_engine.go` | Dynamic prompt builder with CoT templates per task type (conversation, command, reasoning, creative, analysis, proactive, greeting, emergency) |
-| No ReAct loop (improved) | DONE | `internal/cognition/react.go` | Already existed; enhanced with better tool selection and structured reasoning |
+| No ReAct loop (improved) | DONE | `internal/cognition/react.go` | Enhanced with verifier integration, 30s timeout, anti-hallucination guards, loop detection |
 | No task decomposition (improved) | DONE | `internal/cognition/planner.go`, `internal/agent/loop.go` | Already existed; enhanced with better routing |
 | Static prompt engineering | DONE | `internal/cognition/prompt_engine.go` | Dynamic prompt builder adapts tone, depth, format to context/emotion — JARVIS personality baked in |
+| Hallucination in ReAct | FIXED | `internal/cognition/react.go`, `internal/cognition/verifier.go` | Verifier wired into ReAct loop — tool results and final answers verified for plausibility. 30s timeout per iteration. Max iterations reduced 5→3. |
 
 ## 2. TOOL USE & ECOSYSTEM DEFICITS — Severity: HIGH — ALL RESOLVED
 
@@ -31,24 +32,42 @@ Tracking implementation of JARVIS-class capabilities across reasoning, tool use,
 | Zero persistent storage | DONE | `internal/memory/` | SQLite + JSON already existed; user profile now persisted |
 | No session continuity (enhanced) | DONE | `internal/agent/loop.go` | Already existed; enhanced with richer context restoration |
 | No memory hierarchy (enhanced) | DONE | `internal/memory/manager.go` | Already existed; enhanced with user profile integration |
-| No RAG infrastructure (enhanced) | DONE | `internal/memory/rag.go` | Already existed; enhanced with relevance scoring |
+| No RAG infrastructure (enhanced) | DONE | `internal/memory/rag.go` | Already existed; QueryEvents fixed to use LIKE queries, relevance scoring |
 | No user modeling | DONE | `internal/agent/user_model.go` | User profile with preference learning, habit tracking, topic extraction, frequent apps |
 
 ## 3. EMOTIONAL INTELLIGENCE — Severity: MEDIUM — ALL RESOLVED
 
 | Deficiency | Status | File(s) | Notes |
 |---|---|---|---|
-| No emotional STT | DONE | `internal/personality/prosody_analyzer.go` | Audio prosody analysis: RMS energy, zero-crossing rate, spectral centroid, pitch estimation, volume variance, pause ratio |
-| No emotional TTS | DONE | `internal/personality/tts_adapter.go` | Emotion-aware TTS parameter adaptation: speed, pitch, volume, emphasis, pause scale — per emotion type |
+| No emotional STT | DONE | `internal/personality/prosody_analyzer.go` | Audio prosody analysis: RMS energy, zero-crossing rate, spectral centroid, pitch estimation, volume variance, pause ratio. SpeechRate bug fixed (was always 0). Spectral centroid normalized. Pitch clamped to human range. |
+| No emotional TTS | DONE | `internal/personality/tts_adapter.go` | Emotion-aware TTS parameter adaptation: speed, pitch, volume, emphasis, pause scale — per emotion type. Fully wired to agent loop. |
 | Robotic responses | DONE | `internal/cognition/prompt_engine.go`, `internal/agent/loop.go` | JARVIS personality in prompts, emotional tone directives, response adaptation per emotion |
 
-## 4. PROACTIVE INTELLIGENCE — Severity: HIGH — ALL RESOLVED
+## 4. TWO-WAY COMMUNICATION — New — ALL IMPLEMENTED
 
-| Deficiency | Status | File(s) | Notes |
+| Feature | Status | File(s) | Notes |
 |---|---|---|---|
-| No proactive contact | DONE | `internal/agent/proactive.go` | Pattern-based anticipatory actions, idle reminders, contextual suggestions |
-| No predictive modeling | DONE | `internal/agent/proactive.go` | Time-of-day pattern detection, usage frequency analysis |
-| No contextual awareness | DONE | `internal/agent/proactive.go` | Pattern matching with context, system events, user behavior analysis |
+| Barge-in with VAD confirmation | DONE | `cmd/mai/main.go`, `cmd/mai/audio.go` | Two-layer detection: RMS threshold then Silero VAD confirmation. Noise-immune — rejects fans, door slams, TTS echo. Configurable threshold. |
+| Thinking chime | DONE | `cmd/mai/main.go`, `cmd/mai/audio.go` | 80ms 440Hz sine wave with fade-out envelope. Plays at LLM processing start. Configurable on/off. |
+| Reduced silence wait | DONE | `cmd/mai/main.go` | `waitForMicSilence` reduced 3s→500ms, 5→3 consecutive checks. Skipped entirely on barge-in path. |
+| Removed pre-TTS delay | DONE | `cmd/mai/main.go` | 200ms sleep before every utterance removed from all 3 playback paths. |
+| Interruptible playAudio | DONE | `cmd/mai/audio.go` | `playAudio` now accepts context + stop flag. Callback and poll loop check for cancellation. |
+| TTS voice style from system prompt | DONE | `internal/personality/tts_adapter.go`, `internal/agent/loop.go`, `cmd/mai/main.go` | 6 presets (calm/warm/energetic/serious/soft/neutral). Auto-detected from system prompt keywords. Explicit override via `tts.voice_style` config. |
+
+## 5. BUG FIXES & POLISH — DONE
+
+| Fix | File(s) | Notes |
+|---|---|---|
+| Panic recovery | `cmd/mai/main.go`, `internal/events/bus.go` | defer/recover in audio callback and event bus dispatch |
+| C memory leak | `cmd/mai/main.go` | VAD circular buffer freed before reallocation on wake word |
+| sessionSamples infinite growth | `cmd/mai/main.go` | Reset on streaming ASR VAD segment end and state transition |
+| lastResponseTime zero-value | `cmd/mai/main.go` | Was time.Time{} (17000-year startup bug) → time.Now() |
+| Episodic QueryEvents ignoring query | `internal/memory/episodic.go` | Now uses LIKE query when query string provided |
+| Prosody SpeechRate always 0 | `internal/personality/prosody_analyzer.go` | Added syllable-like energy peak detection |
+| Spectral centroid normalization | `internal/personality/prosody_analyzer.go` | Normalized to 0-1 range, clamped at Nyquist |
+| Pitch estimation range | `internal/personality/prosody_analyzer.go` | Clamped to 50-500 Hz human speech range, normalized to 0-1 |
+| MCP client race condition | `internal/tools/mcp/client.go` | Added sync.RWMutex around sessionID |
+| Duplicated silence-wait loops | `cmd/mai/main.go` | Extracted 3 copies into shared waitForMicSilence closure |
 
 ---
 
@@ -62,16 +81,24 @@ Tracking implementation of JARVIS-class capabilities across reasoning, tool use,
 | `internal/agent/proactive.go` | Proactive intelligence — pattern analysis (time-of-day, frequency), anticipatory actions, idle reminders. | ~190 |
 | `internal/agent/interrupt.go` | Priority-based interrupt hierarchy (critical/high/normal/low) with queue management and auto-classification. | ~190 |
 | `internal/personality/prosody_analyzer.go` | Audio prosody analysis for emotional STT — RMS, ZCR, spectral centroid, pitch, volume variance, pause ratio. Emotion matching via template distance. | ~280 |
-| `internal/personality/tts_adapter.go` | Emotion-aware TTS parameter control — speed, pitch, volume, emphasis, pause scale adapted per emotion. | ~120 |
+| `internal/personality/tts_adapter.go` | Emotion-aware TTS parameter control — speed, pitch, volume, emphasis, pause scale adapted per emotion. Voice style presets with system prompt parsing. | ~200 |
 
 ## Modified Files
 
 | File | Changes |
 |---|---|
-| `internal/agent/loop.go` | **MAJOR REWRITE**: Integrated prompt engine, function calling, user model, proactive engine, interrupt manager, prosody analyzer, TTS adapter. New `handleFunctionCall()` method. Emotion-aware TTS params passed via event bus. |
+| `internal/agent/loop.go` | **MAJOR REWRITE**: Integrated prompt engine, function calling, user model, proactive engine, interrupt manager, prosody analyzer, TTS adapter. New `handleFunctionCall()` method. Emotion-aware TTS params passed via event bus. Added `SetTTSVoiceStyle()`. |
 | `internal/tools/registry.go` | Enhanced with categories (`ToolCategory`), `DiscoverByCategory()`, `Search()` (scored keyword matching), `Unregister()`, `Count()`, `GetMetadata()`, `ListByCategory()`. |
 | `pkg/interfaces/tools.go` | Added `ToolCategory` type with 8 categories (system, web, media, communication, file, automation, query, external). Added `Category` and `Keywords` fields to `ToolMetadata`. |
-| `cmd/mai/main.go` | TTS bridge now reads emotion-adaptive `speed`/`pitch` from event payload. |
+| `cmd/mai/main.go` | Barge-in detection with VAD confirmation. Thinking chime. Reduced silence wait. Removed pre-TTS delays. RMS computation consolidated. Audio callback restructured. TTS voice style wiring. Event bus panic recovery. VAD C memory leak fix. |
+| `cmd/mai/audio.go` | `playAudio` interruptible (context + stop flag). Added `generateThinkingChime()`. |
+| `internal/cognition/react.go` | Verifier wired into ReAct loop. 30s context timeout. Max iterations 5→3. |
+| `internal/events/bus.go` | Panic recovery in Publish handler dispatch. |
+| `internal/memory/episodic.go` | QueryEvents now uses LIKE query. |
+| `internal/tools/mcp/client.go` | Fixed sessionID race with RWMutex. |
+| `pkg/models/config.go` | Added BargeInEnabled, BargeInThreshold, ThinkingChime, TTSVoiceStyle fields. |
+| `config.yaml` | Added barge_in/threshold, thinking_chime, voice_style config. |
+| `config.example.yaml` | Mirrored config additions. |
 
 ---
 
@@ -99,6 +126,39 @@ Orchestrator.HandleInput()
     │
     ├── Response Adaptation (emotion-aware truncation, prefix)
     └── TTS with Emotion-Adaptive Parameters (speed, pitch, volume)
+```
+
+### Two-Way Communication Flow
+```
+TTS Playback Active
+    ↓
+Audio callback runs RMS + VAD on mic input
+    ├── RMS < threshold → continue playback (normal)
+    ├── RMS > threshold + VAD rejects → continue playback (noise immunity)
+    └── RMS > threshold + VAD confirms speech → BARGE-IN
+            ↓
+        stopPlayback = 1
+        playAudio returns early
+        ttsPlaying = 0
+        Skip waitForMicSilence (user already speaking)
+        Audio callback immediately feeds to ASR/VAD
+```
+
+### Voice Style Detection
+```
+System Prompt
+    ↓
+ParseVoiceStyle() scans for keywords:
+    "be calm", "composed", "steady" → "calm" preset
+    "warm", "friendly"             → "warm" preset
+    "energetic", "bright"          → "energetic" preset
+    "serious", "authoritative"     → "serious" preset
+    "quiet", "gentle", "softly"    → "soft" preset
+    Explicit: tts.voice_style in config.yaml
+    ↓
+TTSAdapter.SetVoiceStyle(style) adjusts base speed/pitch/volume
+    ↓
+Emotion detection applies delta on top of style baseline
 ```
 
 ### Prompt Engine
@@ -148,4 +208,5 @@ Orchestrator.HandleInput()
 - Pitch Estimation → fundamental frequency
 - Volume Variance → emotional stability
 - Pause Ratio → hesitation/deliberation
+- Speech Rate → syllable-level energy peak detection
 - Template matching against emotion profiles

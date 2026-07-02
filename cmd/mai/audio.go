@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"math"
+	"sync/atomic"
 	"time"
 
 	"github.com/gen2brain/malgo"
@@ -96,12 +99,13 @@ func (c *audioCapture) onRecvFrames(_, pSample []byte, frameCount uint32) {
 }
 
 // playAudio plays float32 samples through the default output device.
-func playAudio(samples []float32, sampleRate int) error {
-	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
+// It can be interrupted midway via ctx cancellation or the stop flag.
+func playAudio(ctx context.Context, samples []float32, sampleRate int, stop *int32) error {
+	devCtx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
 	if err != nil {
 		return err
 	}
-	defer ctx.Free()
+	defer devCtx.Free()
 
 	deviceConfig := malgo.DefaultDeviceConfig(malgo.Playback)
 	deviceConfig.Playback.Format = malgo.FormatS16
@@ -110,6 +114,9 @@ func playAudio(samples []float32, sampleRate int) error {
 
 	var playbackIndex int
 	onSamples := func(pOutputSample, _ []byte, frameCount uint32) {
+		if stop != nil && atomic.LoadInt32(stop) != 0 {
+			return // Stop playback immediately on barge-in
+		}
 		n := int(frameCount)
 		for i := 0; i < n; i++ {
 			if playbackIndex >= len(samples) {
@@ -122,7 +129,7 @@ func playAudio(samples []float32, sampleRate int) error {
 		}
 	}
 
-	device, err := malgo.InitDevice(ctx.Context, deviceConfig, malgo.DeviceCallbacks{Data: onSamples})
+	device, err := malgo.InitDevice(devCtx.Context, deviceConfig, malgo.DeviceCallbacks{Data: onSamples})
 	if err != nil {
 		return err
 	}
@@ -132,10 +139,34 @@ func playAudio(samples []float32, sampleRate int) error {
 		return err
 	}
 
+	// Poll loop with context awareness and stop flag support
 	for playbackIndex < len(samples) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if stop != nil && atomic.LoadInt32(stop) != 0 {
+			return nil
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	return nil
+}
+
+// generateThinkingChime creates a short 440Hz sine wave tone for the thinking indicator.
+// Duration ~80ms, amplitude ~-12dB (0.25) to be subtle.
+func generateThinkingChime(sampleRate int) []float32 {
+	duration := 0.08 // 80ms
+	numSamples := int(float64(sampleRate) * duration)
+	samples := make([]float32, numSamples)
+	for i := 0; i < numSamples; i++ {
+		t := float64(i) / float64(sampleRate)
+		// Sine wave at 440Hz with a quick fade-out envelope
+		envelope := 1.0 - float64(i)/float64(numSamples)
+		samples[i] = float32(0.25 * math.Sin(2*math.Pi*440*t) * envelope)
+	}
+	return samples
 }
 

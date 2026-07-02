@@ -664,6 +664,12 @@ func (o *Orchestrator) GetTTSParams(emotion personality.EmotionState, text strin
 	return o.ttsAdapter.AdaptToContext(emotion, len(text), isQuestion)
 }
 
+// SetTTSVoiceStyle applies a voice style preset to the TTS adapter.
+// Called at startup to match the system prompt tone.
+func (o *Orchestrator) SetTTSVoiceStyle(style string) {
+	o.ttsAdapter.SetVoiceStyle(style)
+}
+
 func (o *Orchestrator) AnalyzeProsody(samples []float32, sampleRate int) personality.EmotionState {
 	features := o.prosody.Analyze(samples, sampleRate)
 	return o.prosody.DetectEmotion(features)
@@ -684,11 +690,17 @@ func (o *Orchestrator) GetInterruptManager() *InterruptManager {
 func (o *Orchestrator) publishTTS(text string) {
 	o.lastSpoken = strings.ToLower(text)
 	o.lastSpokenAt = time.Now()
+
+	emotion := o.emotion.GetCurrent()
+	ttsParams := o.GetTTSParams(emotion, text)
+
 	o.bus.Publish(interfaces.Event{
 		Type:   "action.tts.request",
 		Source: "agent.orchestrator",
 		Payload: map[string]interface{}{
-			"text": text,
+			"text":  text,
+			"speed": ttsParams.Speed,
+			"pitch": ttsParams.Pitch,
 		},
 	})
 }

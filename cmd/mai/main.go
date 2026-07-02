@@ -35,6 +35,7 @@ import (
 	"github.com/user/mai/internal/llm"
 	"github.com/user/mai/internal/memory"
 	"github.com/user/mai/internal/perception"
+	"github.com/user/mai/internal/personality"
 	"github.com/user/mai/internal/tools"
 	"github.com/user/mai/internal/tools/adapters"
 	"github.com/user/mai/internal/tools/mcp"
@@ -83,7 +84,7 @@ func main() {
 	defer cancel()
 
 	var isSpeaking int32 // atomic: 1=speaking, 0=idle
-	var lastResponseTime time.Time
+	var lastResponseTime = time.Now()
 	var lastResponseMu sync.Mutex
 	var lastDetected time.Time = time.Now().Add(-time.Hour)
 	var sessionSamples []float32
@@ -91,9 +92,50 @@ func main() {
 
 	// atomic: 1=speaking/assistant-audio-muting, 0=idle
 	var ttsPlaying int32 // atomic: 1=playing TTS, 0=not
+	var stopPlayback int32 // atomic: 1=stop current TTS playback (barge-in), 0=normal
 	var lastMicRMS float64
 	var lastMicMu sync.Mutex
 	var sherpaMu sync.Mutex // Mutex for all other Sherpa-ONNX calls
+
+	// waitForMicSilence blocks until the mic stays quiet (RMS < 0.0015 for 3 consecutive checks)
+	// or a 500ms deadline is reached. Returns true if silence was detected, false if timed out.
+	waitForMicSilence := func() bool {
+		const (
+			silenceRMS = 0.0015
+			consecN    = 3
+			checkEvery = 50 * time.Millisecond
+		)
+		consec := 0
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			lastMicMu.Lock()
+			rms := lastMicRMS
+			lastMicMu.Unlock()
+			if rms < silenceRMS {
+				consec++
+				if consec >= consecN {
+					return true
+				}
+			} else {
+				consec = 0
+			}
+			time.Sleep(checkEvery)
+		}
+		return false
+	}
+
+	// thinkingChime plays a short tone to indicate LLM processing has started.
+	playingChime := int32(0)
+	playThinkingChime := func() {
+		if !cfg.Audio.ThinkingChime || !atomic.CompareAndSwapInt32(&playingChime, 0, 1) {
+			return
+		}
+		go func() {
+			chime := generateThinkingChime(16000)
+			_ = playAudio(ctx, chime, 16000, nil)
+			atomic.StoreInt32(&playingChime, 0)
+		}()
+	}
 
 	// Audio Lookback Buffer (1.5s at 16000Hz = 24000 samples)
 	lookbackSize := 24000
@@ -156,6 +198,10 @@ func main() {
 
 	vadBuffer := sherpa.NewCircularBuffer(10 * 16000)
 	defer sherpa.DeleteCircularBuffer(vadBuffer)
+
+	// Separate VAD buffer for barge-in detection (smaller — just enough for VAD window)
+	bargeVadBuffer := sherpa.NewCircularBuffer(2 * 16000)
+	defer sherpa.DeleteCircularBuffer(bargeVadBuffer)
 
 	log.Println("[VAD] Voice activity detector ready")
 
@@ -261,7 +307,7 @@ func main() {
 	go func() {
 		testAudio := tts.Generate("System ready.", cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
 		if testAudio != nil {
-			playAudio(testAudio.Samples, testAudio.SampleRate)
+			playAudio(ctx, testAudio.Samples, testAudio.SampleRate, nil)
 		}
 	}()
 
@@ -336,10 +382,25 @@ func main() {
 		// Orchestrator
 		orch := agent.NewOrchestrator(bus, memManager, llmProvider, registry, react)
 		orch.DirectAction = executor.ParseAndExecute // Wire up the legacy highly-reliable regex parser
+
+		// Apply TTS voice style from system prompt
+		ttsStyle := cfg.TTS.TTSVoiceStyle
+		if ttsStyle == "" {
+			ttsStyle = personality.ParseVoiceStyle(cfg.LLM.SystemPrompt)
+		}
+		if ttsStyle != "" && ttsStyle != "neutral" {
+			orch.SetTTSVoiceStyle(ttsStyle)
+		}
+
 		go orch.Start(ctx)
 
 		// Bridge for Perception
 		agentBridge = perception.NewBridge(bus)
+
+		// Thinking chime — plays when speech transcription is received (LLM processing begins)
+		bus.Subscribe("perception.audio.transcription", func(event interfaces.Event) {
+			playThinkingChime()
+		})
 
 		// Bridge for TTS — with emotion-adaptive parameters
 		bus.Subscribe("action.tts.request", func(event interfaces.Event) {
@@ -350,38 +411,19 @@ func main() {
 			}
 			log.Printf("[AGENT] Speaking (speed=%.2f): %s", speed, text)
 			atomic.StoreInt32(&isSpeaking, 1)
-			time.Sleep(200 * time.Millisecond)
 			ttsMu.Lock()
 			audio := tts.Generate(text, cfg.TTS.Supertonic.Sid, speed)
 			ttsMu.Unlock()
 			if audio != nil {
 				atomic.StoreInt32(&ttsPlaying, 1)
-				_ = playAudio(audio.Samples, audio.SampleRate)
+				atomic.StoreInt32(&stopPlayback, 0)
+				_ = playAudio(ctx, audio.Samples, audio.SampleRate, &stopPlayback)
 				atomic.StoreInt32(&ttsPlaying, 0)
-			}
 
-			// Wait for mic silence instead of fixed echo tail.
-			const (
-				silenceRMS = 0.0015
-				consecN    = 5
-				checkEvery = 50 * time.Millisecond
-			)
-			consec := 0
-			deadline := time.Now().Add(3 * time.Second)
-			for time.Now().Before(deadline) {
-				lastMicMu.Lock()
-				rms := lastMicRMS
-				lastMicMu.Unlock()
-
-				if rms < silenceRMS {
-					consec++
-					if consec >= consecN {
-						break
-					}
-				} else {
-					consec = 0
+				// If barge-in was triggered, skip silence wait — user is already speaking
+				if atomic.LoadInt32(&stopPlayback) == 0 {
+					waitForMicSilence()
 				}
-				time.Sleep(checkEvery)
 			}
 
 			atomic.StoreInt32(&isSpeaking, 0)
@@ -391,6 +433,7 @@ func main() {
 			log.Printf("[FOLLOW-UP] Listening for follow-up (15s window)...")
 		})
 	}
+
 	log.Println("[AUTO] Automation system ready")
 
 	// 5. Initialize audio capture
@@ -408,13 +451,16 @@ func main() {
 	workerChan := make(chan Task, 10)
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for task := range workerChan {
-			atomic.StoreInt32(&isSpeaking, 1) // Pause ASR while thinking and talking
-			log.Printf("[LLM] Thinking about: %s", task.Text)
+		go func() {
+			defer wg.Done()
+			for task := range workerChan {
+				atomic.StoreInt32(&isSpeaking, 1) // Pause ASR while thinking and talking
+				log.Printf("[LLM] Thinking about: %s", task.Text)
 
-			// Try to parse and execute automation action
+				// Play thinking chime to indicate LLM processing
+				playThinkingChime()
+
+				// Try to parse and execute automation action
 			executed, feedback, actionErr := executor.ParseAndExecute(task.Text)
 			if actionErr != nil {
 				log.Printf("[ACTION] Error executing action: %v", actionErr)
@@ -451,32 +497,14 @@ func main() {
 			if audio != nil {
 				log.Println("[TTS] Playing response...")
 				atomic.StoreInt32(&ttsPlaying, 1)
-				_ = playAudio(audio.Samples, audio.SampleRate)
+				atomic.StoreInt32(&stopPlayback, 0)
+				_ = playAudio(ctx, audio.Samples, audio.SampleRate, &stopPlayback)
 				atomic.StoreInt32(&ttsPlaying, 0)
-			}
 
-			// Wait for mic silence instead of fixed echo tail.
-			const (
-				silenceRMS = 0.0015
-				consecN    = 5
-				checkEvery = 50 * time.Millisecond
-			)
-			consec := 0
-			deadline := time.Now().Add(3 * time.Second)
-			for time.Now().Before(deadline) {
-				lastMicMu.Lock()
-				rms := lastMicRMS
-				lastMicMu.Unlock()
-
-				if rms < silenceRMS {
-					consec++
-					if consec >= consecN {
-						break
-					}
-				} else {
-					consec = 0
+				// If barge-in was triggered, skip silence wait
+				if atomic.LoadInt32(&stopPlayback) == 0 {
+					waitForMicSilence()
 				}
-				time.Sleep(checkEvery)
 			}
 
 			atomic.StoreInt32(&isSpeaking, 0) // Resume ASR
@@ -500,11 +528,50 @@ func main() {
 
 	// Audio callback
 	capture.onSamples = func(samples []float32) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[AUDIO] Panic recovered in audio callback: %v", r)
+			}
+		}()
 		sherpaMu.Lock()
 		defer sherpaMu.Unlock()
 
+		// Compute RMS for every sample batch (used by barge-in and silence detection)
+		var sum float32
+		for _, s := range samples {
+			sum += s * s
+		}
+		rms := math.Sqrt(float64(sum / float32(len(samples))))
+		lastMicMu.Lock()
+		lastMicRMS = rms
+		lastMicMu.Unlock()
+
+		// Barge-in: if TTS is playing, run VAD-based speech detection with noise immunity
+		if atomic.LoadInt32(&ttsPlaying) != 0 {
+			if cfg.Audio.BargeInEnabled && rms > cfg.Audio.BargeInThreshold {
+				// Second layer: confirm with VAD for noise immunity
+				bargeVadBuffer.Push(samples)
+				for bargeVadBuffer.Size() >= cfg.VAD.WindowSize {
+					head := bargeVadBuffer.Head()
+					chunk := bargeVadBuffer.Get(head, cfg.VAD.WindowSize)
+					bargeVadBuffer.Pop(cfg.VAD.WindowSize)
+					vadDetector.AcceptWaveform(chunk)
+				}
+				if !vadDetector.IsEmpty() {
+					// Both RMS and VAD agree: this is human speech, not noise/echo
+					log.Printf("[BARGE-IN] VAD confirmed speech during TTS (RMS=%.4f). Stopping playback.", rms)
+					atomic.StoreInt32(&stopPlayback, 1)
+					// Flush VAD segments so they don't interfere with subsequent detection
+					for !vadDetector.IsEmpty() {
+						vadDetector.Pop()
+					}
+				}
+			}
+			return // Don't process ASR/VAD for recognition during TTS (audio will be echo)
+		}
+
 		if atomic.LoadInt32(&isSpeaking) != 0 {
-			return // Ignore samples while Mai is talking
+			return // Ignore samples while Mai is thinking
 		}
 		switch state {
 		case StateWakeWord:
@@ -574,16 +641,8 @@ func main() {
 			// if we might be in a follow-up window.
 			// However, we don't buffer HERE yet, because we haven't switched to StateListening.
 
-			// Volume check (RMS)
-			var sum float32
-			for _, s := range samples {
-				sum += s * s
-			}
-			rms := math.Sqrt(float64(sum / float32(len(samples))))
+			// Volume check (RMS) — updates shared RMS for barge-in detection and silence wait
 			fmt.Printf("\r[AUDIO] Level: %.4f ", rms)
-			lastMicMu.Lock()
-			lastMicRMS = rms
-			lastMicMu.Unlock()
 
 			if time.Since(lastDetected) < time.Duration(cfg.KWS.CooldownMs)*time.Millisecond {
 				return
@@ -600,8 +659,6 @@ func main() {
 					// JARVIS-style acknowledgement
 					go func() {
 						atomic.StoreInt32(&isSpeaking, 1) // Block mic processing during greeting
-						time.Sleep(200 * time.Millisecond)
-
 						greetings := []string{
 							"Yes Sir. How can I assist you?",
 							"At your service. What is the objective?",
@@ -614,32 +671,14 @@ func main() {
 
 						if audio != nil {
 							atomic.StoreInt32(&ttsPlaying, 1)
-							_ = playAudio(audio.Samples, audio.SampleRate)
+							atomic.StoreInt32(&stopPlayback, 0)
+							_ = playAudio(ctx, audio.Samples, audio.SampleRate, &stopPlayback)
 							atomic.StoreInt32(&ttsPlaying, 0)
-						}
 
-						// Wait for mic silence to reduce self-echo feedback.
-						const (
-							silenceRMS = 0.0015
-							consecN    = 5
-							checkEvery = 50 * time.Millisecond
-						)
-						consec := 0
-						deadline := time.Now().Add(3 * time.Second)
-						for time.Now().Before(deadline) {
-							lastMicMu.Lock()
-							rms := lastMicRMS
-							lastMicMu.Unlock()
-
-							if rms < silenceRMS {
-								consec++
-								if consec >= consecN {
-									break
-								}
-							} else {
-								consec = 0
+							// Skip silence wait on barge-in
+							if atomic.LoadInt32(&stopPlayback) == 0 {
+								waitForMicSilence()
 							}
-							time.Sleep(checkEvery)
 						}
 
 						atomic.StoreInt32(&isSpeaking, 0)
@@ -648,6 +687,7 @@ func main() {
 					state = StateListening
 					sessionText = "" // Reset session text
 					sessionSamples = nil
+					sherpa.DeleteCircularBuffer(vadBuffer) // Free old C buffer before allocating new
 					vadBuffer = sherpa.NewCircularBuffer(10 * 16000)
 					if recognizer != nil {
 						recognizer.Reset(asrStream)
@@ -697,6 +737,7 @@ func main() {
 					if text != "" {
 						sessionText += text + " "
 					}
+					sessionSamples = nil // Reset buffer for streaming path
 				} else if offlineRecognizer != nil {
 					// Process full buffer with Offline ASR
 					log.Println("\n[ASR] Processing segment with Offline Qwen3...")
@@ -725,8 +766,9 @@ func main() {
 						log.Println("[PIPELINE] Routing to legacy pipeline...")
 						workerChan <- Task{Text: sessionText}
 					}
-					state = StateWakeWord
-					sessionText = ""
+				state = StateWakeWord
+				sessionText = ""
+				sessionSamples = nil // Reset buffer on state transition
 					if recognizer != nil {
 						recognizer.Reset(asrStream)
 					}

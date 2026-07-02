@@ -731,6 +731,45 @@ See [`ROADMAP.md`](ROADMAP.md) for detailed implementation tasks. See [`progress
 
 ---
 
+
+## Recent Optimizations & Bug Fixes
+
+### Two-Way Communication — Barge-In, Thinking Chime, Reduced Dead Time
+- **Barge-in with VAD confirmation**: Speak during TTS playback to interrupt Mai. Uses a two-layer detector: RMS threshold as the first filter, then Silero VAD as the second layer to confirm the sound is actually human speech (not echo, fans, or door slams). This provides true noise immunity. Configurable via `audio.barge_in_enabled` and `audio.barge_in_threshold`.
+- **Thinking chime**: A subtle 80ms tone plays when LLM processing starts, so you know you've been heard. No more dead air. Configurable via `audio.thinking_chime`.
+- **`waitForMicSilence` reduced** from 3s max to 500ms max with 3 consecutive checks for faster turn-taking. On barge-in, skipped entirely since the user is already speaking.
+- **200ms pre-TTS sleep removed** — eliminates the defensive delay before every utterance.
+- **`playAudio` interruptible** — supports mid-stream cancellation via context + stop flag, checked in both the audio callback and poll loop.
+- **Audio callback restructured**: RMS computed once at callback entry, shared between barge-in detection and silence wait.
+- **TTS Voice Style**: The system prompt's tone (calm, warm, energetic, etc.) now automatically influences TTS speed, pitch, and volume. If your prompt says "be calm and composed", TTS will speak slower and softer. Override via `tts.voice_style` in config.
+
+### Supertonic TTS v2 → v3 Migration
+- Upgraded from `sherpa-onnx-supertonic-tts-int8-2026-03-06` (Supertonic 2) to `sherpa-onnx-supertonic-3-tts-int8-2026-05-11` (Supertonic 3)
+- Zero code changes required — model files are fully backward-compatible
+- Supertonic 3 reduces repeat/skip failures and improves voice quality
+
+### Bug Fixes
+- **Panic recovery**: Added `defer/recover` guards in the audio callback and event bus dispatch — a panic in either no longer crashes the process
+- **C memory leak**: VAD circular buffer now properly freed before reallocation on each wake-word trigger
+- **`sessionSamples` reset**: Streaming ASR path properly resets the sample buffer at VAD segment boundaries
+- **`lastResponseTime` initialization**: Fixed from zero-value (which caused a ~17000-year startup follow-up window bug) to `time.Now()`
+- **Episodic QueryEvents**: Now uses `LIKE` query instead of ignoring the parameter — enables proper context retrieval in the RAG pipeline
+- **Prosody SpeechRate**: `SpeechRate` feature is now computed via syllable-like energy peak detection (was always 0)
+- **Spectral centroid**: Normalized to 0-1 range and clamped at Nyquist frequency for more accurate feature matching
+- **Pitch estimation**: Clamped to human speech range (50-500 Hz) and normalized to 0-1
+- **MCP client race condition**: Added `sync.RWMutex` protection around `sessionID` field for concurrent access safety
+
+### Hallucination Reduction
+- **Verifier integration**: The `Verifier` is now wired into the `ReActLoop` — tool call results and final answers are verified for plausibility before acceptance
+- **ReAct timeout**: Added 30-second per-iteration context timeout — prevents stalled tool calls from hanging indefinitely
+- **Reduced max iterations**: From 5 to 3 — most tasks resolve in 1-2 iterations, reducing latency
+
+### Performance
+- **`waitForMicSilence()` helper**: Extracted 3 duplicated silence-wait loops (30 lines each) into a shared closure — reduces code duplication and improves maintainability
+- **Personality fully wired**: `publishTTS()` now includes emotion-adapted speed and pitch params from `TTSAdapter`, and `handleTranscription()` already included them — emotion-aware voice is active in all TTS paths
+
+---
+
 ## Contributing
 
 We welcome contributions! Please see [`CONTRIBUTING.md`](CONTRIBUTING.md) for guidelines.

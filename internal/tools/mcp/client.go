@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/user/mai/pkg/interfaces"
@@ -39,6 +40,7 @@ type Client struct {
 	tools         []ToolDefinition
 	initialized   bool
 	sessionID     string
+	mu            sync.RWMutex
 }
 
 func NewClient(url string) *Client {
@@ -211,8 +213,11 @@ func (c *Client) sendRequest(ctx context.Context, method string, params interfac
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if c.sessionID != "" {
-		httpReq.Header.Set("Mcp-Session-Id", c.sessionID)
+	c.mu.RLock()
+	sid := c.sessionID
+	c.mu.RUnlock()
+	if sid != "" {
+		httpReq.Header.Set("Mcp-Session-Id", sid)
 	}
 
 	resp, err := c.client.Do(httpReq)
@@ -221,8 +226,10 @@ func (c *Client) sendRequest(ctx context.Context, method string, params interfac
 	}
 	defer resp.Body.Close()
 
-	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
-		c.sessionID = sid
+	if newSID := resp.Header.Get("Mcp-Session-Id"); newSID != "" {
+		c.mu.Lock()
+		c.sessionID = newSID
+		c.mu.Unlock()
 	}
 
 	respBody, err := io.ReadAll(resp.Body)
@@ -255,8 +262,11 @@ func (c *Client) sendNotification(ctx context.Context, method string, params int
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if c.sessionID != "" {
-		httpReq.Header.Set("Mcp-Session-Id", c.sessionID)
+	c.mu.RLock()
+	sid := c.sessionID
+	c.mu.RUnlock()
+	if sid != "" {
+		httpReq.Header.Set("Mcp-Session-Id", sid)
 	}
 
 	resp, err := c.client.Do(httpReq)

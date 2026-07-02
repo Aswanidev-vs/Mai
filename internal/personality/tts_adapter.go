@@ -3,6 +3,7 @@ package personality
 import (
 	"log"
 	"math"
+	"strings"
 )
 
 type TTSParams struct {
@@ -17,6 +18,55 @@ type TTSAdapter struct {
 	baseSpeed  float32
 	basePitch  float32
 	baseVolume float32
+	styleName  string
+}
+
+// Voice style presets that map to TTSAdapter base values
+var voiceStyles = map[string]struct {
+	speed  float32
+	pitch  float32
+	volume float32
+}{
+	"calm":       {0.9, 0.95, 0.9},    // Composed, measured
+	"warm":       {1.0, 1.05, 1.05},   // Gentle, friendly
+	"energetic":  {1.15, 1.08, 1.1},   // Bright, fast
+	"serious":    {0.95, 0.95, 1.0},   // Even, authoritative
+	"soft":       {0.85, 0.95, 0.85},  // Quiet, gentle
+	"neutral":    {1.0, 1.0, 1.0},     // Default
+}
+
+// ParseVoiceStyle extracts a TTS voice style keyword from the system prompt.
+// It scans for known style keywords in the prompt text and returns the first match.
+// If nothing is found, returns "neutral".
+func ParseVoiceStyle(systemPrompt string) string {
+	lower := strings.ToLower(systemPrompt)
+	for style := range voiceStyles {
+		if style == "neutral" {
+			continue
+		}
+		// Check for explicit style indicators
+		if strings.Contains(lower, "speak "+style) ||
+			strings.Contains(lower, "voice "+style) ||
+			strings.Contains(lower, "tone "+style) ||
+			strings.Contains(lower, "be "+style) ||
+			strings.Contains(lower, style+" voice") {
+			return style
+		}
+	}
+	// Also check for implicit style cues
+	if strings.Contains(lower, "quiet") || strings.Contains(lower, "gentle") || strings.Contains(lower, "softly") {
+		return "soft"
+	}
+	if strings.Contains(lower, "warm") || strings.Contains(lower, "friendly") {
+		return "warm"
+	}
+	if strings.Contains(lower, "calm") || strings.Contains(lower, "composed") || strings.Contains(lower, "steady") {
+		return "calm"
+	}
+	if strings.Contains(lower, "energetic") || strings.Contains(lower, "bright") || strings.Contains(lower, "upbeat") {
+		return "energetic"
+	}
+	return "neutral"
 }
 
 func NewTTSAdapter(baseSpeed, basePitch, baseVolume float32) *TTSAdapter {
@@ -33,7 +83,28 @@ func NewTTSAdapter(baseSpeed, basePitch, baseVolume float32) *TTSAdapter {
 		baseSpeed:  baseSpeed,
 		basePitch:  basePitch,
 		baseVolume: baseVolume,
+		styleName:  "neutral",
 	}
+}
+
+// SetVoiceStyle selects a voice style preset that modifies the base TTS parameters.
+// The style name is matched case-insensitively against known presets.
+func (ta *TTSAdapter) SetVoiceStyle(style string) {
+	preset, ok := voiceStyles[strings.ToLower(style)]
+	if !ok {
+		log.Printf("[TTS] Unknown voice style %q, keeping neutral", style)
+		return
+	}
+	ta.baseSpeed = preset.speed
+	ta.basePitch = preset.pitch
+	ta.baseVolume = preset.volume
+	ta.styleName = style
+	log.Printf("[TTS] Voice style set to %q (speed=%.2f, pitch=%.2f, volume=%.2f)",
+		style, ta.baseSpeed, ta.basePitch, ta.baseVolume)
+}
+
+func (ta *TTSAdapter) GetStyleName() string {
+	return ta.styleName
 }
 
 func (ta *TTSAdapter) AdaptToEmotion(emotion EmotionState) TTSParams {
