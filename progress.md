@@ -1,7 +1,7 @@
 # Mai JARVIS-Level Implementation Progress
 
 ## Overview
-Tracking implementation of JARVIS-class capabilities across reasoning, tool use, emotion, personalization, and proactive intelligence.
+Tracking implementation of JARVIS-class capabilities across reasoning, tool use, emotion, personalization, proactive intelligence, and two-way communication.
 
 **BUILD STATUS: PASSING** | `go vet: CLEAN` | Binary: `mai.exe`
 
@@ -49,7 +49,7 @@ Tracking implementation of JARVIS-class capabilities across reasoning, tool use,
 |---|---|---|---|
 | Barge-in with VAD confirmation | DONE | `cmd/mai/main.go`, `cmd/mai/audio.go` | Two-layer detection: RMS threshold then Silero VAD confirmation. Noise-immune — rejects fans, door slams, TTS echo. Configurable threshold. |
 | Thinking chime | DONE | `cmd/mai/main.go`, `cmd/mai/audio.go` | 80ms 440Hz sine wave with fade-out envelope. Plays at LLM processing start. Configurable on/off. |
-| Reduced silence wait | DONE | `cmd/mai/main.go` | `waitForMicSilence` reduced 3s→500ms, 5→3 consecutive checks. Skipped entirely on barge-in path. |
+| Reduced silence wait | DONE | `cmd/mai/main.go` | `waitForMicSilence` reduced 3s→500ms, consecutive checks 5→3. Skipped entirely on barge-in path. |
 | Removed pre-TTS delay | DONE | `cmd/mai/main.go` | 200ms sleep before every utterance removed from all 3 playback paths. |
 | Interruptible playAudio | DONE | `cmd/mai/audio.go` | `playAudio` now accepts context + stop flag. Callback and poll loop check for cancellation. |
 | TTS voice style from system prompt | DONE | `internal/personality/tts_adapter.go`, `internal/agent/loop.go`, `cmd/mai/main.go` | 6 presets (calm/warm/energetic/serious/soft/neutral). Auto-detected from system prompt keywords. Explicit override via `tts.voice_style` config. |
