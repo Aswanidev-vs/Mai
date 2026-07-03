@@ -113,7 +113,7 @@ llm:
   # When hybrid_mode is true:
   #   - Non-sensitive queries → cloud provider (fast, smart)
   #   - Sensitive queries (passwords, keys, PII) → local Ollama (private)
-  hybrid_mode: false
+  hybrid_mode: true
 
   # LOCAL provider (always Ollama) — used for all queries when hybrid_mode=false
   # or for sensitive queries when hybrid_mode=true
@@ -129,7 +129,7 @@ llm:
   # If cloud section is empty/missing, falls back to provider/model/url/api_key above
   cloud:
     provider: "openrouter"           # e.g., "openai", "gemini", "claude", "openrouter"
-    model: "openai/gpt-oss-120b:free"              # e.g., "gpt-4o", "gemini-2.0-flash", "claude-sonnet-4-20250514"
+    model: "google/gemma-4-26b-a4b-it:free"              # e.g., "gpt-4o", "gemini-2.0-flash", "claude-sonnet-4-20250514"
     url: "https://openrouter.ai/api/v1"                # API endpoint (auto-detected if empty)
     api_key: "OPENROUTER_API"            # Your API key
 
