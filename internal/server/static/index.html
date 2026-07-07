@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mai - AI Companion</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%237c6aef'/><text x='50' y='68' font-size='50' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'>M</text></svg>">
+    <link rel="stylesheet" href="css/main.css">
+    <link rel="stylesheet" href="css/chat.css">
+    <link rel="stylesheet" href="css/character.css">
+    <link rel="stylesheet" href="css/settings.css">
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.175.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.175.0/examples/jsm/",
+            "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.3.3/lib/three-vrm.module.min.js",
+            "@pixiv/three-vrm-animation": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm-animation@3.3.3/lib/three-vrm-animation.module.min.js"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-left">
+                <div class="logo">M</div>
+                <h1 class="title">Mai</h1>
+            </div>
+            <div class="header-right">
+                <div class="status-indicator" id="statusIndicator">
+                    <span class="status-dot"></span>
+                    <span class="status-text" id="statusText">Connecting...</span>
+                </div>
+                <button class="icon-btn" id="settingsToggle" title="Settings">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                    </svg>
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main">
+            <!-- Character Panel -->
+            <section class="panel character-panel" id="characterPanel">
+                <div id="characterContainer"></div>
+                <div class="emotion-badge" id="emotionBadge">
+                    <span class="emotion-icon" id="emotionIcon"></span>
+                    <span class="emotion-label" id="emotionLabel">Calm</span>
+                </div>
+            </section>
+
+            <!-- Chat Panel -->
+            <section class="panel chat-panel">
+                <div class="chat-messages" id="chatMessages">
+                    <div class="welcome-message">
+                        <div class="welcome-icon">M</div>
+                        <p class="welcome-text">Hey. I'm Mai.</p>
+                        <p class="welcome-sub">Your cognitive partner. Ask me anything.</p>
+                    </div>
+                </div>
+                <div class="chat-input-area">
+                    <div class="input-wrapper">
+                        <textarea id="chatInput" placeholder="Message Mai..." rows="1"></textarea>
+                        <button class="send-btn" id="sendBtn" title="Send">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="input-hint">Enter to send, Shift+Enter for newline</div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Settings Panel (hidden by default) -->
+        <aside class="settings-panel" id="settingsPanel">
+            <div class="settings-header">
+                <h2>Settings</h2>
+                <button class="icon-btn" id="settingsClose" title="Close">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="settings-body">
+                <div class="setting-group">
+                    <label class="setting-label">LLM Provider</label>
+                    <select id="settingLLMProvider" class="setting-select">
+                        <option value="ollama">Ollama (Local)</option>
+                        <option value="openai">OpenAI</option>
+                        <option value="gemini">Gemini</option>
+                        <option value="claude">Claude</option>
+                        <option value="openrouter">OpenRouter</option>
+                    </select>
+                </div>
+                <div class="setting-group">
+                    <label class="setting-label">Model</label>
+                    <input type="text" id="settingLLMModel" class="setting-input" placeholder="e.g., qwen3:8b">
+                </div>
+                <div class="setting-group">
+                    <label class="setting-label">TTS Speed</label>
+                    <input type="range" id="settingTTSSpeed" class="setting-range" min="0.5" max="2.0" step="0.1" value="1.25">
+                    <span class="range-value" id="ttsSpeedValue">1.25</span>
+                </div>
+                <div class="setting-group">
+                    <label class="setting-label">Voice Style</label>
+                    <select id="settingVoiceStyle" class="setting-select">
+                        <option value="">Auto-detect</option>
+                        <option value="calm">Calm</option>
+                        <option value="warm">Warm</option>
+                        <option value="energetic">Energetic</option>
+                        <option value="serious">Serious</option>
+                        <option value="soft">Soft</option>
+                    </select>
+                </div>
+                <div class="setting-group">
+                    <label class="setting-label">Hybrid Mode</label>
+                    <label class="toggle">
+                        <input type="checkbox" id="settingHybridMode" checked>
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+            </div>
+        </aside>
+    </div>
+
+    <script src="js/utils.js"></script>
+    <script src="js/ws-client.js"></script>
+    <script src="js/audio.js"></script>
+    <script src="js/chat.js"></script>
+    <script type="module" src="js/character.js"></script>
+    <script src="js/settings.js"></script>
+    <script type="module" src="js/app.js"></script>
+</body>
+</html>

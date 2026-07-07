@@ -1,0 +1,50 @@
+.character-panel {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 0;
+    overflow: hidden;
+}
+
+#characterContainer {
+    width: 100%;
+    height: 100%;
+}
+
+#characterContainer canvas {
+    width: 100% !important;
+    height: 100% !important;
+    display: block;
+}
+
+.emotion-badge {
+    position: absolute;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: 20px;
+    background: rgba(10, 10, 20, 0.7);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(124, 106, 239, 0.3);
+    font-size: 13px;
+    color: var(--text-secondary);
+    transition: all 0.3s;
+    z-index: 5;
+    white-space: nowrap;
+}
+
+.emotion-badge.active {
+    border-color: var(--accent);
+    background: rgba(124, 106, 239, 0.15);
+    color: var(--text-primary);
+}
+
+.emotion-icon {
+    font-size: 14px;
+}

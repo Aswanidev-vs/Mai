@@ -36,6 +36,7 @@ import (
 	"github.com/user/mai/internal/memory"
 	"github.com/user/mai/internal/perception"
 	"github.com/user/mai/internal/personality"
+	"github.com/user/mai/internal/server"
 	"github.com/user/mai/internal/tools"
 	"github.com/user/mai/internal/tools/adapters"
 	"github.com/user/mai/internal/tools/mcp"
@@ -52,8 +53,10 @@ func main() {
 
 	var configPath string
 	var testCloud bool
+	var companionMode bool
 	flag.StringVar(&configPath, "config", "config.yaml", "Path to configuration file")
 	flag.BoolVar(&testCloud, "test-cloud", false, "Test cloud LLM provider and exit")
+	flag.BoolVar(&companionMode, "companion", false, "Enable companion Web UI (overrides config)")
 	flag.Parse()
 
 	// Load config
@@ -396,6 +399,24 @@ func main() {
 
 		// Bridge for Perception
 		agentBridge = perception.NewBridge(bus)
+
+	// WebSocket companion server
+	if companionMode {
+		cfg.Server.Enabled = true
+		log.Println("[BOOT] Companion mode enabled via --companion flag")
+	}
+	if cfg.Server.Enabled {
+			srv := server.New(server.ServerConfig{
+				Enabled: cfg.Server.Enabled,
+				Port:    cfg.Server.Port,
+				Token:   cfg.Server.Token,
+			}, bus, &isSpeaking, &ttsPlaying, func() string {
+				return string(orch.GetStatus())
+			})
+			if err := srv.Start(); err != nil {
+				log.Printf("[SERVER] Failed to start: %v", err)
+			}
+		}
 
 		// Thinking chime — plays when speech transcription is received (LLM processing begins)
 		bus.Subscribe("perception.audio.transcription", func(event interfaces.Event) {
