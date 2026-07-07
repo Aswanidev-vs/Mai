@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -96,6 +97,119 @@ func (c *audioCapture) onRecvFrames(_, pSample []byte, frameCount uint32) {
 		samples[i] = float32(s16) / 32768.0
 	}
 	c.onSamples(samples)
+}
+
+// playAudioStreaming plays TTS chunks as they arrive on a channel.
+// The generator function is called in a goroutine and should send
+// float32 sample slices into the returned channel, then close it when done.
+// Returns once the channel is closed and all buffered audio has been played.
+func playAudioStreaming(ctx context.Context, sampleRate int, stop *int32, generate func(ch chan<- []float32)) error {
+	ch := make(chan []float32, 64)
+
+	// Run the TTS generator in a goroutine.
+	go func() {
+		defer close(ch)
+		generate(ch)
+	}()
+
+	devCtx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
+	if err != nil {
+		return err
+	}
+	defer devCtx.Free()
+
+	deviceConfig := malgo.DefaultDeviceConfig(malgo.Playback)
+	deviceConfig.Playback.Format = malgo.FormatS16
+	deviceConfig.Playback.Channels = 1
+	deviceConfig.SampleRate = uint32(sampleRate)
+
+	var mu sync.Mutex
+	var buf []float32
+	var readIdx int
+	var streamDone bool
+
+	onSamples := func(pOutputSample, _ []byte, frameCount uint32) {
+		if stop != nil && atomic.LoadInt32(stop) != 0 {
+			return
+		}
+		mu.Lock()
+		n := int(frameCount)
+		written := 0
+		for written < n {
+			if readIdx >= len(buf) {
+				if streamDone {
+					break
+				}
+				mu.Unlock()
+				time.Sleep(time.Millisecond)
+				mu.Lock()
+				continue
+			}
+			s := buf[readIdx]
+			readIdx++
+			s16 := int16(s * 32767.0)
+			pOutputSample[written*2] = byte(s16 & 0xFF)
+			pOutputSample[written*2+1] = byte(s16 >> 8)
+			written++
+		}
+		// Trim consumed data periodically to avoid unbounded growth.
+		if readIdx > 8192 && readIdx > len(buf)/2 {
+			buf = buf[readIdx:]
+			readIdx = 0
+		}
+		mu.Unlock()
+	}
+
+	device, err := malgo.InitDevice(devCtx.Context, deviceConfig, malgo.DeviceCallbacks{Data: onSamples})
+	if err != nil {
+		return err
+	}
+	defer device.Uninit()
+
+	if err := device.Start(); err != nil {
+		return err
+	}
+
+	// Drain channel into the shared buffer.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for chunk := range ch {
+			if stop != nil && atomic.LoadInt32(stop) != 0 {
+				return
+			}
+			mu.Lock()
+			buf = append(buf, chunk...)
+			mu.Unlock()
+		}
+		mu.Lock()
+		streamDone = true
+		mu.Unlock()
+	}()
+
+	// Wait for generation to finish.
+	<-done
+
+	// Wait for playback to drain.
+	for {
+		mu.Lock()
+		remaining := len(buf) - readIdx
+		mu.Unlock()
+		if remaining <= 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if stop != nil && atomic.LoadInt32(stop) != 0 {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return nil
 }
 
 // playAudio plays float32 samples through the default output device.

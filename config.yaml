@@ -113,12 +113,12 @@ llm:
   # When hybrid_mode is true:
   #   - Non-sensitive queries → cloud provider (fast, smart)
   #   - Sensitive queries (passwords, keys, PII) → local Ollama (private)
-  hybrid_mode: true
+  hybrid_mode: false
 
   # LOCAL provider (always Ollama) — used for all queries when hybrid_mode=false
   # or for sensitive queries when hybrid_mode=true
   provider: "ollama"
-  model: "gemma4:e2b-it-q4_K_M"
+  model: "gemma3:4b"
   url: "http://localhost:11434/api/generate"
   api_key: ""
   auto_start: true
@@ -552,3 +552,8 @@ agentic:
 mcp:
   enabled: false
   servers: []  # List of MCP server URLs, e.g., ["http://localhost:3000", "http://localhost:3001"]
+
+server:
+  enabled: true       # Enable the companion web UI server
+  port: 8080          # HTTP/WS server port
+  token: ""           # Auth token (empty = no auth required)
