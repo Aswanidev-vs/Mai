@@ -139,6 +139,30 @@ body {
     color: var(--text-primary);
 }
 
+/* Mic / voice toggle */
+#mictoggle, #micToggle {
+    position: relative;
+}
+
+#mictoggle.active, #micToggle.active {
+    background: var(--accent);
+    color: white;
+    box-shadow: 0 0 12px rgba(124, 106, 239, 0.6);
+}
+
+#mictoggle.active::after, #micToggle.active::after {
+    content: '';
+    position: absolute;
+    top: -3px;
+    right: -3px;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--error);
+    border: 2px solid var(--bg-secondary);
+    animation: pulse 1.1s infinite;
+}
+
 /* Main Layout */
 .main {
     position: relative;

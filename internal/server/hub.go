@@ -33,6 +33,7 @@ type Hub struct {
 	mu           sync.RWMutex
 	eventBus     interfaces.EventBus
 	getStatusFunc func() string
+	onClientGone  func() // called after a client fully disconnects
 }
 
 func NewHub() *Hub {
@@ -61,6 +62,9 @@ func (h *Hub) Run() {
 			}
 			h.mu.Unlock()
 			log.Printf("[WS] Client disconnected: %s (total: %d)", client.id, len(h.clients))
+			if h.onClientGone != nil {
+				h.onClientGone()
+			}
 
 		case message := <-h.broadcast:
 			h.mu.RLock()

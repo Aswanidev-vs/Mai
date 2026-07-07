@@ -10,6 +10,10 @@ class AudioPlayer {
         this.onSpeakingEnd = null;
         this._currentSource = null;
         this._draining = false;
+
+        // Playback clock for viseme-accurate lip sync
+        this._utteranceStartCtx = null; // AudioContext.currentTime when current utterance began
+        this._knownDuration = 0;        // cumulative seconds of queued audio for current utterance
     }
 
     init() {
@@ -35,6 +39,11 @@ class AudioPlayer {
         if (!this.audioContext) this.init();
         this.resume();
 
+        // Track cumulative duration of the current utterance (for viseme timing)
+        const bytes = base64Audio ? atob(base64Audio).length : 0;
+        const sr = sampleRate || 24000;
+        this._knownDuration += (bytes / 2) / sr;
+
         this.queue.push({ base64Audio, sampleRate, done });
         if (!this._draining) {
             this._drainQueue();
@@ -48,6 +57,10 @@ class AudioPlayer {
         // Signal speaking start
         if (!this.playing && this.queue.length > 0) {
             this.playing = true;
+            // Mark utterance start time on the audio clock for viseme playhead
+            if (this.audioContext) {
+                this._utteranceStartCtx = this.audioContext.currentTime;
+            }
             if (this.onSpeakingStart) this.onSpeakingStart();
         }
 
@@ -67,6 +80,7 @@ class AudioPlayer {
 
         this.playing = false;
         this._draining = false;
+        this._utteranceStartCtx = null;
         if (this.onSpeakingEnd) this.onSpeakingEnd();
     }
 
@@ -155,5 +169,19 @@ class AudioPlayer {
         }
         this.playing = false;
         this._draining = false;
+        this._utteranceStartCtx = null;
+        this._knownDuration = 0;
+    }
+
+    // ── Lip-sync playback clock ──
+    // Seconds elapsed since the current utterance started playing.
+    getPlayhead() {
+        if (this._utteranceStartCtx === null || !this.audioContext) return 0;
+        return Math.max(0, this.audioContext.currentTime - this._utteranceStartCtx);
+    }
+
+    // Cumulative seconds of audio queued for the current utterance.
+    getKnownDuration() {
+        return this._knownDuration;
     }
 }

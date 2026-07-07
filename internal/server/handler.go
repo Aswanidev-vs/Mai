@@ -1,6 +1,8 @@
 package server
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"log"
 
@@ -22,6 +24,16 @@ func (h *Hub) HandleMessage(client *Client, raw []byte) {
 		h.handleStateRequest(client, msg)
 	case MethodConfigUpdate:
 		h.handleConfigUpdate(client, msg)
+	case MethodAudioInput:
+		h.handleAudioInput(client, msg)
+	case MethodAudioInputStart:
+		if h.eventBus != nil {
+			h.eventBus.Publish(interfaces.Event{Type: "companion.audio.start", Source: "ws-server", Payload: map[string]interface{}{"client": client.id}})
+		}
+	case MethodAudioInputStop:
+		if h.eventBus != nil {
+			h.eventBus.Publish(interfaces.Event{Type: "companion.audio.stop", Source: "ws-server", Payload: map[string]interface{}{"client": client.id}})
+		}
 	default:
 		if msg.Method != "" {
 			h.sendError(client, msg.ID, -32601, "Method not found: "+msg.Method)
@@ -101,6 +113,37 @@ func (h *Hub) sendResult(client *Client, id string, result json.RawMessage) {
 	msg := WSMessage{ID: id, Result: result}
 	data, _ := json.Marshal(msg)
 	h.SendToClient(client, data)
+}
+
+func (h *Hub) handleAudioInput(client *Client, msg WSMessage) {
+	var params AudioInputParams
+	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		return
+	}
+	if params.Audio == "" || h.eventBus == nil {
+		return
+	}
+
+	// base64 int16 → float32 PCM
+	raw, err := base64.StdEncoding.DecodeString(params.Audio)
+	if err != nil || len(raw) == 0 || len(raw)%2 != 0 {
+		return
+	}
+	samples := make([]float32, len(raw)/2)
+	for i := 0; i < len(samples); i++ {
+		s16 := int16(binary.LittleEndian.Uint16(raw[i*2 : i*2+2]))
+		samples[i] = float32(s16) / 32768.0
+	}
+
+	h.eventBus.Publish(interfaces.Event{
+		Type:   "perception.audio.frame",
+		Source: "ws-server",
+		Payload: map[string]interface{}{
+			"samples":     samples,
+			"sample_rate": params.SampleRate,
+			"client":      client.id,
+		},
+	})
 }
 
 func (h *Hub) sendError(client *Client, id string, code int, message string) {

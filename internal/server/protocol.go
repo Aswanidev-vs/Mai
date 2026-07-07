@@ -19,9 +19,12 @@ type WSError struct {
 
 // Client → Server methods
 const (
-	MethodChatInput    = "chat.input"
-	MethodConfigUpdate = "config.update"
-	MethodStateRequest = "state.request"
+	MethodChatInput        = "chat.input"
+	MethodConfigUpdate     = "config.update"
+	MethodStateRequest     = "state.request"
+	MethodAudioInput       = "audio.input"
+	MethodAudioInputStart  = "audio.input.start"
+	MethodAudioInputStop   = "audio.input.stop"
 )
 
 // Server → Client notifications
@@ -73,4 +76,10 @@ type ConfigUpdateParams struct {
 type ConfigChangedParams struct {
 	Key   string      `json:"key"`
 	Value interface{} `json:"value"`
+}
+
+// AudioInputParams carries raw PCM (base64 int16) from the browser microphone.
+type AudioInputParams struct {
+	Audio      string `json:"audio"`
+	SampleRate int    `json:"sample_rate"`
 }

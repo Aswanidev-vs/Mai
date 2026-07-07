@@ -20,27 +20,30 @@ type ServerConfig struct {
 
 // Server is the Mai companion WebSocket + HTTP server.
 type Server struct {
-	cfg        ServerConfig
-	hub        *Hub
-	upgrader   websocket.Upgrader
-	eventBus   interfaces.EventBus
-	isSpeaking *int32
-	ttsPlaying *int32
- getStatus  func() string
+	cfg                ServerConfig
+	hub                *Hub
+	upgrader           websocket.Upgrader
+	eventBus           interfaces.EventBus
+	isSpeaking         *int32
+	ttsPlaying         *int32
+	getStatus          func() string
+	OnClientDisconnect func() // called when a client leaves (to restore local mic, etc.)
 }
 
 // New creates a new Server.
 func New(cfg ServerConfig, bus interfaces.EventBus, isSpeaking, ttsPlaying *int32, getStatus func() string) *Server {
+	hub := NewHub()
+	hub.eventBus = bus
 	return &Server{
 		cfg:        cfg,
-		hub:        NewHub(),
+		hub:        hub,
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
 		eventBus:   bus,
 		isSpeaking: isSpeaking,
 		ttsPlaying: ttsPlaying,
 		getStatus:  getStatus,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
-		},
 	}
 }
 
@@ -79,6 +82,21 @@ func (s *Server) Start() error {
 	}()
 
 	return nil
+}
+
+// ClientCount returns the number of connected browser clients.
+func (s *Server) ClientCount() int {
+	if s.hub == nil {
+		return 0
+	}
+	return s.hub.ClientCount()
+}
+
+// SetOnClientGone registers a callback that fires when all clients disconnect.
+func (s *Server) SetOnClientGone(fn func()) {
+	if s.hub != nil {
+		s.hub.onClientGone = fn
+	}
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
