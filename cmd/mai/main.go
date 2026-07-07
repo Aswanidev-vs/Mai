@@ -316,34 +316,49 @@ func main() {
 
 	log.Printf("[TTS] Synthesizer ready (%s)", cfg.TTS.ActiveModel)
 
-	// speak generates audio and plays it where the user can hear it:
-	// if a browser companion is connected, stream to the browser (so lips sync);
-	// otherwise play locally. Avoids double audio when a client is present.
+	// speak generates audio and plays it where the user can hear it.
+	// When a browser companion is connected, it streams chunks as they're
+	// synthesised (true streaming) so the first audio arrives almost immediately.
 	speak := func(text string, speed float32) {
 		if speed == 0 {
 			speed = cfg.TTS.Supertonic.Speed
 		}
 		atomic.StoreInt32(&isSpeaking, 1)
-		ttsMu.Lock()
-		audio := tts.Generate(text, cfg.TTS.Supertonic.Sid, speed)
-		ttsMu.Unlock()
-		if audio == nil {
-			atomic.StoreInt32(&isSpeaking, 0)
-			return
-		}
+
 		if bus != nil && cfg.Server.Enabled && companionHasClient() {
-			// Browser plays it (lip-sync driven by real voice energy).
-			publishTTSAudio(bus, audio.Samples, audio.SampleRate, true)
+			// ── Streaming path: publish each callback chunk in real time ──
+			const outSR = 44100 // Supertonic output rate
+			ttsMu.Lock()
+			tts.GenerateWithCallback(text, cfg.TTS.Supertonic.Sid, speed,
+				func(samples []float32) bool {
+					publishTTSAudioChunk(bus, samples, outSR, false)
+					return true // keep generating
+				},
+			)
+			ttsMu.Unlock()
+			// Signal "end of utterance" so the browser knows playback is done.
+			publishTTSAudioChunk(bus, nil, outSR, true)
+
 		} else {
-			// Local speaker only.
+			// ── Local-only path: streaming playback ──
 			atomic.StoreInt32(&ttsPlaying, 1)
 			atomic.StoreInt32(&stopPlayback, 0)
-			_ = playAudio(ctx, audio.Samples, audio.SampleRate, &stopPlayback)
+			_ = playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
+				ttsMu.Lock()
+				tts.GenerateWithCallback(text, cfg.TTS.Supertonic.Sid, speed,
+					func(samples []float32) bool {
+						ch <- samples
+						return true
+					},
+				)
+				ttsMu.Unlock()
+			})
 			atomic.StoreInt32(&ttsPlaying, 0)
 			if atomic.LoadInt32(&stopPlayback) == 0 {
 				waitForMicSilence()
 			}
 		}
+
 		atomic.StoreInt32(&isSpeaking, 0)
 		lastResponseMu.Lock()
 		lastResponseTime = time.Now()
@@ -564,21 +579,27 @@ func main() {
 
 			log.Printf("[LLM] Response received. Starting TTS...")
 
-			// TTS
-			ttsMu.Lock()
-			audio := tts.Generate(response, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
-			ttsMu.Unlock()
-			if audio != nil {
-				log.Println("[TTS] Playing response...")
-				atomic.StoreInt32(&ttsPlaying, 1)
-				atomic.StoreInt32(&stopPlayback, 0)
-				_ = playAudio(ctx, audio.Samples, audio.SampleRate, &stopPlayback)
-				atomic.StoreInt32(&ttsPlaying, 0)
+			// Streaming TTS: generate chunks and play them as they arrive.
+			atomic.StoreInt32(&ttsPlaying, 1)
+			atomic.StoreInt32(&stopPlayback, 0)
+			playErr := playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
+				ttsMu.Lock()
+				tts.GenerateWithCallback(response, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed,
+					func(samples []float32) bool {
+						ch <- samples
+						return true
+					},
+				)
+				ttsMu.Unlock()
+			})
+			if playErr != nil {
+				log.Printf("[TTS] Play error: %v", playErr)
+			}
+			atomic.StoreInt32(&ttsPlaying, 0)
 
-				// If barge-in was triggered, skip silence wait
-				if atomic.LoadInt32(&stopPlayback) == 0 {
-					waitForMicSilence()
-				}
+			// If barge-in was triggered, skip silence wait
+			if atomic.LoadInt32(&stopPlayback) == 0 {
+				waitForMicSilence()
 			}
 
 			atomic.StoreInt32(&isSpeaking, 0) // Resume ASR
@@ -982,6 +1003,38 @@ func resolveEnv(val string) string {
 		return envVal
 	}
 	return val
+}
+
+// publishTTSAudioChunk encodes a single callback chunk and pushes it onto the
+// event bus so the bridge can forward it to the browser in real time.
+func publishTTSAudioChunk(bus interfaces.EventBus, samples []float32, sampleRate int, done bool) {
+	if bus == nil {
+		return
+	}
+	var encoded string
+	if len(samples) > 0 {
+		buf := make([]byte, len(samples)*2)
+		for j, s := range samples {
+			if s > 1.0 {
+				s = 1.0
+			} else if s < -1.0 {
+				s = -1.0
+			}
+			s16 := int16(s * 32767.0)
+			buf[j*2] = byte(s16 & 0xFF)
+			buf[j*2+1] = byte(s16 >> 8)
+		}
+		encoded = base64.StdEncoding.EncodeToString(buf)
+	}
+	bus.Publish(interfaces.Event{
+		Type:   "tts.audio.chunk",
+		Source: "main",
+		Payload: map[string]interface{}{
+			"audio":       encoded,
+			"sample_rate": sampleRate,
+			"done":        done,
+		},
+	})
 }
 
 func publishTTSAudio(bus interfaces.EventBus, samples []float32, sampleRate int, done bool) {

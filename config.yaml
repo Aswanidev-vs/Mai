@@ -118,7 +118,7 @@ llm:
   # LOCAL provider (always Ollama) — used for all queries when hybrid_mode=false
   # or for sensitive queries when hybrid_mode=true
   provider: "ollama"
-  model: "gemma4:e2b-it-q4_K_M"
+  model: "gemma3:4b"
   url: "http://localhost:11434/api/generate"
   api_key: ""
   auto_start: true

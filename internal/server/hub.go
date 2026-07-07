@@ -13,7 +13,7 @@ const (
 	writeWait      = 10 * time.Second
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 64 * 1024
+	maxMessageSize = 256 * 1024 // 256 KB — large enough for TTS audio chunks
 )
 
 // Client represents a single WebSocket connection.
@@ -39,7 +39,7 @@ type Hub struct {
 func NewHub() *Hub {
 	return &Hub{
 		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte, 256),
+		broadcast:  make(chan []byte, 512),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 	}
@@ -67,16 +67,31 @@ func (h *Hub) Run() {
 			}
 
 		case message := <-h.broadcast:
+			// Collect stale clients first, then remove them under write lock.
 			h.mu.RLock()
+			var stale []*Client
 			for client := range h.clients {
 				select {
 				case client.send <- message:
 				default:
-					close(client.send)
-					delete(h.clients, client)
+					stale = append(stale, client)
 				}
 			}
 			h.mu.RUnlock()
+
+			if len(stale) > 0 {
+				h.mu.Lock()
+				for _, client := range stale {
+					if _, ok := h.clients[client]; ok {
+						delete(h.clients, client)
+						close(client.send)
+					}
+				}
+				h.mu.Unlock()
+				if h.onClientGone != nil {
+					h.onClientGone()
+				}
+			}
 		}
 	}
 }
