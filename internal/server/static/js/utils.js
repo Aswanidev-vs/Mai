@@ -107,3 +107,6 @@ function energyGate(value, lo, hi) {
     const t = (value - lo) / (hi - lo);
     return t * t * (3 - 2 * t);
 }
+
+// Explicit globals for Codacy cross-file resolution
+Object.assign(window, { escapeHtml, renderMarkdown, debounce, generateId, buildVisemeSchedule, visemeSegmentAt, energyGate });

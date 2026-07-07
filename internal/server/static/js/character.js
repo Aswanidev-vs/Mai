@@ -41,8 +41,8 @@ const lerp = (a, b, t) => a + (b - a) * t;
 // Crypto-secure random for Codacy compliance. Falls back to Math.random if crypto unavailable.
 const secureRand = () => {
     const a = new Uint32Array(1);
-    try { crypto.getRandomValues(a); return a[0] / 4294967296; }
-    catch (e) { return secureRand(); }
+    try { crypto.getRandomValues(a); return a[0] / 0x100000000; }
+    catch (e) { return Math.random(); }
 };
 
 class CharacterRenderer {
@@ -672,8 +672,8 @@ class CharacterRenderer {
     _setEmotion(name, intensity = 1) {
         if (!this.vrm?.expressionManager) return;
         clearTimeout(this.expressionResetTimer);
+        if (!Object.hasOwn(EMOTION_MAP, name)) return;
         const st = EMOTION_MAP[name];
-        if (!st) return;
         this.currentEmotion = name;
         this.isTransitioning = true;
         this.transitionProgress = 0;
