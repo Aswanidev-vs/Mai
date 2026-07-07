@@ -42,7 +42,7 @@ const lerp = (a, b, t) => a + (b - a) * t;
 const secureRand = () => {
     const a = new Uint32Array(1);
     try { crypto.getRandomValues(a); return a[0] / 0x100000000; }
-    catch (e) { return Math.random(); }
+    catch (e) { return 0.5; }
 };
 
 class CharacterRenderer {

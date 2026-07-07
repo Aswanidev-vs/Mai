@@ -1,4 +1,4 @@
-// Chat UI logic
+// Chat UI logic — DOM-safe, no innerHTML with user text
 
 class ChatUI {
     constructor() {
@@ -12,13 +12,11 @@ class ChatUI {
     }
 
     _setupInput() {
-        // Auto-resize textarea
         this.inputEl.addEventListener('input', () => {
             this.inputEl.style.height = 'auto';
             this.inputEl.style.height = Math.min(this.inputEl.scrollHeight, 120) + 'px';
         });
 
-        // Enter to send
         this.inputEl.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
@@ -42,16 +40,22 @@ class ChatUI {
     }
 
     addUserMessage(text) {
-        // Remove welcome message
         const welcome = this.messagesEl.querySelector('.welcome-message');
         if (welcome) welcome.remove();
 
         const el = document.createElement('div');
         el.className = 'message user';
-        el.innerHTML = `
-            <div class="message-avatar">You</div>
-            <div class="message-content">${escapeHtml(text)}</div>
-        `;
+
+        const avatar = document.createElement('div');
+        avatar.className = 'message-avatar';
+        avatar.textContent = 'You';
+
+        const content = document.createElement('div');
+        content.className = 'message-content';
+        content.textContent = text;
+
+        el.appendChild(avatar);
+        el.appendChild(content);
         this.messagesEl.appendChild(el);
         this._scrollToBottom();
     }
@@ -59,12 +63,18 @@ class ChatUI {
     startAgentMessage() {
         const el = document.createElement('div');
         el.className = 'message assistant';
-        el.innerHTML = `
-            <div class="message-avatar">M</div>
-            <div class="message-content streaming-cursor"></div>
-        `;
+
+        const avatar = document.createElement('div');
+        avatar.className = 'message-avatar';
+        avatar.textContent = 'M';
+
+        const content = document.createElement('div');
+        content.className = 'message-content streaming-cursor';
+
+        el.appendChild(avatar);
+        el.appendChild(content);
         this.messagesEl.appendChild(el);
-        this.currentStreamingEl = el.querySelector('.message-content');
+        this.currentStreamingEl = content;
         this._scrollToBottom();
         return el;
     }
@@ -73,16 +83,22 @@ class ChatUI {
         if (!this.currentStreamingEl) {
             this.startAgentMessage();
         }
-        this.currentStreamingEl.innerHTML += escapeHtml(token);
+        // Append escaped text safely via textContent
+        this.currentStreamingEl.appendChild(document.createTextNode(token));
         this._scrollToBottom();
     }
 
     finalizeMessage() {
         if (this.currentStreamingEl) {
             this.currentStreamingEl.classList.remove('streaming-cursor');
-            // Re-render with markdown
+            // Render markdown via DOMParser (safe HTML parsing)
             const text = this.currentStreamingEl.textContent;
-            this.currentStreamingEl.innerHTML = renderMarkdown(text);
+            const md = renderMarkdown(text);
+            const frag = new DOMParser().parseFromString(md, 'text/html').body;
+            this.currentStreamingEl.textContent = '';
+            while (frag.firstChild) {
+                this.currentStreamingEl.appendChild(frag.firstChild);
+            }
             this.currentStreamingEl = null;
         }
         this.sendBtn.disabled = false;
@@ -92,10 +108,19 @@ class ChatUI {
     addSystemMessage(text) {
         const el = document.createElement('div');
         el.className = 'message assistant';
-        el.innerHTML = `
-            <div class="message-avatar">M</div>
-            <div class="message-content"><em>${escapeHtml(text)}</em></div>
-        `;
+
+        const avatar = document.createElement('div');
+        avatar.className = 'message-avatar';
+        avatar.textContent = 'M';
+
+        const content = document.createElement('div');
+        content.className = 'message-content';
+        const em = document.createElement('em');
+        em.textContent = text;
+        content.appendChild(em);
+
+        el.appendChild(avatar);
+        el.appendChild(content);
         this.messagesEl.appendChild(el);
         this._scrollToBottom();
     }
