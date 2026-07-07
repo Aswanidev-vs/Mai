@@ -50,6 +50,24 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		b.hub.BroadcastNotification(NotifChatResponse, ChatResponseChunk{Text: text, Done: true})
 	})
 
+	// TTS audio chunks → WS clients (for browser-side lip sync)
+	bus.Subscribe("tts.audio.chunk", func(event interfaces.Event) {
+		audio, _ := event.Payload["audio"].(string)
+		sampleRate, _ := event.Payload["sample_rate"].(int)
+		done, _ := event.Payload["done"].(bool)
+		if audio == "" {
+			return
+		}
+		if sampleRate == 0 {
+			sampleRate = 24000
+		}
+		b.hub.BroadcastNotification(NotifTTSChunk, TTSChunkParams{
+			Audio:      audio,
+			SampleRate: sampleRate,
+			Done:       done,
+		})
+	})
+
 	log.Println("[BRIDGE] Event bus bridge active")
 }
 

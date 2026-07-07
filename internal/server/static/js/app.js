@@ -15,6 +15,14 @@ if (audio.analyser) {
     character.setAnalyser(audio.analyser);
 }
 
+// Wire speaking lifecycle to character
+audio.onSpeakingStart = () => {
+    character.setSpeaking(true);
+};
+audio.onSpeakingEnd = () => {
+    character.setSpeaking(false);
+};
+
 const statusIndicator = document.getElementById('statusIndicator');
 const statusText = document.getElementById('statusText');
 const emotionBadge = document.getElementById('emotionBadge');
@@ -65,16 +73,18 @@ ws.on('status.changed', (params) => {
         statusIndicator.classList.add('thinking');
     } else if (status === 'speaking') {
         statusIndicator.classList.add('speaking');
-        character.setSpeaking(true);
-    } else {
-        character.setSpeaking(false);
+        // Speaking state is managed by audio callbacks, not status events
     }
 });
 
-// TTS audio chunks
+// TTS audio chunks — queue for sequential playback with lip sync
 ws.on('tts.chunk', (params) => {
     if (params.audio) {
-        audio.playChunk(params.audio, params.sample_rate);
+        // Ensure analyser is connected before first chunk
+        if (audio.analyser && !character.analyser) {
+            character.setAnalyser(audio.analyser);
+        }
+        audio.queueChunk(params.audio, params.sample_rate, !!params.done);
     }
 });
 

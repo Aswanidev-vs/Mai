@@ -12,6 +12,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -436,6 +437,8 @@ func main() {
 			audio := tts.Generate(text, cfg.TTS.Supertonic.Sid, speed)
 			ttsMu.Unlock()
 			if audio != nil {
+				publishTTSAudio(bus, audio.Samples, audio.SampleRate, true)
+
 				atomic.StoreInt32(&ttsPlaying, 1)
 				atomic.StoreInt32(&stopPlayback, 0)
 				_ = playAudio(ctx, audio.Samples, audio.SampleRate, &stopPlayback)
@@ -951,4 +954,46 @@ func resolveEnv(val string) string {
 		return envVal
 	}
 	return val
+}
+
+func publishTTSAudio(bus interfaces.EventBus, samples []float32, sampleRate int, done bool) {
+	if bus == nil || len(samples) == 0 {
+		return
+	}
+
+	const chunkSize = 8192
+	totalSamples := len(samples)
+	
+	for i := 0; i < totalSamples; i += chunkSize {
+		end := i + chunkSize
+		isLastChunk := false
+		if end >= totalSamples {
+			end = totalSamples
+			isLastChunk = true
+		}
+		
+		chunk := samples[i:end]
+		buf := make([]byte, len(chunk)*2)
+		for j, s := range chunk {
+			if s > 1.0 {
+				s = 1.0
+			} else if s < -1.0 {
+				s = -1.0
+			}
+			s16 := int16(s * 32767.0)
+			buf[j*2] = byte(s16 & 0xFF)
+			buf[j*2+1] = byte(s16 >> 8)
+		}
+		
+		encoded := base64.StdEncoding.EncodeToString(buf)
+		bus.Publish(interfaces.Event{
+			Type:   "tts.audio.chunk",
+			Source: "main",
+			Payload: map[string]interface{}{
+				"audio":       encoded,
+				"sample_rate": sampleRate,
+				"done":        done && isLastChunk,
+			},
+		})
+	}
 }
