@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"sync/atomic"
 
@@ -38,7 +39,19 @@ func New(cfg ServerConfig, bus interfaces.EventBus, isSpeaking, ttsPlaying *int3
 		cfg:        cfg,
 		hub:        hub,
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
+			CheckOrigin: func(r *http.Request) bool {
+				origin := r.Header.Get("Origin")
+				if origin == "" {
+					return true // browserless clients (e.g. curl, ws tests)
+				}
+				// Only allow local origins for security.
+				u, err := url.Parse(origin)
+				if err != nil {
+					return false
+				}
+				host := u.Hostname()
+				return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == ""
+			},
 		},
 		eventBus:   bus,
 		isSpeaking: isSpeaking,
