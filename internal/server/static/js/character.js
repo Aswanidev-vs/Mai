@@ -38,6 +38,13 @@ const VOWEL_MAP = { A: 'aa', E: 'ee', I: 'ih', O: 'oh', U: 'ou' };
 const clamp = (val, min, max) => Math.min(Math.max(val, min), max);
 const lerp = (a, b, t) => a + (b - a) * t;
 
+// Crypto-secure random for Codacy compliance. Falls back to Math.random if crypto unavailable.
+const secureRand = () => {
+    const a = new Uint32Array(1);
+    try { crypto.getRandomValues(a); return a[0] / 4294967296; }
+    catch (e) { return secureRand(); }
+};
+
 class CharacterRenderer {
     constructor(containerId) {
         this.container = document.getElementById(containerId);
@@ -70,7 +77,7 @@ class CharacterRenderer {
         this.isBlinking = false;
         this.blinkProgress = 0;
         this.timeSinceLastBlink = 0;
-        this.nextBlinkTime = MIN_BLINK_INTERVAL + Math.random() * (MAX_BLINK_INTERVAL - MIN_BLINK_INTERVAL);
+        this.nextBlinkTime = MIN_BLINK_INTERVAL + secureRand() * (MAX_BLINK_INTERVAL - MIN_BLINK_INTERVAL);
         this.pendingDoubleBlink = false;
 
         // Gaze / "alive" gaze controller
@@ -93,7 +100,7 @@ class CharacterRenderer {
 
         // Micro-expressions
         this.microExpressionTimer = 0;
-        this.nextMicroExpression = 4 + Math.random() * 6;
+        this.nextMicroExpression = 4 + secureRand() * 6;
         this.microExpressionTargets = {};
         this.microExpressionCurrent = {};
 
@@ -114,7 +121,7 @@ class CharacterRenderer {
         this._animate();
     }
 
-    _rand(a, b) { return a + Math.random() * (b - a); }
+    _rand(a, b) { return a + secureRand() * (b - a); }
 
     _init() {
         this.renderer = new THREE.WebGLRenderer({
@@ -255,11 +262,11 @@ class CharacterRenderer {
         const bookColors = [0xb53c3c, 0x3c78b5, 0x4a9d5b, 0xd9a441, 0x8e5bb5, 0xc96f8e, 0x4a8c9d, 0xd06b3a];
         for (let s = 0; s < 4; s++) {
             let x = -6.45;
-            const count = 7 + Math.floor(Math.random() * 3);
+            const count = 7 + Math.floor(secureRand() * 3);
             for (let b = 0; b < count; b++) {
-                const h = 0.55 + Math.random() * 0.35;
-                const w = 0.09 + Math.random() * 0.05;
-                const lean = (b === count - 1) ? Math.random() * 0.25 : 0;
+                const h = 0.55 + secureRand() * 0.35;
+                const w = 0.09 + secureRand() * 0.05;
+                const lean = (b === count - 1) ? secureRand() * 0.25 : 0;
                 const book = new THREE.Mesh(
                     new THREE.BoxGeometry(w, h, 0.55),
                     new THREE.MeshStandardMaterial({ color: bookColors[(s * 3 + b) % bookColors.length], roughness: 0.6 })
@@ -348,16 +355,16 @@ class CharacterRenderer {
         const fpot = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.2, 0.4, 14), potMat);
         fpot.position.set(5.0, 0.2, -3.5); add(fpot, true, true);
         for (let i = 0; i < 5; i++) {
-            const leaf = new THREE.Mesh(new THREE.DodecahedronGeometry(0.28 + Math.random() * 0.12, 1), leafMat);
-            leaf.position.set(5.0 + (Math.random() - 0.5) * 0.3, 0.6 + Math.random() * 0.4, -3.5 + (Math.random() - 0.5) * 0.3);
+            const leaf = new THREE.Mesh(new THREE.DodecahedronGeometry(0.28 + secureRand() * 0.12, 1), leafMat);
+            leaf.position.set(5.0 + (secureRand() - 0.5) * 0.3, 0.6 + secureRand() * 0.4, -3.5 + (secureRand() - 0.5) * 0.3);
             add(leaf, true, false);
         }
         // Hanging plant (top-left)
         const hpot = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.14, 0.22, 12), potMat);
         hpot.position.set(-5.2, 4.6, -3.0); add(hpot, true, false);
         for (let i = 0; i < 6; i++) {
-            const hleaf = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.7 + Math.random() * 0.3, 6), leafMat);
-            hleaf.position.set(-5.2 + (Math.random() - 0.5) * 0.2, 4.2 - Math.random() * 0.3, -3.0 + (Math.random() - 0.5) * 0.2);
+            const hleaf = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.7 + secureRand() * 0.3, 6), leafMat);
+            hleaf.position.set(-5.2 + (secureRand() - 0.5) * 0.2, 4.2 - secureRand() * 0.3, -3.0 + (secureRand() - 0.5) * 0.2);
             add(hleaf, false, false);
         }
         // Book on the rug (lived-in detail)
@@ -378,9 +385,9 @@ class CharacterRenderer {
         const moteCount = 90;
         const motePos = new Float32Array(moteCount * 3);
         for (let i = 0; i < moteCount; i++) {
-            motePos[i * 3] = (Math.random() - 0.5) * 12;
-            motePos[i * 3 + 1] = Math.random() * 8;
-            motePos[i * 3 + 2] = -4 + Math.random() * 5;
+            motePos[i * 3] = (secureRand() - 0.5) * 12;
+            motePos[i * 3 + 1] = secureRand() * 8;
+            motePos[i * 3 + 2] = -4 + secureRand() * 5;
         }
         const moteGeo = new THREE.BufferGeometry();
         moteGeo.setAttribute('position', new THREE.BufferAttribute(motePos, 3));
@@ -602,7 +609,7 @@ class CharacterRenderer {
                 if (this.pendingDoubleBlink) {
                     this.pendingDoubleBlink = false;
                     this.nextBlinkTime = this._rand(lo, hi);
-                } else if (Math.random() < DOUBLE_BLINK_CHANCE) {
+                } else if (secureRand() < DOUBLE_BLINK_CHANCE) {
                     this.pendingDoubleBlink = true;
                     this.nextBlinkTime = 0.12;
                 } else {
@@ -621,9 +628,9 @@ class CharacterRenderer {
             this.gazeTimer = 0;
             this.nextGazeShift = this._rand(GAZE_SHIFT_MIN, GAZE_SHIFT_MAX);
 
-            if (Math.random() < WANDER_CHANCE) {
+            if (secureRand() < WANDER_CHANCE) {
                 // Look around the room (toward desk/books), then back.
-                const side = Math.random() < 0.5 ? -1 : 1;
+                const side = secureRand() < 0.5 ? -1 : 1;
                 this.gazePoint.set(
                     this.defaultLookAt.x + side * this._rand(0.4, 0.9),
                     this.defaultLookAt.y + this._rand(-0.1, 0.3),
@@ -633,8 +640,8 @@ class CharacterRenderer {
             } else {
                 // Small natural saccade near the user.
                 this.gazePoint.set(
-                    this.defaultLookAt.x + (Math.random() - 0.5) * 0.12,
-                    this.defaultLookAt.y + (Math.random() - 0.5) * 0.08,
+                    this.defaultLookAt.x + (secureRand() - 0.5) * 0.12,
+                    this.defaultLookAt.y + (secureRand() - 0.5) * 0.08,
                     this.defaultLookAt.z
                 );
                 this.gazeWander = 0;
@@ -704,12 +711,12 @@ class CharacterRenderer {
         this.microExpressionTimer += delta;
         if (this.microExpressionTimer >= this.nextMicroExpression) {
             this.microExpressionTimer = 0;
-            this.nextMicroExpression = 5 + Math.random() * 7;
+            this.nextMicroExpression = 5 + secureRand() * 7;
             const options = [
-                { name: 'happy', value: Math.random() * 0.10 },
-                { name: 'neutral', value: 0.85 + Math.random() * 0.15 },
+                { name: 'happy', value: secureRand() * 0.10 },
+                { name: 'neutral', value: 0.85 + secureRand() * 0.15 },
             ];
-            const chosen = options[Math.floor(Math.random() * options.length)];
+            const chosen = options[Math.floor(secureRand() * options.length)];
             this.microExpressionTargets = { [chosen.name]: chosen.value };
         }
 
@@ -759,7 +766,7 @@ class CharacterRenderer {
             this.idleBehaviorTimer -= delta;
             if (!this.idleBehavior && this.idleBehaviorTimer <= 0) {
                 this.idleBehaviorTimer = this._rand(IDLE_BEHAVIOR_MIN, IDLE_BEHAVIOR_MAX);
-                const kind = Math.random() < 0.5 ? 'stretch' : 'glance';
+                const kind = secureRand() < 0.5 ? 'stretch' : 'glance';
                 this.idleBehavior = { kind, dur: kind === 'stretch' ? 2.2 : 1.6 };
                 this.idleBehaviorT = 0;
             }

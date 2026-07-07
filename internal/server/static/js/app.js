@@ -181,7 +181,7 @@ const micController = {
                 let s = Math.max(-1, Math.min(1, input[i]));
                 view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
             }
-            const b64 = btoa(String.fromCharCode.apply(null, new Uint8Array(buf)));
+            const b64 = (() => { const u8 = new Uint8Array(buf); let s = ''; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return btoa(s); })();
             ws.send('audio.input', { audio: b64, sample_rate: 16000 });
         };
         const silent = this.ctx.createGain();
