@@ -75,10 +75,7 @@ jobs:
                 echo "Conflicts auto-resolved successfully."
 
                 # Commit the resolution
-                git commit -m "resolve: auto-merge origin/$BASE_REF
-
-Automated conflict resolution by OpenCode bot.
-Please review the changes before merging."
+                git commit -m "resolve: auto-merge origin/$BASE_REF - Automated conflict resolution by OpenCode bot. Please review before merging."
 
                 # Push to PR branch
                 git push origin "HEAD:$PR_BRANCH"
@@ -359,10 +356,7 @@ Please review the changes before merging."
             if [ "$UNMERGED" -gt 0 ]; then
               echo "::warning::Cannot auto-resolve all conflicts. Manual intervention required."
             else
-              git commit -m "resolve: auto-merge origin/$BASE_BRANCH
-
-AI-assisted conflict resolution by OpenCode bot.
-Please review the changes before merging."
+              git commit -m "resolve: auto-merge origin/$BASE_BRANCH - AI-assisted conflict resolution by OpenCode bot. Please review before merging."
               git push origin "HEAD:$PR_BRANCH"
               echo "Conflicts resolved and pushed."
             fi
