@@ -8,6 +8,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# IMPORTANT: For the bot to work, enable these in your repo:
+# 1. Settings > Actions > General > Workflow permissions > Read and write permissions
+# 2. Settings > Collaborators > Add bot with write access
+# 3. Ensure OPENCODE_API_KEY secret is set in Settings > Secrets
+
 permissions:
   id-token: write
   contents: write
@@ -32,6 +37,7 @@ jobs:
         run: |
           git config user.name "OpenCode Bot"
           git config user.email "opencode-bot[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
 
       - name: Detect and resolve merge conflicts
         id: conflicts
@@ -239,6 +245,7 @@ jobs:
         run: |
           git config user.name "OpenCode Bot"
           git config user.email "opencode-bot[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
 
       - name: Parse command
         id: command
