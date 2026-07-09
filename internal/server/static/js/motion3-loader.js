@@ -102,14 +102,7 @@ async function loadMotion3(url) {
 
 // Available motion clips — loaded after model init
 const MOTION_FILES = [
-    '/assets/hiyori_m01.motion3.json',
-    '/assets/hiyori_m02.motion3.json',
-    '/assets/hiyori_m03.motion3.json',
-    '/assets/hiyori_m04.motion3.json',
-    '/assets/hiyori_m05.motion3.json',
-    '/assets/hiyori_m06.motion3.json',
-    '/assets/hiyori_m07.motion3.json',
-    '/assets/hiyori_m08.motion3.json',
+    '/motion/standby5_animation.json',
 ];
 
 // Motion parameter → VRM coreModel parameter ID mapping
@@ -137,7 +130,87 @@ const PARAM_MAP = {
     ParamHairAhoge: 'ParamHairAhoge',
 };
 
+// Custom bone animation loader for standby5_animation.json format
+class BoneAnimationClip {
+    constructor(json, name) {
+        this.name = name || json.name || 'unnamed';
+        this.duration = json.duration || 4.0;
+        this.tracks = json.tracks || [];
+    }
+
+    // Get bone transform at given time
+    getBoneTransform(boneName, time) {
+        const track = this.tracks.find(t => t.name === boneName);
+        if (!track) return null;
+
+        const t = time % this.duration;
+        const times = track.times;
+        const values = track.values;
+
+        // Find surrounding keyframes
+        let idx = 0;
+        while (idx < times.length - 1 && times[idx + 1] < t) {
+            idx++;
+        }
+
+        if (idx >= times.length - 1) {
+            // Return last value
+            const offset = (times.length - 1) * (track.type === 'vector' ? 3 : 4);
+            if (track.type === 'vector') {
+                return new THREE.Vector3(values[offset], values[offset + 1], values[offset + 2]);
+            } else {
+                return new THREE.Quaternion(values[offset], values[offset + 1], values[offset + 2], values[offset + 3]);
+            }
+        }
+
+        const t0 = times[idx];
+        const t1 = times[idx + 1];
+        const alpha = (t - t0) / (t1 - t0);
+
+        if (track.type === 'vector') {
+            const offset0 = idx * 3;
+            const offset1 = (idx + 1) * 3;
+            return new THREE.Vector3(
+                lerp(values[offset0], values[offset1], alpha),
+                lerp(values[offset0 + 1], values[offset1 + 1], alpha),
+                lerp(values[offset0 + 2], values[offset1 + 2], alpha)
+            );
+        } else {
+            const offset0 = idx * 4;
+            const offset1 = (idx + 1) * 4;
+            return new THREE.Quaternion().fromArray([
+                lerp(values[offset0], values[offset1], alpha),
+                lerp(values[offset0 + 1], values[offset1 + 1], alpha),
+                lerp(values[offset0 + 2], values[offset1 + 2], alpha),
+                lerp(values[offset0 + 3], values[offset1 + 3], alpha)
+            ]).normalize();
+        }
+    }
+}
+
+function lerp(a, b, t) {
+    return a + (b - a) * t;
+}
+
+async function loadBoneAnimation(url) {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`Failed to load bone animation: ${url}`);
+    const json = await resp.json();
+    return new BoneAnimationClip(json, url.split('/').pop().replace('.json', ''));
+}
+
+// Load facial expressions JSON
+async function loadFacialExpressions(url) {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`Failed to load facial expressions: ${url}`);
+    const json = await resp.json();
+    return json.expressions || {};
+}
+
 window.Motion3Clip = Motion3Clip;
 window.loadMotion3 = loadMotion3;
 window.MOTION_FILES = MOTION_FILES;
 window.PARAM_MAP = PARAM_MAP;
+window.BoneAnimationClip = BoneAnimationClip;
+window.loadBoneAnimation = loadBoneAnimation;
+window.loadFacialExpressions = loadFacialExpressions;

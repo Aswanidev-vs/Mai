@@ -4,13 +4,14 @@ import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { VRMAnimationLoaderPlugin, createVRMAnimationClip } from '@pixiv/three-vrm-animation';
 
 const CAMERA_FOV = 30;
-const BLINK_CLOSE_DURATION = 0.075;  // 75ms ease-out closing (Airi: blinkCloseDuration)
-const BLINK_OPEN_MIN = 0.15;         // 150ms minimum opening (Airi: minBlinkOpenDuration)
-const BLINK_OPEN_MAX = 0.30;         // 300ms maximum opening (Airi: maxBlinkOpenDuration)
-const BLINK_DELAY_MIN = 3.0;         // 3s minimum between blinks (Airi: minDelay)
-const BLINK_DELAY_MAX = 8.0;         // 8s maximum between blinks (Airi: maxDelay)
-const DOUBLE_BLINK_CHANCE = 0.22;
-const BLINK_SKIP_THRESHOLD = 0.15;   // Skip blink if eyes already near-closed (Airi: BLINK_THRESHOLD)
+const BLINK_CLOSE_DURATION = 0.08;  // 80ms closing (slightly slower for natural feel)
+const BLINK_OPEN_MIN = 0.12;         // 120ms minimum opening (faster opening)
+const BLINK_OPEN_MAX = 0.25;         // 250ms maximum opening
+const BLINK_DELAY_MIN = 2.5;         // 2.5s minimum between blinks (more frequent)
+const BLINK_DELAY_MAX = 6.0;         // 6s maximum between blinks
+const DOUBLE_BLINK_CHANCE = 0.18;    // Slightly less frequent double blinks
+const BLINK_SKIP_THRESHOLD = 0.15;
+const PARTIAL_BLINK_CHANCE = 0.25;    // 25% chance of partial blink (more natural)
 // Advanced lip sync constants (from Airi)
 const LIP_ATTACK = 50;
 const LIP_RELEASE = 30;
@@ -57,16 +58,16 @@ const BREATH_VARIANCE = 0.15;       // Random variance in breathing
 const SPONTANEOUS_SMILE_CHANCE = 0.15; // 15% chance to smile during idle check
 
 const EMOTION_MAP = {
-    happy:     { expression: [{ name: 'happy', value: 0.7 }], blendDuration: 0.4 },
-    sad:       { expression: [{ name: 'sad', value: 0.65 }], blendDuration: 0.5 },
-    angry:     { expression: [{ name: 'angry', value: 0.65 }], blendDuration: 0.3 },
-    surprised: { expression: [{ name: 'surprised', value: 0.75 }], blendDuration: 0.15 },
-    neutral:   { expression: [{ name: 'neutral', value: 1.0 }], blendDuration: 0.6 },
-    think:     { expression: [{ name: 'think', value: 0.6 }], blendDuration: 0.5 },
-    calm:      { expression: [{ name: 'neutral', value: 1.0 }], blendDuration: 0.7 },
-    stressed:  { expression: [{ name: 'angry', value: 0.5 }], blendDuration: 0.35 },
-    excited:   { expression: [{ name: 'surprised', value: 0.6 }, { name: 'happy', value: 0.3 }], blendDuration: 0.2 },
-    frustrated:{ expression: [{ name: 'angry', value: 0.55 }], blendDuration: 0.35 },
+    happy:     { expression: [{ name: 'happy', value: 0.7 }], blendDuration: 0.4, facialKey: 'happy' },
+    sad:       { expression: [{ name: 'sad', value: 0.65 }], blendDuration: 0.5, facialKey: 'sad' },
+    angry:     { expression: [{ name: 'angry', value: 0.65 }], blendDuration: 0.3, facialKey: 'angry' },
+    surprised: { expression: [{ name: 'surprised', value: 0.75 }], blendDuration: 0.15, facialKey: 'surprised' },
+    neutral:   { expression: [{ name: 'neutral', value: 1.0 }], blendDuration: 0.6, facialKey: null },
+    think:     { expression: [{ name: 'think', value: 0.6 }], blendDuration: 0.5, facialKey: null },
+    calm:      { expression: [{ name: 'neutral', value: 1.0 }], blendDuration: 0.7, facialKey: null },
+    stressed:  { expression: [{ name: 'angry', value: 0.5 }], blendDuration: 0.35, facialKey: 'angry' },
+    excited:   { expression: [{ name: 'surprised', value: 0.6 }, { name: 'happy', value: 0.3 }], blendDuration: 0.2, facialKey: 'happy' },
+    frustrated:{ expression: [{ name: 'angry', value: 0.55 }], blendDuration: 0.35, facialKey: 'angry' },
 };
 
 const VOWEL_MAP = { A: 'aa', E: 'ee', I: 'ih', O: 'oh', U: 'ou' };
@@ -180,8 +181,17 @@ class CharacterRenderer {
         // Enhanced user responsiveness
         this.lastUserInteractionTime = performance.now();
 
+        // Camera control system
+        this.cameraDistance = 1.0; // Multiplier for base distance
+        this.cameraOffsetX = 0;
+        this.cameraOffsetY = 0;
+        this.cameraOffsetZ = 0;
+        this.baseCameraPosition = new THREE.Vector3();
+        this.baseLookAt = new THREE.Vector3();
+
         this._init();
         this._loadModel();
+        this._setupCameraControls();
         this._animate();
     }
 
@@ -462,22 +472,106 @@ class CharacterRenderer {
         }
     }
 
+    // ── Camera Control System (X,Y,Z axis control) ──
+    _setupCameraControls() {
+        // Scroll wheel for Z-axis zoom
+        this.renderer.domElement.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const zoomSpeed = 0.001;
+            this.cameraDistance = Math.max(0.5, Math.min(3.0, this.cameraDistance - e.deltaY * zoomSpeed));
+            this._updateCameraPosition();
+        }, { passive: false });
+
+        // Mouse drag for X,Y axis camera movement
+        let isDragging = false;
+        let lastMouseX = 0;
+        let lastMouseY = 0;
+
+        this.renderer.domElement.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+        });
+
+        window.addEventListener('mouseup', () => {
+            isDragging = false;
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const deltaX = e.clientX - lastMouseX;
+            const deltaY = e.clientY - lastMouseY;
+            
+            const moveSpeed = 0.002;
+            this.cameraOffsetX -= deltaX * moveSpeed;
+            this.cameraOffsetY += deltaY * moveSpeed;
+            
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+            
+            this._updateCameraPosition();
+        });
+
+        // Trackpad scroll for Z-axis (alternative to mouse wheel)
+        this.renderer.domElement.addEventListener('touchstart', (e) => {
+            if (e.touches.length === 2) {
+                // Two-finger pinch for zoom
+                this.lastTouchDistance = this._getTouchDistance(e.touches);
+            }
+        });
+
+        this.renderer.domElement.addEventListener('touchmove', (e) => {
+            if (e.touches.length === 2) {
+                e.preventDefault();
+                const currentDistance = this._getTouchDistance(e.touches);
+                const delta = this.lastTouchDistance - currentDistance;
+                const zoomSpeed = 0.005;
+                this.cameraDistance = Math.max(0.5, Math.min(3.0, this.cameraDistance + delta * zoomSpeed));
+                this.lastTouchDistance = currentDistance;
+                this._updateCameraPosition();
+            }
+        }, { passive: false });
+    }
+
+    _getTouchDistance(touches) {
+        const dx = touches[0].clientX - touches[1].clientX;
+        const dy = touches[0].clientY - touches[1].clientY;
+        return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    _updateCameraPosition() {
+        if (!this.baseCameraPosition.length()) return;
+        
+        // Apply distance multiplier to Z
+        const newZ = this.baseCameraPosition.z * this.cameraDistance + this.cameraOffsetZ;
+        
+        // Apply X,Y offsets
+        const newX = this.baseCameraPosition.x + this.cameraOffsetX;
+        const newY = this.baseCameraPosition.y + this.cameraOffsetY;
+        
+        this.camera.position.set(newX, newY, newZ);
+        this.camera.lookAt(this.baseLookAt.x + this.cameraOffsetX, this.baseLookAt.y + this.cameraOffsetY, this.baseLookAt.z);
+    }
+
     // ── Cozy Background System ──
     _loadModel() {
         const loader = new GLTFLoader();
         loader.register((parser) => new VRMLoaderPlugin(parser));
         loader.register((parser) => new VRMAnimationLoaderPlugin(parser));
 
-        // Load VRM + VRMA + motion3.json files in parallel
+        // Load VRM + VRMA + bone animation + facial expressions files in parallel
         const motionPromises = MOTION_FILES.map(url =>
-            loadMotion3(url).catch(e => { console.warn(`[VRM] Failed to load motion: ${url}`, e); return null; })
+            loadBoneAnimation(url).catch(e => { console.warn(`[VRM] Failed to load motion: ${url}`, e); return null; })
         );
+        const expressionsPromise = loadFacialExpressions('/motion/facial_expressions.json')
+            .catch(e => { console.warn(`[VRM] Failed to load expressions: ${e}`); return {}; });
 
         Promise.all([
             new Promise((resolve) => loader.load('/assets/mai.vrm', resolve)),
             new Promise((resolve) => loader.load('/assets/idle_loop.vrma', resolve)),
             Promise.all(motionPromises),
-        ]).then(([vrmGltf, vrmaGltf, motionClips]) => {
+            expressionsPromise,
+        ]).then(([vrmGltf, vrmaGltf, motionClips, facialExpressions]) => {
             const vrm = vrmGltf.userData.vrm;
             if (!vrm) { console.error('[VRM] No VRM data'); return; }
 
@@ -522,6 +616,15 @@ class CharacterRenderer {
             this.motionTime = 0;
             this.motionPlaying = false;
             console.log(`[VRM] Loaded ${this.motionClips.length} motion clips`);
+            
+            // Store facial expressions
+            this.facialExpressions = facialExpressions;
+            console.log(`[VRM] Loaded ${Object.keys(facialExpressions).length} facial expressions`);
+            
+            // Auto-play standby animation for natural idle movement
+            if (this.motionClips.length > 0) {
+                this.playMotion(0);
+            }
 
             try {
                 const vrmaAnims = vrmaGltf?.userData?.vrmAnimations;
@@ -578,15 +681,27 @@ class CharacterRenderer {
     }
 
     _updateMotion3(delta) {
-        if (!this.motionPlaying || !this.currentMotion || !this.vrm?.expressionManager) return;
+        if (!this.motionPlaying || !this.currentMotion || !this.vrm?.humanoid) return;
 
         this.motionTime += delta;
 
-        // Apply each parameter curve to the VRM model
-        for (const paramId of Object.keys(PARAM_MAP)) {
-            const value = this.currentMotion.evaluate(paramId, this.motionTime);
-            if (value !== null) {
-                this.vrm.expressionManager.setValue(paramId, value);
+        // Apply bone transforms from the animation
+        const boneNames = ['Hips', 'Spine', 'LeftUpperArm', 'RightUpperArm', 'LeftUpperLeg', 'RightUpperLeg', 'Neck'];
+        
+        for (const boneName of boneNames) {
+            const transform = this.currentMotion.getBoneTransform(boneName + '.position', this.motionTime);
+            const rotation = this.currentMotion.getBoneTransform(boneName + '.quaternion', this.motionTime);
+            
+            if (transform || rotation) {
+                const bone = this.vrm.humanoid.getNormalizedBoneNode(boneName.toLowerCase());
+                if (bone) {
+                    if (transform) {
+                        bone.position.copy(transform);
+                    }
+                    if (rotation) {
+                        bone.quaternion.copy(rotation);
+                    }
+                }
             }
         }
 
@@ -620,10 +735,14 @@ class CharacterRenderer {
         const rad = (CAMERA_FOV / 2 * Math.PI) / 180;
         // Frame from head to waist — aim camera at upper body, not full-body center
         const lookY = center.y + size.y * 0.25; // Aim higher (face area)
-        const zDist = (size.y * 0.35) / Math.tan(rad); // Closer than full body, wider than face-only
+        const zDist = (size.y * 0.25) / Math.tan(rad); // Much closer to match Airi's framing
 
-        this.camera.position.set(center.x, lookY, center.z + zDist);
-        this.camera.lookAt(center.x, lookY, center.z);
+        // Store base positions for camera control
+        this.baseCameraPosition.set(center.x, lookY, center.z + zDist);
+        this.baseLookAt.set(center.x, lookY, center.z);
+        
+        // Apply current camera controls
+        this._updateCameraPosition();
 
         this.eyeHeight = lookY;
         // Fix "looking up": aim her gaze a touch BELOW eye height so she meets the lens straight-on.
@@ -760,7 +879,7 @@ class CharacterRenderer {
         return Math.sqrt(sum / this.timeData.length);
     }
 
-    // ── Blink (Airi-style state machine: idle→closing→opening) ──
+    // ── Natural Blink System with partial blinks and smoother curves ──
     _updateBlink(delta) {
         if (!this.vrm?.expressionManager) return;
         const dtMs = delta * 1000;
@@ -773,20 +892,22 @@ class CharacterRenderer {
                 startLeft: 1, startRight: 1,
                 delayMs: this._rand(BLINK_DELAY_MIN, BLINK_DELAY_MAX) * 1000,
                 openDurationMs: this._rand(BLINK_OPEN_MIN, BLINK_OPEN_MAX) * 1000,
+                isPartial: false,
+                partialIntensity: 1,
             };
         }
         const bs = this._blinkState;
 
-        // Ease curves (Airi: easeOutQuad for closing, easeInQuad for opening)
-        const easeOutQuad = (t) => 1 - (1 - t) * (1 - t);
-        const easeInQuad = (t) => t * t;
+        // Natural ease curves using sine for smoother motion
+        const easeOutSine = (t) => Math.sin((t * Math.PI) / 2);
+        const easeInSine = (t) => 1 - Math.cos((t * Math.PI) / 2);
         const clamp01 = (v) => Math.min(1, Math.max(0, v));
 
         // Get current eye openness as base
         const baseLeft = clamp01(this.vrm.expressionManager.getValue('eyeLOpen') ?? 1);
         const baseRight = clamp01(this.vrm.expressionManager.getValue('eyeROpen') ?? 1);
 
-        // Skip blink if eyes are already nearly closed (Airi: BLINK_THRESHOLD)
+        // Skip blink if eyes are already nearly closed
         if (bs.phase === 'idle' && baseLeft <= BLINK_SKIP_THRESHOLD && baseRight <= BLINK_SKIP_THRESHOLD) {
             bs.delayMs = this._rand(BLINK_DELAY_MIN, BLINK_DELAY_MAX) * 1000;
             return;
@@ -800,20 +921,24 @@ class CharacterRenderer {
                 bs.progress = 0;
                 bs.startLeft = baseLeft;
                 bs.startRight = baseRight;
+                // Determine if this is a partial blink (more natural)
+                bs.isPartial = secureRand() < PARTIAL_BLINK_CHANCE;
+                bs.partialIntensity = bs.isPartial ? 0.4 + secureRand() * 0.3 : 1; // 40-70% for partial
             }
             return;
         }
 
-        // Closing: move toward zero with ease-out
+        // Closing: move toward zero with smooth sine curve
         if (bs.phase === 'closing') {
             bs.progress = Math.min(1, bs.progress + dtMs / (BLINK_CLOSE_DURATION * 1000));
-            const eased = easeOutQuad(bs.progress);
-            const eyeL = clamp01(bs.startLeft * (1 - eased));
-            const eyeR = clamp01(bs.startRight * (1 - eased));
+            const eased = easeOutSine(bs.progress);
+            const closeAmount = bs.partialIntensity * eased; // Partial blinks don't close fully
+            const eyeL = clamp01(bs.startLeft * (1 - closeAmount));
+            const eyeR = clamp01(bs.startRight * (1 - closeAmount));
             this.vrm.expressionManager.setValue('eyeLOpen', eyeL);
             this.vrm.expressionManager.setValue('eyeROpen', eyeR);
             // Also set blink expression for models that use it
-            this.vrm.expressionManager.setValue('blink', Math.sin(bs.progress * Math.PI));
+            this.vrm.expressionManager.setValue('blink', Math.sin(bs.progress * Math.PI) * bs.partialIntensity);
             if (bs.progress >= 1) {
                 bs.phase = 'opening';
                 bs.progress = 0;
@@ -822,22 +947,23 @@ class CharacterRenderer {
             return;
         }
 
-        // Opening: move back to base with ease-in
+        // Opening: move back to base with smooth sine curve
         bs.progress = Math.min(1, bs.progress + dtMs / bs.openDurationMs);
-        const eased = easeInQuad(bs.progress);
+        const eased = easeInSine(bs.progress);
+        const closeAmount = bs.partialIntensity * (1 - eased); // Fade from partial to open
         const eyeL = clamp01(bs.startLeft * eased);
         const eyeR = clamp01(bs.startRight * eased);
         this.vrm.expressionManager.setValue('eyeLOpen', eyeL);
         this.vrm.expressionManager.setValue('eyeROpen', eyeR);
-        this.vrm.expressionManager.setValue('blink', Math.sin((1 - bs.progress) * Math.PI));
+        this.vrm.expressionManager.setValue('blink', Math.sin((1 - bs.progress) * Math.PI) * bs.partialIntensity);
 
         if (bs.progress >= 1) {
             // Blink complete — reset to idle
             bs.phase = 'idle';
             bs.progress = 0;
             bs.delayMs = this._rand(BLINK_DELAY_MIN, BLINK_DELAY_MAX) * 1000;
-            // Double blink chance
-            if (secureRand() < DOUBLE_BLINK_CHANCE) {
+            // Double blink chance (less likely after partial blink)
+            if (!bs.isPartial && secureRand() < DOUBLE_BLINK_CHANCE) {
                 bs.delayMs = 120; // Quick second blink
             }
         }
@@ -977,6 +1103,18 @@ class CharacterRenderer {
         }
 
         const norm = this._clampIntensity(intensity);
+        
+        // Use facial expressions JSON if available
+        if (st.facialKey && this.facialExpressions && this.facialExpressions[st.facialKey]) {
+            const facialData = this.facialExpressions[st.facialKey];
+            if (facialData.morphTargets) {
+                for (const [morphName, value] of Object.entries(facialData.morphTargets)) {
+                    this.targetExpressionValues.set(morphName, value * norm);
+                }
+            }
+        }
+        
+        // Fallback to standard expressions
         for (const e of st.expression || []) {
             this.targetExpressionValues.set(e.name, e.value * norm);
         }
