@@ -1,0 +1,95 @@
+{
+  "metadata": {
+    "source": "Expression Editor Analysis",
+    "targetLibrary": "Three.js / VRM Web Loader",
+    "baseModelType": "VRoid / Anime Style humanoid"
+  },
+  "expressions": {
+    "sad": {
+      "timestamp": "00:00",
+      "morphTargets": {
+        "eyebrow_sad_influence": 0.85,
+        "eye_sad_influence": 0.40,
+        "mouth_sad_influence": 0.90
+      }
+    },
+    "angry": {
+      "timestamp": "00:01",
+      "morphTargets": {
+        "eyebrow_angry_influence": 1.00,
+        "eye_angry_influence": 0.30,
+        "mouth_angry_influence": 0.85
+      }
+    },
+    "happy": {
+      "timestamp": "00:03",
+      "morphTargets": {
+        "eyebrow_happy_influence": 0.70,
+        "eye_happy_joy_influence": 1.00,
+        "mouth_happy_open_influence": 1.00
+      }
+    },
+    "surprised": {
+      "timestamp": "00:06",
+      "morphTargets": {
+        "eyebrow_surprise_influence": 0.95,
+        "eye_widened_influence": 1.00,
+        "mouth_surprise_open_influence": 1.00
+      }
+    },
+    "closed": {
+      "timestamp": "00:10",
+      "morphTargets": {
+        "eye_blink_left_influence": 1.00,
+        "eye_blink_right_influence": 1.00,
+        "mouth_neutral_influence": 1.00
+      }
+    },
+    "closed_right": {
+      "timestamp": "00:13",
+      "morphTargets": {
+        "eye_blink_right_influence": 1.00,
+        "eye_blink_left_influence": 0.00,
+        "mouth_subtle_smile": 0.25
+      }
+    },
+    "closed_left": {
+      "timestamp": "00:15",
+      "morphTargets": {
+        "eye_blink_left_influence": 1.00,
+        "eye_blink_right_influence": 0.00,
+        "mouth_subtle_smile": 0.25
+      }
+    },
+    "viseme_A": {
+      "timestamp": "00:17",
+      "morphTargets": {
+        "mouth_aa_influence": 1.00
+      }
+    },
+    "viseme_I": {
+      "timestamp": "00:19",
+      "morphTargets": {
+        "mouth_ih_influence": 1.00
+      }
+    },
+    "viseme_U": {
+      "timestamp": "00:20",
+      "morphTargets": {
+        "mouth_ou_influence": 1.00
+      }
+    },
+    "viseme_E": {
+      "timestamp": "00:22",
+      "morphTargets": {
+        "mouth_ee_influence": 1.00
+      }
+    },
+    "viseme_O": {
+      "timestamp": "00:24",
+      "morphTargets": {
+        "mouth_oh_influence": 1.00
+      }
+    }
+  }
+}

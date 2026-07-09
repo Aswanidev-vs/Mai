@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@pixiv/three-vrm": "^3.5.5",
+    "@pixiv/three-vrm-animation": "^3.3.3",
+    "playwright": "^1.61.1",
+    "three": "^0.185.1"
+  }
+}
