@@ -26,6 +26,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Configure git
         run: |
@@ -140,7 +141,7 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          model: opencode/minimax-m3-free
+          model: deepseek-v4-flash-free
           prompt: |
             You are an expert code reviewer. Review this pull request and provide feedback.
 
@@ -232,6 +233,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Configure git
         run: |
@@ -271,7 +273,7 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          model: opencode/minimax-m3-free
+          model: deepseek-v4-flash-free
 
       - name: Handle /review command
         if: steps.command.outputs.command == 'review'
@@ -280,7 +282,7 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          model: opencode/minimax-m3-free
+          model: deepseek-v4-flash-free
           prompt: |
             Perform a thorough code review of this PR.
             Analyze the code changes and provide detailed feedback on:
@@ -319,7 +321,7 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          model: opencode/minimax-m3-free
+          model: deepseek-v4-flash-free
           prompt: |
             Fix the issues mentioned in this comment.
             Analyze the code, identify the problems, and apply fixes.
@@ -369,7 +371,7 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          model: opencode/minimax-m3-free
+          model: deepseek-v4-flash-free
           prompt: |
             Help resolve merge conflicts in this PR.
             Analyze the conflicting changes and suggest the best resolution.
