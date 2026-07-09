@@ -4,10 +4,13 @@ import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { VRMAnimationLoaderPlugin, createVRMAnimationClip } from '@pixiv/three-vrm-animation';
 
 const CAMERA_FOV = 30;
-const BLINK_DURATION = 0.15;
-const MIN_BLINK_INTERVAL = 1.5;
-const MAX_BLINK_INTERVAL = 5;
+const BLINK_CLOSE_DURATION = 0.075;  // 75ms ease-out closing (Airi: blinkCloseDuration)
+const BLINK_OPEN_MIN = 0.15;         // 150ms minimum opening (Airi: minBlinkOpenDuration)
+const BLINK_OPEN_MAX = 0.30;         // 300ms maximum opening (Airi: maxBlinkOpenDuration)
+const BLINK_DELAY_MIN = 3.0;         // 3s minimum between blinks (Airi: minDelay)
+const BLINK_DELAY_MAX = 8.0;         // 8s maximum between blinks (Airi: maxDelay)
 const DOUBLE_BLINK_CHANCE = 0.22;
+const BLINK_SKIP_THRESHOLD = 0.15;   // Skip blink if eyes already near-closed (Airi: BLINK_THRESHOLD)
 // Advanced lip sync constants (from Airi)
 const LIP_ATTACK = 50;
 const LIP_RELEASE = 30;
@@ -15,14 +18,39 @@ const LIP_CAP = 0.7;
 const LIP_SILENCE_VOL = 0.04;
 const LIP_SILENCE_GAIN = 0.05;
 const LIP_IDLE_MS = 160;
+const LIP_RELEASE_DURATION_MS = 200; // Smooth crossfade when speech ends (Airi: RELEASE_DURATION_MS)
 const EXPRESSION_RESET_MS = 4000;
+
+// Spring-damper head physics (Airi: stiffness=120, damping=16, mass=1)
+const HEAD_SPRING_STIFFNESS = 120;
+const HEAD_SPRING_DAMPING = 16;
+const HEAD_SPRING_MASS = 1;
+const HEAD_SNAP_THRESHOLD = 0.01;   // Snap to target when close enough (Airi)
+
+// CPT-distributed eye saccade intervals (Airi: EYE_SACCADE_INT_STEP=400, EYE_SACCADE_INT_P)
+const SACCADE_STEP = 400;
+const SACCADE_CPT = [
+    [0.075, 800],   // 7.5% chance → 800ms
+    [0.110, 0],     // 11% → 1200ms
+    [0.125, 0],     // 12.5% → 1600ms
+    [0.140, 0],     // 14% → 2000ms
+    [0.125, 0],     // 12.5% → 2400ms
+    [0.050, 0],     // 5% → 2800ms
+    [0.040, 0],     // 4% → 3200ms
+    [0.030, 0],     // 3% → 3600ms
+    [0.020, 0],     // 2% → 4000ms
+    [1.000, 0],     // rest → 4400ms
+];
+// Build cumulative probability table
+for (let i = 1; i < SACCADE_CPT.length; i++) {
+    SACCADE_CPT[i][0] += SACCADE_CPT[i - 1][0];
+    SACCADE_CPT[i][1] = SACCADE_CPT[i - 1][1] + SACCADE_STEP;
+}
 
 // "Alive" tuning (Airi-inspired)
 const REST_IDLE_SECONDS = 25;       // time before she slips into a calmer "rest" state
-const GAZE_SHIFT_MIN = 2.0;         // seconds between micro-saccades
-const GAZE_SHIFT_MAX = 5.0;
 const WANDER_CHANCE = 0.30;         // chance a gaze shift is a longer "look around the room"
-const IDLE_BEHAVIOR_MIN = 10;       // seconds between occasional idle behaviors (more frequent)
+const IDLE_BEHAVIOR_MIN = 10;       // seconds between occasional idle behaviors
 const IDLE_BEHAVIOR_MAX = 25;
 const BREATH_BASE_RATE = 0.75;      // Base breathing rate (slower = more relaxed)
 const BREATH_VARIANCE = 0.15;       // Random variance in breathing
@@ -81,21 +109,36 @@ class CharacterRenderer {
         this.visemeSchedule = null;
         this.visemeDuration = 0;
 
-        // Blink
-        this.isBlinking = false;
-        this.blinkProgress = 0;
-        this.timeSinceLastBlink = 0;
-        this.nextBlinkTime = MIN_BLINK_INTERVAL + secureRand() * (MAX_BLINK_INTERVAL - MIN_BLINK_INTERVAL);
-        this.pendingDoubleBlink = false;
+        // Blink state (initialized lazily in _updateBlink)
+        this._blinkState = null;
 
         // Gaze / "alive" gaze controller
         this.fixationTarget = new THREE.Vector3(0, 1.3, 0);
         this.defaultLookAt = new THREE.Vector3(0, 1.3, 0);
         this.eyeHeight = 1.3;
         this.gazePoint = new THREE.Vector3(0, 1.3, 0);   // current gaze destination
-        this.nextGazeShift = this._rand(GAZE_SHIFT_MIN, GAZE_SHIFT_MAX);
+        this.nextGazeShift = this._cptSaccadeInterval();   // CPT-distributed intervals
         this.gazeTimer = 0;
         this.gazeWander = 0;                               // 0..1 how far she's looking away
+
+        // Spring-damper head physics (Airi-style)
+        this.headSpring = {
+            targetPitch: 0, targetYaw: 0, targetRoll: 0,
+            velPitch: 0, velYaw: 0, velRoll: 0,
+            posPitch: 0, posYaw: 0, posRoll: 0,
+        };
+
+        // Lip sync release state (smooth crossfade when speech ends)
+        this.lipSyncRelease = { remainingMs: 0, lastForcedValue: 0 };
+
+        // Mouse tracking for eye/head follow
+        this._onMouseMove = (e) => {
+            this.mouseX = (e.clientX / window.innerWidth) * 2 - 1;
+            this.mouseY = -(e.clientY / window.innerHeight) * 2 + 1;
+            this.userPresent = true;
+            this.lastInteraction = performance.now();
+        };
+        window.addEventListener('mousemove', this._onMouseMove);
 
         // Expression
         this.currentExpressionValues = new Map();
@@ -134,53 +177,274 @@ class CharacterRenderer {
         this.idleBehavior = null;      // { type, t, dur }
         this.idleBehaviorT = 0;
 
-        // Parallax background system
-        this.parallaxLayers = [];
-        this.mouseX = 0;
-        this.mouseY = 0;
-        this.targetMouseX = 0;
-        this.targetMouseY = 0;
-
         // Enhanced user responsiveness
-        this.headTiltTarget = 0;
-        this.headTiltCurrent = 0;
         this.lastUserInteractionTime = performance.now();
 
         this._init();
-        this._createParallaxBackground();
         this._loadModel();
         this._animate();
-        this._setupParallaxEvents();
     }
 
     _rand(a, b) { return a + secureRand() * (b - a); }
 
-    _init() {
-        this.renderer = new THREE.WebGLRenderer({
-            antialias: false, // Disabled for performance
-            alpha: false,
-            powerPreference: 'high-performance',
-        });
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // Reduced from 2 for performance
-        this.renderer.setClearColor(0x0e0c15, 1);
+    // CPT-distributed saccade interval (Airi: randomSaccadeInterval)
+    // Probability-weighted: short intervals more likely than long ones
+    _cptSaccadeInterval() {
+        const r = secureRand();
+        for (let i = 0; i < SACCADE_CPT.length; i++) {
+            if (r <= SACCADE_CPT[i][0]) {
+                return (SACCADE_CPT[i][1] + secureRand() * SACCADE_STEP) / 1000; // Convert ms→s
+            }
+        }
+        return (SACCADE_CPT[SACCADE_CPT.length - 1][1] + secureRand() * SACCADE_STEP) / 1000;
+    }
+
+    // Spring-damper physics update (Airi: semi-implicit Euler)
+    _springDamper(current, target, velocity, dt) {
+        const accel = (HEAD_SPRING_STIFFNESS * (target - current) - HEAD_SPRING_DAMPING * velocity) / HEAD_SPRING_MASS;
+        velocity += accel * dt;
+        current += velocity * dt;
+        // Snap to target when close enough
+        if (Math.abs(target - current) < HEAD_SNAP_THRESHOLD && Math.abs(velocity) < HEAD_SNAP_THRESHOLD) {
+            current = target;
+            velocity = 0;
+        }
+        return { pos: current, vel: velocity };
+    }
+
+    // Smoothstep: 3t² - 2t³ (Airi lip sync release)
+    _smoothstep(t) { return t * t * (3 - 2 * t); }
+
+    async _init() {
+        // ── Rendering Backend: WebGPU → WebGL fallback ──
+        this.renderBackend = 'webgl'; // default
+        this.renderer = null;
+
+        // Try WebGPU first
+        if (navigator.gpu) {
+            try {
+                const adapter = await navigator.gpu.requestAdapter();
+                if (adapter) {
+                    const device = await adapter.requestDevice();
+                    if (device) {
+                        this.renderer = new THREE.WebGPURenderer({ antialias: false, alpha: true });
+                        this.renderBackend = 'webgpu';
+                        console.log('[VRM] Using WebGPU renderer');
+                    }
+                }
+            } catch (e) {
+                console.warn('[VRM] WebGPU unavailable, falling back to WebGL:', e.message);
+            }
+        }
+
+        // Fallback to WebGL
+        if (!this.renderer) {
+            this.renderer = new THREE.WebGLRenderer({
+                antialias: false,
+                alpha: true,
+                powerPreference: 'high-performance',
+            });
+            this.renderBackend = 'webgl';
+            console.log('[VRM] Using WebGL renderer');
+        }
+
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+        this.renderer.setClearColor(0x000000, 0); // Transparent — PixiJS handles background
         this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-        this.renderer.toneMapping = THREE.LinearToneMapping; // Cheaper than ACESFilmic
+        this.renderer.toneMapping = THREE.LinearToneMapping;
         this.renderer.toneMappingExposure = 1.15;
-        this.renderer.shadowMap.enabled = false; // Disabled - not needed for 2D background
+        this.renderer.shadowMap.enabled = false;
         this.container.appendChild(this.renderer.domElement);
 
+        // Three.js scene + camera (transparent background)
         this.scene = new THREE.Scene();
-        // Fog removed - not needed with 2D background
         this.camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.01, 100);
+
+        // Warm lighting for VRM character
+        this.scene.add(new THREE.AmbientLight(0xfff0e0, 0.9));
+        const ptLight = new THREE.PointLight(0xffe8c8, 0.5, 20);
+        ptLight.position.set(2, 2, -2);
+        this.scene.add(ptLight);
+
+        // ── PixiJS 2D Background Layer ──
+        this._initPixiBackground();
 
         this._resize();
         window.addEventListener('resize', () => this._resize());
-        // ResizeObserver catches layout changes that the window resize event misses.
         if (window.ResizeObserver && this.container) {
             new ResizeObserver(() => this._resize()).observe(this.container);
         }
-        // Deferred resize ensures the canvas is sized after CSS layout completes.
         requestAnimationFrame(() => this._resize());
+    }
+
+    // ── PixiJS Cozy Background ──
+    _initPixiBackground() {
+        if (typeof PIXI === 'undefined') {
+            console.warn('[VRM] PixiJS not loaded, using CSS background fallback');
+            this.container.style.background = 'linear-gradient(180deg, #f5e6d3 0%, #e8d5c0 40%, #d4c4a8 100%)';
+            return;
+        }
+
+        this.pixiApp = new PIXI.Application({
+            resizeTo: this.container,
+            backgroundAlpha: 0,
+            antialias: true,
+            resolution: Math.min(window.devicePixelRatio, 2),
+            autoDensity: true,
+        });
+        // Insert PixiJS canvas behind the Three.js canvas
+        this.container.insertBefore(this.pixiApp.view, this.container.firstChild);
+        this.pixiApp.view.style.position = 'absolute';
+        this.pixiApp.view.style.top = '0';
+        this.pixiApp.view.style.left = '0';
+        this.pixiApp.view.style.zIndex = '0';
+
+        const stage = this.pixiApp.stage;
+        const w = this.container.clientWidth;
+        const h = this.container.clientHeight;
+
+        // ── Warm gradient background ──
+        const bg = new PIXI.Graphics();
+        bg.beginFill(0xf5e6d3);
+        bg.drawRect(0, 0, w, h);
+        bg.endFill();
+        // Gradient overlay via a tall sprite
+        const gradCanvas = document.createElement('canvas');
+        gradCanvas.width = 1;
+        gradCanvas.height = 256;
+        const gCtx = gradCanvas.getContext('2d');
+        const grad = gCtx.createLinearGradient(0, 0, 0, 256);
+        grad.addColorStop(0, 'rgba(245,230,211,0)');
+        grad.addColorStop(0.4, 'rgba(232,213,192,0.3)');
+        grad.addColorStop(1, 'rgba(212,196,168,0.6)');
+        gCtx.fillStyle = grad;
+        gCtx.fillRect(0, 0, 1, 256);
+        const gradTex = PIXI.Texture.from(gradCanvas);
+        const gradSprite = new PIXI.Sprite(gradTex);
+        gradSprite.width = w;
+        gradSprite.height = h;
+        bg.addChild(gradSprite);
+        stage.addChild(bg);
+
+        // ── Window ──
+        const winX = w * 0.72;
+        const winY = h * 0.18;
+        const winW = w * 0.18;
+        const winH = h * 0.45;
+        // Frame
+        const frame = new PIXI.Graphics();
+        frame.beginFill(0x8b7355);
+        frame.drawRect(winX - 6, winY - 6, winW + 12, winH + 12);
+        frame.endFill();
+        stage.addChild(frame);
+        // Pane gradient
+        const winCanvas = document.createElement('canvas');
+        winCanvas.width = 128;
+        winCanvas.height = 192;
+        const wCtx = winCanvas.getContext('2d');
+        const wGrad = wCtx.createLinearGradient(0, 0, 0, 192);
+        wGrad.addColorStop(0, '#b8d4e8');
+        wGrad.addColorStop(0.6, '#d4e8f0');
+        wGrad.addColorStop(1, '#f0e8d8');
+        wCtx.fillStyle = wGrad;
+        wCtx.fillRect(0, 0, 128, 192);
+        wCtx.strokeStyle = '#8b7355';
+        wCtx.lineWidth = 3;
+        wCtx.beginPath();
+        wCtx.moveTo(64, 0); wCtx.lineTo(64, 192);
+        wCtx.moveTo(0, 96); wCtx.lineTo(128, 96);
+        wCtx.stroke();
+        const winTex = PIXI.Texture.from(winCanvas);
+        const winSprite = new PIXI.Sprite(winTex);
+        winSprite.x = winX;
+        winSprite.y = winY;
+        winSprite.width = winW;
+        winSprite.height = winH;
+        stage.addChild(winSprite);
+        // Warm glow
+        const glowCanvas = document.createElement('canvas');
+        glowCanvas.width = 128;
+        glowCanvas.height = 128;
+        const glCtx = glowCanvas.getContext('2d');
+        const glGrad = glCtx.createRadialGradient(64, 64, 0, 64, 64, 64);
+        glGrad.addColorStop(0, 'rgba(255,230,180,0.2)');
+        glGrad.addColorStop(1, 'rgba(255,230,180,0)');
+        glCtx.fillStyle = glGrad;
+        glCtx.fillRect(0, 0, 128, 128);
+        const glowTex = PIXI.Texture.from(glowCanvas);
+        const glowSprite = new PIXI.Sprite(glowTex);
+        glowSprite.x = winX - winW * 0.3;
+        glowSprite.y = winY - winH * 0.2;
+        glowSprite.width = winW * 1.6;
+        glowSprite.height = winH * 1.4;
+        stage.addChild(glowSprite);
+
+        // ── Side table + plant ──
+        const tableX = w * 0.1;
+        const tableY = h * 0.7;
+        const table = new PIXI.Graphics();
+        table.beginFill(0x9c7a54);
+        table.drawRect(tableX, tableY, w * 0.08, h * 0.12);
+        table.endFill();
+        table.beginFill(0x8b6940);
+        table.drawRect(tableX - w * 0.01, tableY - h * 0.01, w * 0.1, h * 0.012);
+        table.endFill();
+        stage.addChild(table);
+        // Pot
+        const pot = new PIXI.Graphics();
+        pot.beginFill(0xc4956a);
+        pot.drawRect(tableX + w * 0.02, tableY - h * 0.04, w * 0.04, h * 0.035);
+        pot.endFill();
+        stage.addChild(pot);
+        // Leaves
+        const leaf = new PIXI.Graphics();
+        leaf.beginFill(0x6b9b6b);
+        for (let i = 0; i < 5; i++) {
+            const angle = (i - 2) * 0.4;
+            const lx = tableX + w * 0.04 + Math.sin(angle) * w * 0.025;
+            const ly = tableY - h * 0.06 + Math.cos(angle) * -h * 0.04;
+            leaf.drawEllipse(lx, ly, w * 0.008, h * 0.035);
+        }
+        leaf.endFill();
+        stage.addChild(leaf);
+
+        // ── Floor rug ──
+        const rug = new PIXI.Graphics();
+        rug.beginFill(0xc9a882, 0.5);
+        rug.drawEllipse(w * 0.45, h * 0.92, w * 0.35, h * 0.06);
+        rug.endFill();
+        stage.addChild(rug);
+
+        // ── Ambient particles (floating dust in window light) ──
+        this.pixiParticles = [];
+        for (let i = 0; i < 12; i++) {
+            const p = new PIXI.Graphics();
+            p.beginFill(0xffe8c8, 0.3 + Math.random() * 0.3);
+            p.drawCircle(0, 0, 1 + Math.random() * 1.5);
+            p.endFill();
+            p.x = winX + Math.random() * winW;
+            p.y = winY + Math.random() * winH;
+            p._vx = (Math.random() - 0.5) * 0.15;
+            p._vy = -0.05 - Math.random() * 0.1;
+            p._life = Math.random() * 200;
+            stage.addChild(p);
+            this.pixiParticles.push(p);
+        }
+
+        // Animate particles
+        this.pixiApp.ticker.add(() => {
+            for (const p of this.pixiParticles) {
+                p.x += p._vx;
+                p.y += p._vy;
+                p._life++;
+                p.alpha = 0.3 * Math.sin((p._life % 200) / 200 * Math.PI);
+                if (p.y < winY - 10 || p._life > 200) {
+                    p.x = winX + Math.random() * winW;
+                    p.y = winY + winH * 0.8 + Math.random() * winH * 0.2;
+                    p._life = 0;
+                }
+            }
+        });
     }
 
     _resize() {
@@ -190,164 +454,30 @@ class CharacterRenderer {
         this.renderer.setSize(w, h);
         this.camera.aspect = w / h;
         this.camera.updateProjectionMatrix();
-    }
-
-    // ── 2D Parallax Background System ──
-    _createParallaxBackground() {
-        // Background layer (furthest, slowest movement)
-        const bgLayer = new THREE.Group();
-        const bgMat = new THREE.MeshBasicMaterial({ color: 0x241d30 });
-        const bgPlane = new THREE.Mesh(new THREE.PlaneGeometry(30, 20), bgMat);
-        bgPlane.position.z = -8;
-        bgLayer.add(bgPlane);
-        
-        // Add gradient overlay for depth
-        const gradientCanvas = document.createElement('canvas');
-        gradientCanvas.width = 512;
-        gradientCanvas.height = 512;
-        const ctx = gradientCanvas.getContext('2d');
-        const gradient = ctx.createLinearGradient(0, 0, 0, 512);
-        gradient.addColorStop(0, '#3a3350');
-        gradient.addColorStop(0.5, '#241d30');
-        gradient.addColorStop(1, '#1a1520');
-        ctx.fillStyle = gradient;
-        ctx.fillRect(0, 0, 512, 512);
-        const gradientTexture = new THREE.CanvasTexture(gradientCanvas);
-        const gradientMat = new THREE.MeshBasicMaterial({ map: gradientTexture, transparent: true });
-        const gradientPlane = new THREE.Mesh(new THREE.PlaneGeometry(30, 20), gradientMat);
-        gradientPlane.position.z = -7.9;
-        bgLayer.add(gradientPlane);
-        
-        this.parallaxLayers.push({ group: bgLayer, depth: 0.02 });
-        this.scene.add(bgLayer);
-
-        // Mid-ground layer (medium movement)
-        const midLayer = new THREE.Group();
-        
-        // Window
-        const windowMat = new THREE.MeshBasicMaterial({ color: 0xbfd4e8 });
-        const windowFrame = new THREE.Mesh(new THREE.PlaneGeometry(3, 4), new THREE.MeshBasicMaterial({ color: 0x2a1d12 }));
-        windowFrame.position.set(2, 2, -6);
-        midLayer.add(windowFrame);
-        
-        const windowPane = new THREE.Mesh(new THREE.PlaneGeometry(2.5, 3.5), windowMat);
-        windowPane.position.set(2, 2, -5.9);
-        midLayer.add(windowPane);
-        
-        // Wall art
-        const frameMat = new THREE.MeshBasicMaterial({ color: 0x2a1d12 });
-        const artColors = [0x6b8fd9, 0xd98fb0, 0x8fd9a8];
-        for (let i = 0; i < 3; i++) {
-            const frame = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 1.5), frameMat);
-            frame.position.set(-3 + i * 1.5, 1.5, -6);
-            midLayer.add(frame);
-            
-            const art = new THREE.Mesh(new THREE.PlaneGeometry(1, 1.2), new THREE.MeshBasicMaterial({ color: artColors[i] }));
-            art.position.set(-3 + i * 1.5, 1.5, -5.9);
-            midLayer.add(art);
-        }
-        
-        // Bookshelf (simplified 2D)
-        const shelfMat = new THREE.MeshBasicMaterial({ color: 0x4a3320 });
-        const shelf = new THREE.Mesh(new THREE.PlaneGeometry(2, 4), shelfMat);
-        shelf.position.set(-5, 0, -6);
-        midLayer.add(shelf);
-        
-        // Books on shelf
-        const bookColors = [0xb53c3c, 0x3c78b5, 0x4a9d5b, 0xd9a441];
-        for (let i = 0; i < 8; i++) {
-            const book = new THREE.Mesh(new THREE.PlaneGeometry(0.15, 0.4 + Math.random() * 0.3), new THREE.MeshBasicMaterial({ color: bookColors[i % bookColors.length] }));
-            book.position.set(-5.8 + i * 0.2, -0.5 + Math.random() * 2, -5.9);
-            book.rotation.z = (Math.random() - 0.5) * 0.2;
-            midLayer.add(book);
-        }
-        
-        this.parallaxLayers.push({ group: midLayer, depth: 0.05 });
-        this.scene.add(midLayer);
-
-        // Foreground layer (closest, fastest movement)
-        const fgLayer = new THREE.Group();
-        
-        // Desk
-        const deskMat = new THREE.MeshBasicMaterial({ color: 0x6b4a2f });
-        const desk = new THREE.Mesh(new THREE.PlaneGeometry(4, 0.5), deskMat);
-        desk.position.set(-2, -1.5, -4);
-        fgLayer.add(desk);
-        
-        // Lamp
-        const lampMat = new THREE.MeshBasicMaterial({ color: 0xffd9a0 });
-        const lamp = new THREE.Mesh(new THREE.CircleGeometry(0.3, 16), lampMat);
-        lamp.position.set(-3.5, -0.8, -3.9);
-        fgLayer.add(lamp);
-        
-        // Plant
-        const plantMat = new THREE.MeshBasicMaterial({ color: 0x4a7c59 });
-        const pot = new THREE.Mesh(new THREE.CircleGeometry(0.25, 16), new THREE.MeshBasicMaterial({ color: 0xdedede }));
-        pot.position.set(4, -1.8, -4);
-        fgLayer.add(pot);
-        
-        const leaves = new THREE.Mesh(new THREE.CircleGeometry(0.4, 8), plantMat);
-        leaves.position.set(4, -1.3, -3.9);
-        fgLayer.add(leaves);
-        
-        // Rug
-        const rugMat = new THREE.MeshBasicMaterial({ color: 0x6b5b95 });
-        const rug = new THREE.Mesh(new THREE.CircleGeometry(2, 32), rugMat);
-        rug.position.set(0, -2.5, -3);
-        fgLayer.add(rug);
-        
-        this.parallaxLayers.push({ group: fgLayer, depth: 0.1 });
-        this.scene.add(fgLayer);
-
-        // Simple lighting (no shadows needed for 2D)
-        this.scene.add(new THREE.AmbientLight(0xffffff, 0.8));
-    }
-
-    _setupParallaxEvents() {
-        // Track mouse movement for parallax
-        this.container.addEventListener('mousemove', (e) => {
-            const rect = this.container.getBoundingClientRect();
-            this.targetMouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-            this.targetMouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-        });
-
-        // Touch support
-        this.container.addEventListener('touchmove', (e) => {
-            const rect = this.container.getBoundingClientRect();
-            const touch = e.touches[0];
-            this.targetMouseX = ((touch.clientX - rect.left) / rect.width) * 2 - 1;
-            this.targetMouseY = -((touch.clientY - rect.top) / rect.height) * 2 + 1;
-        });
-
-        // Reset on mouse leave
-        this.container.addEventListener('mouseleave', () => {
-            this.targetMouseX = 0;
-            this.targetMouseY = 0;
-        });
-    }
-
-    _updateParallax(delta) {
-        // Smooth mouse movement
-        const lerpSpeed = 1 - Math.exp(-10 * delta);
-        this.mouseX += (this.targetMouseX - this.mouseX) * lerpSpeed;
-        this.mouseY += (this.targetMouseY - this.mouseY) * lerpSpeed;
-
-        // Apply parallax to each layer
-        for (const layer of this.parallaxLayers) {
-            layer.group.position.x = this.mouseX * layer.depth * 5;
-            layer.group.position.y = this.mouseY * layer.depth * 3;
+        // PixiJS resizes itself via resizeTo, but ensure canvas is behind Three.js
+        if (this.pixiApp?.view) {
+            this.pixiApp.view.style.zIndex = '0';
+            this.renderer.domElement.style.position = 'relative';
+            this.renderer.domElement.style.zIndex = '1';
         }
     }
 
+    // ── Cozy Background System ──
     _loadModel() {
         const loader = new GLTFLoader();
         loader.register((parser) => new VRMLoaderPlugin(parser));
         loader.register((parser) => new VRMAnimationLoaderPlugin(parser));
 
+        // Load VRM + VRMA + motion3.json files in parallel
+        const motionPromises = MOTION_FILES.map(url =>
+            loadMotion3(url).catch(e => { console.warn(`[VRM] Failed to load motion: ${url}`, e); return null; })
+        );
+
         Promise.all([
             new Promise((resolve) => loader.load('/assets/mai.vrm', resolve)),
             new Promise((resolve) => loader.load('/assets/idle_loop.vrma', resolve)),
-        ]).then(([vrmGltf, vrmaGltf]) => {
+            Promise.all(motionPromises),
+        ]).then(([vrmGltf, vrmaGltf, motionClips]) => {
             const vrm = vrmGltf.userData.vrm;
             if (!vrm) { console.error('[VRM] No VRM data'); return; }
 
@@ -366,6 +496,7 @@ class CharacterRenderer {
 
             this.vrmGroup = new THREE.Group();
             this.vrmGroup.add(vrm.scene);
+            // Removed rotation - let model face its default direction
             this.scene.add(this.vrmGroup);
 
             vrm.springBoneManager?.reset();
@@ -384,6 +515,13 @@ class CharacterRenderer {
                 this.vrm.lookAt.target = new THREE.Object3D();
             }
             this.scene.add(this.vrm.lookAt.target);
+
+            // Store motion3 clips for playback
+            this.motionClips = motionClips.filter(Boolean);
+            this.currentMotion = null;
+            this.motionTime = 0;
+            this.motionPlaying = false;
+            console.log(`[VRM] Loaded ${this.motionClips.length} motion clips`);
 
             try {
                 const vrmaAnims = vrmaGltf?.userData?.vrmAnimations;
@@ -425,6 +563,39 @@ class CharacterRenderer {
         }).catch((err) => console.error('[VRM] Load error:', err));
     }
 
+    // ── Motion3 Playback ──
+    playMotion(index) {
+        if (!this.motionClips || index >= this.motionClips.length) return;
+        this.currentMotion = this.motionClips[index];
+        this.motionTime = 0;
+        this.motionPlaying = true;
+        console.log(`[VRM] Playing motion: ${this.currentMotion.name}`);
+    }
+
+    stopMotion() {
+        this.motionPlaying = false;
+        this.currentMotion = null;
+    }
+
+    _updateMotion3(delta) {
+        if (!this.motionPlaying || !this.currentMotion || !this.vrm?.expressionManager) return;
+
+        this.motionTime += delta;
+
+        // Apply each parameter curve to the VRM model
+        for (const paramId of Object.keys(PARAM_MAP)) {
+            const value = this.currentMotion.evaluate(paramId, this.motionTime);
+            if (value !== null) {
+                this.vrm.expressionManager.setValue(paramId, value);
+            }
+        }
+
+        // Handle loop/stop
+        if (!this.currentMotion.loop && this.motionTime >= this.currentMotion.duration) {
+            this.stopMotion();
+        }
+    }
+
     _frameModel() {
         if (!this.vrm?.scene) return;
 
@@ -447,8 +618,9 @@ class CharacterRenderer {
         box.getCenter(center);
 
         const rad = (CAMERA_FOV / 2 * Math.PI) / 180;
-        const zDist = (size.y * 0.25) / Math.tan(rad); // Closer camera for more intimate feel
-        const lookY = center.y + size.y * 0.19;
+        // Frame from head to waist — aim camera at upper body, not full-body center
+        const lookY = center.y + size.y * 0.25; // Aim higher (face area)
+        const zDist = (size.y * 0.35) / Math.tan(rad); // Closer than full body, wider than face-only
 
         this.camera.position.set(center.x, lookY, center.z + zDist);
         this.camera.lookAt(center.x, lookY, center.z);
@@ -470,7 +642,7 @@ class CharacterRenderer {
         this.audioPlayer = player;
     }
 
-    // ── Advanced Lip Sync (Airi-style winner+runner blending) ──
+    // ── Advanced Lip Sync (Airi-style winner+runner + smoothstep release) ──
     _updateLipSync(delta) {
         if (!this.vrm?.expressionManager) return;
 
@@ -485,15 +657,30 @@ class CharacterRenderer {
         }
 
         if (!active) {
-            // Release all vowels to silence
-            for (const bs of Object.values(VOWEL_MAP)) {
-                const r = 1 - Math.exp(-LIP_RELEASE * delta);
-                this.smoothedVowels[bs] += (0 - this.smoothedVowels[bs]) * r;
-                if (this.smoothedVowels[bs] < 0.004) this.smoothedVowels[bs] = 0;
-                this.vrm.expressionManager.setValue(bs, this.smoothedVowels[bs]);
+            // Smoothstep release when speech ends (Airi: useMotionUpdatePluginLipSync)
+            if (this.lipSyncRelease.remainingMs > 0) {
+                this.lipSyncRelease.remainingMs = Math.max(0, this.lipSyncRelease.remainingMs - delta * 1000);
+                const blend = this._smoothstep(1 - this.lipSyncRelease.remainingMs / LIP_RELEASE_DURATION_MS);
+                // Read current motion-driven mouth value and crossfade
+                const motionValue = this.vrm.expressionManager.getValue('aa') || 0;
+                const blended = this.lipSyncRelease.lastForcedValue * (1 - blend) + motionValue * blend;
+                for (const bs of Object.values(VOWEL_MAP)) {
+                    this.vrm.expressionManager.setValue(bs, blended * 0.7);
+                }
+            } else {
+                // Fully released — fade to zero
+                for (const bs of Object.values(VOWEL_MAP)) {
+                    const r = 1 - Math.exp(-LIP_RELEASE * delta);
+                    this.smoothedVowels[bs] += (0 - this.smoothedVowels[bs]) * r;
+                    if (this.smoothedVowels[bs] < 0.004) this.smoothedVowels[bs] = 0;
+                    this.vrm.expressionManager.setValue(bs, this.smoothedVowels[bs]);
+                }
             }
             return;
         }
+
+        // Track last forced value for smooth release
+        this.lipSyncRelease.remainingMs = LIP_RELEASE_DURATION_MS;
 
         const playhead = this.audioPlayer ? this.audioPlayer.getPlayhead() : 0;
         const phase = clamp(playhead / this.visemeDuration, 0, 1);
@@ -543,6 +730,7 @@ class CharacterRenderer {
         }
 
         // Smooth transitions with attack/release
+        let maxWeight = 0;
         for (const key of ['A', 'E', 'I', 'O', 'U']) {
             const bs = VOWEL_MAP[key];
             const from = this.smoothedVowels[bs];
@@ -551,7 +739,10 @@ class CharacterRenderer {
             this.smoothedVowels[bs] = from + (to - from) * rate;
             const weight = (this.smoothedVowels[bs] <= 0.01 ? 0 : this.smoothedVowels[bs]) * 0.7;
             this.vrm.expressionManager.setValue(bs, weight);
+            if (weight > maxWeight) maxWeight = weight;
         }
+        // Track last forced value for smoothstep release
+        this.lipSyncRelease.lastForcedValue = maxWeight;
     }
 
     // True 0..1 amplitude from the live audio waveform (time domain).
@@ -569,45 +760,97 @@ class CharacterRenderer {
         return Math.sqrt(sum / this.timeData.length);
     }
 
-    // ── Blink (with calmer rhythm in rest mode) ──
+    // ── Blink (Airi-style state machine: idle→closing→opening) ──
     _updateBlink(delta) {
         if (!this.vrm?.expressionManager) return;
-        this.timeSinceLastBlink += delta;
-        if (!this.isBlinking && this.timeSinceLastBlink >= this.nextBlinkTime) {
-            this.isBlinking = true;
-            this.blinkProgress = 0;
-        }
-        if (this.isBlinking) {
-            this.blinkProgress += delta / BLINK_DURATION;
-            this.vrm.expressionManager.setValue('blink', Math.sin(Math.PI * this.blinkProgress));
-            if (this.blinkProgress >= 1) {
-                this.isBlinking = false;
-                this.timeSinceLastBlink = 0;
-                this.vrm.expressionManager.setValue('blink', 0);
+        const dtMs = delta * 1000;
 
-                const lo = this.restMode ? MIN_BLINK_INTERVAL * 2.2 : MIN_BLINK_INTERVAL;
-                const hi = this.restMode ? MAX_BLINK_INTERVAL * 2.0 : MAX_BLINK_INTERVAL;
-                if (this.pendingDoubleBlink) {
-                    this.pendingDoubleBlink = false;
-                    this.nextBlinkTime = this._rand(lo, hi);
-                } else if (secureRand() < DOUBLE_BLINK_CHANCE) {
-                    this.pendingDoubleBlink = true;
-                    this.nextBlinkTime = 0.12;
-                } else {
-                    this.nextBlinkTime = this._rand(lo, hi);
-                }
+        // Initialize blink state if needed
+        if (!this._blinkState) {
+            this._blinkState = {
+                phase: 'idle', // idle | closing | opening
+                progress: 0,
+                startLeft: 1, startRight: 1,
+                delayMs: this._rand(BLINK_DELAY_MIN, BLINK_DELAY_MAX) * 1000,
+                openDurationMs: this._rand(BLINK_OPEN_MIN, BLINK_OPEN_MAX) * 1000,
+            };
+        }
+        const bs = this._blinkState;
+
+        // Ease curves (Airi: easeOutQuad for closing, easeInQuad for opening)
+        const easeOutQuad = (t) => 1 - (1 - t) * (1 - t);
+        const easeInQuad = (t) => t * t;
+        const clamp01 = (v) => Math.min(1, Math.max(0, v));
+
+        // Get current eye openness as base
+        const baseLeft = clamp01(this.vrm.expressionManager.getValue('eyeLOpen') ?? 1);
+        const baseRight = clamp01(this.vrm.expressionManager.getValue('eyeROpen') ?? 1);
+
+        // Skip blink if eyes are already nearly closed (Airi: BLINK_THRESHOLD)
+        if (bs.phase === 'idle' && baseLeft <= BLINK_SKIP_THRESHOLD && baseRight <= BLINK_SKIP_THRESHOLD) {
+            bs.delayMs = this._rand(BLINK_DELAY_MIN, BLINK_DELAY_MAX) * 1000;
+            return;
+        }
+
+        // Idle: count down delay to next blink
+        if (bs.phase === 'idle') {
+            bs.delayMs -= dtMs;
+            if (bs.delayMs <= 0) {
+                bs.phase = 'closing';
+                bs.progress = 0;
+                bs.startLeft = baseLeft;
+                bs.startRight = baseRight;
+            }
+            return;
+        }
+
+        // Closing: move toward zero with ease-out
+        if (bs.phase === 'closing') {
+            bs.progress = Math.min(1, bs.progress + dtMs / (BLINK_CLOSE_DURATION * 1000));
+            const eased = easeOutQuad(bs.progress);
+            const eyeL = clamp01(bs.startLeft * (1 - eased));
+            const eyeR = clamp01(bs.startRight * (1 - eased));
+            this.vrm.expressionManager.setValue('eyeLOpen', eyeL);
+            this.vrm.expressionManager.setValue('eyeROpen', eyeR);
+            // Also set blink expression for models that use it
+            this.vrm.expressionManager.setValue('blink', Math.sin(bs.progress * Math.PI));
+            if (bs.progress >= 1) {
+                bs.phase = 'opening';
+                bs.progress = 0;
+                bs.openDurationMs = this._rand(BLINK_OPEN_MIN, BLINK_OPEN_MAX) * 1000;
+            }
+            return;
+        }
+
+        // Opening: move back to base with ease-in
+        bs.progress = Math.min(1, bs.progress + dtMs / bs.openDurationMs);
+        const eased = easeInQuad(bs.progress);
+        const eyeL = clamp01(bs.startLeft * eased);
+        const eyeR = clamp01(bs.startRight * eased);
+        this.vrm.expressionManager.setValue('eyeLOpen', eyeL);
+        this.vrm.expressionManager.setValue('eyeROpen', eyeR);
+        this.vrm.expressionManager.setValue('blink', Math.sin((1 - bs.progress) * Math.PI));
+
+        if (bs.progress >= 1) {
+            // Blink complete — reset to idle
+            bs.phase = 'idle';
+            bs.progress = 0;
+            bs.delayMs = this._rand(BLINK_DELAY_MIN, BLINK_DELAY_MAX) * 1000;
+            // Double blink chance
+            if (secureRand() < DOUBLE_BLINK_CHANCE) {
+                bs.delayMs = 120; // Quick second blink
             }
         }
     }
 
-    // ── Enhanced Natural gaze: more responsive to user + occasional saccades ──
+    // ── Natural gaze: CPT saccades + mouse tracking (Airi-style) ──
     _updateGaze(delta) {
         if (!this.vrm?.lookAt) return;
 
         this.gazeTimer += delta;
         if (this.gazeTimer >= this.nextGazeShift) {
             this.gazeTimer = 0;
-            this.nextGazeShift = this._rand(GAZE_SHIFT_MIN, GAZE_SHIFT_MAX);
+            this.nextGazeShift = this._cptSaccadeInterval(); // CPT-distributed
 
             if (secureRand() < WANDER_CHANCE) {
                 // Look around the room (toward desk/books), then back.
@@ -629,11 +872,22 @@ class CharacterRenderer {
             }
         }
 
-        // Enhanced: Gaze follows mouse/parallax for more connection
-        if (this.userPresent && this.gazeWander < 0.5) {
-            const gazeInfluence = 0.15;
-            this.gazePoint.x = lerp(this.gazePoint.x, this.defaultLookAt.x + this.mouseX * gazeInfluence, 0.05);
-            this.gazePoint.y = lerp(this.gazePoint.y, this.defaultLookAt.y + this.mouseY * gazeInfluence * 0.5, 0.05);
+        // Mouse tracking: project screen cursor to 3D gaze plane (Airi: useLive2DEyeFocusFor)
+        if (this.userPresent && this.gazeWander < 0.5 && this.camera) {
+            // Project mouse position onto the eye-height plane
+            const mouseScreen = new THREE.Vector2(this.mouseX, this.mouseY);
+            const raycaster = new THREE.Raycaster();
+            raycaster.setFromCamera(mouseScreen, this.camera);
+            // Intersect with horizontal plane at eye height
+            const plane = new THREE.Plane(new THREE.Vector3(0, 0, -1), -this.defaultLookAt.z);
+            const intersect = new THREE.Vector3();
+            raycaster.ray.intersectPlane(plane, intersect);
+            if (intersect) {
+                // Blend mouse influence (stronger when closer)
+                const influence = 0.25;
+                this.gazePoint.x = lerp(this.gazePoint.x, intersect.x * influence + this.defaultLookAt.x * (1 - influence), 0.08);
+                this.gazePoint.y = lerp(this.gazePoint.y, intersect.y * influence + this.defaultLookAt.y * (1 - influence), 0.08);
+            }
         }
 
         // If the user is typing, glance toward where they are (camera-left of her view).
@@ -643,34 +897,51 @@ class CharacterRenderer {
         }
 
         // Ease the fixation target toward the chosen gaze point.
-        const lerpSpeed = 1 - Math.exp(-12 * delta); // Faster response for more aliveness
+        const lerpSpeed = 1 - Math.exp(-12 * delta);
         this.fixationTarget.lerp(this.gazePoint, lerpSpeed);
         // Tiny constant micro-drift so the eyes never feel frozen.
         this.fixationTarget.x += Math.sin(performance.now() * 0.0007) * 0.004;
+        this.fixationTarget.y += Math.sin(performance.now() * 0.0009 + 1.3) * 0.003;
 
         if (this.vrm.lookAt.target) {
             this.vrm.lookAt.target.position.copy(this.fixationTarget);
             this.vrm.lookAt.update(delta);
         }
 
-        // Update head tilt based on user position
-        this._updateHeadTilt(delta);
+        // Update spring-damper head tracking toward mouse
+        this._updateHeadSpring(delta);
     }
 
-    _updateHeadTilt(delta) {
+    // Spring-damper head physics (Airi: useMotionUpdatePluginBeatSync)
+    _updateHeadSpring(delta) {
         if (!this.vrm?.humanoid) return;
-        
-        // Calculate target head tilt based on mouse position
-        const targetTilt = this.mouseX * 0.08; // Subtle tilt toward user
-        
-        // Smooth transition
-        const tiltSpeed = 1 - Math.exp(-8 * delta);
-        this.headTiltCurrent += (targetTilt - this.headTiltCurrent) * tiltSpeed;
-        
-        // Apply to head bone
+
+        // Compute target head angles from mouse position
+        const targetYaw = this.mouseX * 0.08;
+        const targetPitch = this.mouseY * 0.04;
+        const targetRoll = this.mouseX * 0.02;
+
+        const s = this.headSpring;
+        // Spring-damper on each axis
+        const pitchResult = this._springDamper(s.posPitch, targetPitch, s.velPitch, delta);
+        s.posPitch = pitchResult.pos; s.velPitch = pitchResult.vel;
+        const yawResult = this._springDamper(s.posYaw, targetYaw, s.velYaw, delta);
+        s.posYaw = yawResult.pos; s.velYaw = yawResult.vel;
+        const rollResult = this._springDamper(s.posRoll, targetRoll, s.velRoll, delta);
+        s.posRoll = rollResult.pos; s.velRoll = rollResult.vel;
+
+        // Apply spring-damper offset on top of existing head rotation
         const head = this.vrm.humanoid.getNormalizedBoneNode('head');
         if (head) {
-            head.rotation.y += this.headTiltCurrent * 0.02; // Very subtle
+            head.rotation.x += s.posPitch;
+            head.rotation.y += s.posYaw;
+            head.rotation.z += s.posRoll;
+        }
+        const neck = this.vrm.humanoid.getNormalizedBoneNode('neck');
+        if (neck) {
+            neck.rotation.x += s.posPitch * 0.4;
+            neck.rotation.y += s.posYaw * 0.4;
+            neck.rotation.z += s.posRoll * 0.3;
         }
     }
 
@@ -961,14 +1232,14 @@ class CharacterRenderer {
 
     setSpeaking(s) {
         this.speaking = s;
-        if (s) this.lastInteraction = performance.now();
+        if (s) {
+            this.lastInteraction = performance.now();
+            this.lipSyncRelease.remainingMs = 0; // Cancel any pending release
+        }
         if (!s) {
             this.visemeSchedule = null;
             this.visemeDuration = 0;
-            for (const bs of Object.values(VOWEL_MAP)) {
-                this.smoothedVowels[bs] = 0;
-                if (this.vrm?.expressionManager) this.vrm.expressionManager.setValue(bs, 0);
-            }
+            // Don't reset vowels immediately — let smoothstep release handle fade-out
         }
     }
 
@@ -1060,9 +1331,6 @@ class CharacterRenderer {
         const delta = Math.min(this.clock.getDelta(), 0.1);
         const elapsed = this.clock.getElapsedTime();
 
-        // Update parallax background
-        this._updateParallax(delta);
-
         if (this.vrm) {
             if (this.mixer) this.mixer.update(delta);
             this._updateIdle(elapsed, delta);
@@ -1080,6 +1348,7 @@ class CharacterRenderer {
             this._updateMicroExpressions(delta);
             this._updateSpontaneousSmile(delta);
             this._updateLipSync(delta);
+            this._updateMotion3(delta);
 
             this.vrm.expressionManager?.update();
             this.vrm.nodeConstraintManager?.update();

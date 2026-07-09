@@ -80,6 +80,10 @@ func (s *Server) Start() error {
 	staticDir := filepath.Join(".", "internal", "server", "static")
 	mux.Handle("/", http.FileServer(http.Dir(staticDir)))
 
+	// Serve node_modules for local imports (three, @pixiv/three-vrm, etc.)
+	nodeModulesDir := filepath.Join(".", "node_modules")
+	mux.Handle("/node_modules/", http.StripPrefix("/node_modules/", http.FileServer(http.Dir(nodeModulesDir))))
+
 	var handler http.Handler = mux
 	handler = loggingMiddleware(handler)
 	if s.cfg.Token != "" {

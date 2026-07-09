@@ -86,6 +86,10 @@ class Character2D {
         };
         window.addEventListener('mousemove', this._onMouseMove);
 
+        // Scale puppet to match AIRI proportions (60% of viewport height)
+        this._onResize = () => this._fitToScreen();
+        window.addEventListener('resize', this._onResize);
+
         this._loadLayers();
     }
 
@@ -94,10 +98,15 @@ class Character2D {
         let loaded = 0;
         this.layerEls = [];
 
-        // Create the puppet container
+        // Scaler wrapper: 768×768 PSD canvas, positioned like AIRI (centered, waist-up)
+        this.scaler = document.createElement('div');
+        this.scaler.style.cssText = 'position:absolute;width:768px;height:768px;left:50%;top:50%;transform:translate(-50%,-58%);pointer-events:none;z-index:1;';
+        this.container.appendChild(this.scaler);
+
+        // Puppet container inside scaler (layers use calc(50%+offset) relative to this)
         this.puppet = document.createElement('div');
-        this.puppet.style.cssText = 'position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;';
-        this.container.appendChild(this.puppet);
+        this.puppet.style.cssText = 'position:relative;width:100%;height:100%;overflow:hidden;';
+        this.scaler.appendChild(this.puppet);
 
         for (const name of LAYER_ORDER) {
             const img = new Image();
@@ -114,6 +123,7 @@ class Character2D {
                 loaded++;
                 if (loaded === LAYER_ORDER.length) {
                     this.loaded = true;
+                    this._fitToScreen();
                     console.log('[2D] All layers loaded');
                     this._animate();
                 }
@@ -123,6 +133,7 @@ class Character2D {
                 console.warn(`[2D] Failed to load ${name}`);
                 if (loaded === LAYER_ORDER.length) {
                     this.loaded = true;
+                    this._fitToScreen();
                     this._animate();
                 }
             };
@@ -130,6 +141,16 @@ class Character2D {
             this.puppet.appendChild(img);
             this.layerEls.push(img);
         }
+    }
+
+    // ── Layout ──
+    _fitToScreen() {
+        if (!this.scaler) return;
+        const vh = window.innerHeight;
+        // PSD is 768px tall; AIRI's character fills ~60% of screen height
+        const targetHeight = vh * 0.6;
+        const scale = targetHeight / 768;
+        this.scaler.style.transform = `translate(-50%, -58%) scale(${scale})`;
     }
 
     // ── Public API (matches CharacterRenderer) ──
@@ -190,12 +211,8 @@ class Character2D {
         this._updateIdleBehavior(dt);
         this._updateRestMode();
     }
-
     _updateBlink(dt) {
         this.blinkTimer += dt;
-        const eyelashEl = this.layerEls[PARTS.eyelash];
-        if (!eyelashEl) return;
-
         if (!this.isBlinking && this.blinkTimer >= this.nextBlink) {
             this.isBlinking = true;
             this.blinkProgress = 0;
@@ -209,21 +226,17 @@ class Character2D {
                 this.nextBlink = this.restMode
                     ? 3 + Math.random() * 8
                     : 1.5 + Math.random() * 4;
-                eyelashEl.style.opacity = '1';
+                this.blinkScale = 1;
             } else {
-                // Blink: squeeze eyelash vertically
                 const v = Math.sin(Math.PI * this.blinkProgress);
-                eyelashEl.style.transform = `scaleY(${1 - v * 0.9})`;
+                this.blinkScale = 1 - v * 0.9;
             }
         } else {
-            eyelashEl.style.transform = 'scaleY(1)';
+            this.blinkScale = 1;
         }
     }
 
     _updateMouth(dt) {
-        const mouthEl = this.layerEls[PARTS.mouth];
-        if (!mouthEl) return;
-
         let openAmount = 0;
 
         if (this.speaking && this.visemeSchedule && this.visemeSchedule.length > 0 && this.visemeDuration > 0 && this.audioPlayer) {
@@ -234,21 +247,17 @@ class Character2D {
             const gate = energyGate(rms, 0.012, 0.10);
             openAmount = seg ? seg.open * (0.1 + 0.9 * gate) : 0;
         } else if (this.emotionTarget) {
-            // Emotion mouth hints
             const mouthEmotions = { happy: 0.15, sad: 0.1, angry: 0.12, surprised: 0.25 };
             openAmount = mouthEmotions[this.emotionTarget] || 0;
         }
 
-        // Smooth the mouth opening
         this._mouthCurrent = this._mouthCurrent || 0;
         const rate = openAmount > this._mouthCurrent ? 55 : 28;
         this._mouthCurrent += (openAmount - this._mouthCurrent) * (1 - Math.exp(-rate * dt));
 
-        // Apply: scaleY for jaw drop, small translate for natural movement
-        const jawDrop = this._mouthCurrent * 0.8;
-        const lipLift = this._mouthCurrent * 0.15;
-        mouthEl.style.transform = `scaleY(${1 + jawDrop}) translateY(${-lipLift}px)`;
-        mouthEl.style.opacity = String(Math.min(1, 0.6 + this._mouthCurrent * 0.4));
+        this.mouthScaleY = 1 + this._mouthCurrent * 0.8;
+        this.mouthTranslateY = -this._mouthCurrent * 0.15;
+        this.mouthOpacity = Math.min(1, 0.6 + this._mouthCurrent * 0.4);
     }
 
     _updateHead(dt) {
@@ -280,19 +289,38 @@ class Character2D {
         const totalYaw = sway + mouseOffsetX;
         const totalPitch = breathe + mouseOffsetY;
 
-        // Apply to face group (face + eyes + mouth + nose + eyebrows)
-        for (const idx of [PARTS.face, PARTS.eyewhite, PARTS.irides, PARTS.eyebrow, PARTS.nose, PARTS.mouth]) {
+        // Apply 3D parallax effects to face components by varying translation coefficients
+        const parallaxConfig = {
+            face:      { yaw: 0.20, pitch: 0.12 },
+            eyewhite:  { yaw: 0.22, pitch: 0.14 },
+            irides:    { yaw: 0.45, pitch: 0.32 }, // Pupils move more for eye-gaze feel
+            eyebrow:   { yaw: 0.24, pitch: 0.16 },
+            nose:      { yaw: 0.28, pitch: 0.18 }, // Nose moves more for depth projection
+            mouth:     { yaw: 0.24, pitch: 0.16 },
+            eyelash:   { yaw: 0.23, pitch: 0.15 }
+        };
+
+        for (const [partName, coeff] of Object.entries(parallaxConfig)) {
+            const idx = LAYER_ORDER.indexOf(partName);
             const el = this.layerEls[idx];
             if (el) {
-                el.style.transform = `translate(${totalYaw * 0.3}px, ${totalPitch * 0.2}px)`;
+                let transformStr = `translate(${totalYaw * coeff.yaw}px, ${-totalPitch * coeff.pitch}px)`;
+                if (partName === 'eyelash') {
+                    transformStr += ` scaleY(${this.blinkScale || 1})`;
+                } else if (partName === 'mouth') {
+                    transformStr += ` scaleY(${this.mouthScaleY || 1}) translateY(${this.mouthTranslateY || 0}px)`;
+                    el.style.opacity = String(this.mouthOpacity ?? 1);
+                }
+                el.style.transform = transformStr;
             }
         }
-        // Hair moves less (it's further back)
+
+        // Hair moves less (further back or overlays)
         for (const name of ['front_hair', 'back_hair', 'headwear']) {
             const idx = LAYER_ORDER.indexOf(name);
             const el = this.layerEls[idx];
             if (el) {
-                el.style.transform = `translate(${totalYaw * 0.15}px, ${totalPitch * 0.1}px)`;
+                el.style.transform = `translate(${totalYaw * 0.12}px, ${-totalPitch * 0.08}px)`;
             }
         }
         // Body sway (upper body)
@@ -300,7 +328,7 @@ class Character2D {
             const idx = LAYER_ORDER.indexOf(name);
             const el = this.layerEls[idx];
             if (el) {
-                el.style.transform = `translate(${sway * 0.1}px, ${breathe * 0.3}px)`;
+                el.style.transform = `translate(${sway * 0.1}px, ${-breathe * 0.2}px)`;
             }
         }
     }
