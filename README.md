@@ -5,7 +5,7 @@
 
 > **Acknowledgment:** This project is heavily powered by the incredible [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) speech processing toolkit.
 
-**Mai** is a fully offline, **JARVIS-class autonomous agentic assistant** built in Go. Unlike standard voice assistants that simply respond to queries, Mai is designed to perceive, reason, and act independently across your system — all while maintaining 100% local privacy.
+**Mai** is a fully offline, **JARVIS-class autonomous agentic assistant** built in Go with a real-time 3D companion web UI. Unlike standard voice assistants that simply respond to queries, Mai is designed to perceive, reason, and act independently across your system — all while maintaining 100% local privacy and presenting a living, breathing 3D character companion.
 
 > *"Not something you command, but something that understands, remembers, and acts quietly alongside you."*
 
@@ -24,9 +24,63 @@
 | **Proactive Intelligence** | Pattern learning, anticipatory actions, idle reminders | Purely reactive |
 | **User Modeling** | Learns preferences, habits, frequent apps, topics | Generic interactions |
 | **Function Calling** | Structured JSON tool invocation from LLM | Raw text parsing only |
+| **3D Companion** | Real-time VRM character with alive-ness system | Static text UI |
 | **Open Source** | Fully open — modify, audit, and extend | Black-box proprietary systems |
 
-Unlike browser-based or cloud-dependent assistants, Mai's entire pipeline — wake word detection, speech recognition, reasoning, and speech synthesis — runs locally using optimized ONNX models.
+---
+
+## Companion Mode (Web UI)
+
+Mai includes a browser-based companion interface with a real-time 3D character, voice interaction, and streaming responses.
+
+### Features
+- **VRM 3D Character** — Real-time rendered with Three.js + @pixiv/three-vrm
+- **Alive-ness System** — CPT eye saccades, spring-damper head physics, auto-blink, mouse tracking, breathing, idle behaviors, micro-expressions, spontaneous smiling
+- **Streaming TTS with Lip-Sync** — Audio chunks streamed to browser with word-level viseme scheduling and winner+runner mouth blending
+- **Voice Input (Mic)** — Browser Web Audio API captures speech → PCM 16kHz → WebSocket → Sherpa-ONNX VAD/ASR pipeline
+- **WebGPU/WebGL Rendering** — Automatic backend selection with fallback
+- **PixiJS 2D Background** — Cozy warm-toned background with floating dust particles
+- **Motion3 Animation** — VRoid .motion3.json parameter animations for idle movement
+- **Emotion Display** — Real-time emotion badge showing current character state
+- **WebSocket Real-time** — Bi-directional communication for instant responses
+
+### Quick Start (Companion Mode)
+
+```bash
+# 1. Build with companion support
+go build -o mai.exe ./cmd/mai
+
+# 2. Run with companion flag
+./mai.exe --companion
+
+# 3. Open browser
+# Navigate to http://localhost:8080
+```
+
+### Architecture
+
+```
+Browser (Three.js + Web Audio) ←→ WebSocket ←→ Go Server
+    ↓                                      ↓
+VRM Character Renderer              LLM / TTS / ASR
+Motion3 Animations                  Sherpa-ONNX Pipeline
+Live Lip-Sync                       Emotion Detection
+Voice Input (Mic)                   Streaming Audio Chunks
+```
+
+### Voice Interaction Flow
+
+```
+1. User clicks mic → Web Audio API captures PCM 16kHz
+2. PCM chunks sent via WebSocket (audio.input frames)
+3. Server: Sherpa-ONNX VAD detects speech segments
+4. Server: ASR transcribes speech → text
+5. Server: LLM generates response → streaming text tokens
+6. Server: TTS synthesizes audio → streaming chunks
+7. Browser: Receives audio chunks → sequential playback
+8. Browser: Viseme schedule drives mouth animation
+9. Browser: RMS energy drives real-time mouth amplitude
+```
 
 ---
 
@@ -38,6 +92,7 @@ Mai operates in two modes, switchable at runtime via configuration:
 |------|----------|----------|
 | **Legacy Mode** | Classic wake word → ASR → regex/LLM → TTS pipeline | Fast, simple commands with minimal overhead |
 | **Agentic Mode** | Full cognitive loop with memory, planning, and proactivity | Complex multi-step tasks, autonomous monitoring |
+| **Companion Mode** | Web-based 3D character with voice interaction | Real-time conversational companion |
 
 In **Agentic Mode**, Mai features:
 - **Dynamic Prompt Engine**: JARVIS personality with 8 task-tailored prompt templates (conversation, command, reasoning, creative, analysis, proactive, greeting, emergency)
@@ -78,9 +133,11 @@ go build -o mai.exe ./cmd/mai
 # 4. Run it
 ./mai.exe
 
+# Optional: run with companion web UI
+./mai.exe --companion
+
 # Optional: specify a custom config file
 # ./mai.exe -config my-config.yaml
-
 ```
 
 Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally.
@@ -104,6 +161,28 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 | **System Automation** | ✅ Ready | UI automation via RobotGo (WhatsApp, Telegram, YouTube, App Control) |
 | **YAML Configuration** | ✅ Ready | Single config file controls all speech and LLM components |
 | **Audio I/O** | ✅ Ready | Cross-platform microphone capture and speaker playback via miniaudio |
+
+### Companion UI Features
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **VRM 3D Character** | ✅ Ready | Real-time rendered with Three.js + @pixiv/three-vrm |
+| **Streaming TTS Lip-Sync** | ✅ Ready | Word-level viseme scheduling + real-time RMS amplitude |
+| **Voice Input (Mic)** | ✅ Ready | Web Audio API → PCM 16kHz → WebSocket → Sherpa-ONNX ASR |
+| **Eye Saccades (CPT)** | ✅ Ready | Probability-weighted natural eye movement (800-4400ms intervals) |
+| **Spring-Damper Head** | ✅ Ready | Stiffness=120, Damping=16 physics for mouse-tracking head movement |
+| **Auto-Blink** | ✅ Ready | State machine: idle→closing(75ms)→opening(150-300ms), 3-8s delay |
+| **Mouse Eye Tracking** | ✅ Ready | Raycast screen→3D plane projection for gaze following |
+| **Breathing Animation** | ✅ Ready | Multi-layered sine waves (0.75Hz base rate) |
+| **Idle Behaviors** | ✅ Ready | Stretch, glance, adjust, breatheDeep, headNod, shoulderShrug |
+| **Micro-Expressions** | ✅ Ready | Subtle expression flickers every 3-8 seconds |
+| **Spontaneous Smiling** | ✅ Ready | 15% chance every 8-20 seconds, sine curve fade |
+| **Emotion Postures** | ✅ Ready | Head tilt varies by emotion (happy/sad/surprised/think) |
+| **Motion3 Animations** | ✅ Ready | VRoid .motion3.json parameter animation playback (8 clips) |
+| **WebGPU Rendering** | ✅ Ready | Automatic WebGPU→WebGL fallback |
+| **PixiJS Background** | ✅ Ready | Cozy warm-toned 2D background with floating dust particles |
+| **Emotion Display** | ✅ Ready | Real-time emotion badge showing current character state |
+| **Voice Activity Gate** | ✅ Ready | Lip-sync pauses during silence, smooth release on speech end |
 
 ### Agentic Layer — Reasoning & Cognition
 
@@ -136,6 +215,7 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 | **Emotion-Aware TTS** | ✅ Ready | Adapts speed, pitch, volume, emphasis, and pause scale per detected emotion |
 | **Response Adaptation** | ✅ Ready | Shortens responses for stressed users, prefixes empathy for frustrated users |
 | **Tone Directives** | ✅ Ready | Prompt engine injects emotion-specific directives (e.g., "be calm and efficient") |
+| **Character Emotion Display** | ✅ Ready | Real-time VRM expression changes based on detected emotion |
 
 ### Agentic Layer — Proactive Intelligence
 
@@ -169,13 +249,13 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 | **Perception Bridge** | ✅ Ready | Audio transcription and vision event publishing |
 | **Meta-Cognition** | ✅ Ready | Performance tracking, strategy analysis, and self-improvement |
 | **MCP Client** | ✅ Ready | Model Context Protocol for external tool discovery |
-| **Companion Skills (Jarvis-like)** | ✅ Ready | Skill routing via `data/skills.json` (trigger phrases → skill execution) |
+| **Companion Skills** | ✅ Ready | Skill routing via `data/skills.json` (trigger phrases → skill execution) |
 
 ---
 
 ## Emotion-Adaptive Pipeline
 
-Mai detects user emotion from both text and audio prosody, then adapts its voice and responses:
+Mai detects user emotion from both text and audio prosody, then adapts its voice, responses, and character expression:
 
 ```
 User speaks → Audio samples → Prosody Analyzer → Emotion Detection
@@ -184,20 +264,53 @@ Text transcript → Text Emotion Detection → Combined Emotion State
                                      ↓
                     ┌────────────────┼────────────────┐
                     ↓                ↓                ↓
-            Prompt Engine      TTS Adapter      Response Adapter
-         (tone directives)  (speed/pitch/vol)  (length/empathy)
+            Prompt Engine      TTS Adapter      Character
+         (tone directives)  (speed/pitch/vol)  (VRM expression)
 ```
 
 **TTS Adaptation by Emotion:**
 
-| Emotion | Speed | Pitch | Volume | Pauses | Style |
-|---------|-------|-------|--------|--------|-------|
-| **Stressed** | -15% | -5% | -10% | +30% | Calm, efficient |
-| **Frustrated** | -10% | -2% | -5% | +20% | Patient, steady |
-| **Sad** | -20% | -8% | -15% | +50% | Gentle, warm |
-| **Excited** | +15% | +5% | +10% | -20% | Energetic, upbeat |
-| **Happy** | +5% | +3% | +5% | -10% | Warm, positive |
-| **Calm** | -5% | -2% | -5% | +10% | Relaxed, measured |
+| Emotion | Speed | Pitch | Volume | Pauses | Character Expression |
+|---------|-------|-------|--------|--------|---------------------|
+| **Stressed** | -15% | -5% | -10% | +30% | Head droop, furrowed brows |
+| **Frustrated** | -10% | -2% | -5% | +20% | Head tilt, tight mouth |
+| **Sad** | -20% | -8% | -15% | +50% | Head droop, sad eyes |
+| **Excited** | +15% | +5% | +10% | -20% | Head lift, wide eyes, smile |
+| **Happy** | +5% | +3% | +5% | -10% | Head tilt right, smile, squint |
+| **Calm** | -5% | -2% | -5% | +10% | Neutral posture, relaxed |
+
+---
+
+## Character Alive-ness System
+
+The VRM character uses AIRI-inspired techniques to feel alive:
+
+### Eye Movement (CPT-Distributed Saccades)
+- Probability-weighted intervals: 7.5% at 800ms, 11% at 1200ms, ... up to 4400ms
+- Feels natural — short saccades more frequent than long ones
+- Mouse tracking via screen→3D plane raycasting
+
+### Auto-Blink (State Machine)
+- Three phases: idle → closing (75ms ease-out) → opening (150-300ms ease-in)
+- 3-8 second delay between blinks
+- Skips when eyes already near-closed (threshold 0.15)
+- Double-blink chance: 22%
+
+### Spring-Damper Head Physics
+- Stiffness=120, Damping=16, Mass=1 (matching AIRI)
+- Semi-implicit Euler integration with snap-to-target
+- Applied to yaw/pitch/roll for mouse tracking
+
+### Lip Sync (Winner+Runner Blending)
+- Top 2 visemes blended (not winner-take-all)
+- Mouth-integrated emotions (happy→aa, angry→ee, etc.)
+- Smoothstep release (200ms crossfade) when speech ends
+
+### Breathing & Idle
+- Multi-layered sine waves at 0.75Hz base rate
+- Idle behaviors: stretch, glance, adjust, breatheDeep, headNod, shoulderShrug
+- Micro-expressions: subtle flickers every 3-8 seconds
+- Spontaneous smiling: 15% chance every 8-20 seconds
 
 ---
 
@@ -221,6 +334,7 @@ Mai uses a priority-based interrupt system to handle concurrent requests:
 | Go | 1.25+ | [Download](https://golang.org/dl/) |
 | Ollama | Latest | [Download](https://ollama.com) — for LLM backend |
 | ONNX Runtime | Bundled | Included via `sherpa-onnx-go` |
+| Node.js | 18+ | For local npm packages (three, @pixiv/three-vrm) |
 
 ### Optional
 - **llama.cpp** — Alternative LLM backend if you prefer it over Ollama
@@ -238,7 +352,13 @@ git clone <repository-url>
 cd mai
 ```
 
-### 2. Verify Models
+### 2. Install Frontend Dependencies
+
+```bash
+npm install three @pixiv/three-vrm @pixiv/three-vrm-animation
+```
+
+### 3. Verify Models
 
 All required ONNX models are included in the repository:
 
@@ -254,7 +374,7 @@ All required ONNX models are included in the repository:
 
 > **Note**: If models are missing, download them from the [sherpa-onnx releases page](https://github.com/k2-fsa/sherpa-onnx/releases).
 
-### 3. Configure
+### 4. Configure
 
 ```bash
 cp config.example.yaml config.yaml
@@ -268,9 +388,10 @@ Edit `config.yaml` to match your preferences. Key sections:
 - `tts`: Active voice model and speed
 - `llm`: Provider, model name, and system prompt
 - `agentic`: Enable/disable agentic mode
+- `server`: Companion web UI settings (port, token)
 - `privacy`: Sensitive word detection for hybrid mode
 
-### 4. Prepare LLM
+### 5. Prepare LLM
 
 Pull a recommended model via Ollama:
 
@@ -285,16 +406,20 @@ ollama pull qwen2.5:3b
 ollama pull phi3:mini
 ```
 
-### 5. Build & Run
+### 6. Build & Run
 
 ```bash
 go mod tidy
 go build -o mai.exe ./cmd/mai
+
+# Run in legacy mode (wake word)
 ./mai.exe
+
+# Run with companion web UI
+./mai.exe --companion
 
 # Optional: use a custom config file
 # ./mai.exe -config my-config.yaml
-
 ```
 
 ---
@@ -304,6 +429,12 @@ go build -o mai.exe ./cmd/mai
 ### Wake Words
 - **"Mai"** — Primary wake word
 - **"Hey Mai"** — Alternative phrase
+
+### Companion Mode
+- Open `http://localhost:8080` in your browser
+- Click the mic button to speak
+- Type messages in the chat panel
+- Watch Mai's character react to your words
 
 ### Example Interactions
 
@@ -324,21 +455,12 @@ You: "I'm feeling stressed about the deadline"
 Mai: "I understand. Let me help you prioritize. What's the most urgent task?"  [slower, calmer TTS]
 ```
 
-### Companion Skills (Proposal 1)
+### Companion Skills
 Mai can route certain utterances to a **Companion Skill** before normal command/function/conversation routing.
 
 - Skills are defined in: `data/skills.json`
-- A skill matches when the user text **contains** one of the skill’s `triggers` (case-insensitive substring).
-- When matched, Mai:
-  - executes the skill using the existing ReAct pipeline
-  - stores an episodic memory entry: `Type: "skill_invoked"`
-
-Example trigger phrases (built-in starter skills):
-- “plan my day …” (Plan My Day)
-- “summarize …” (Summarize)
-- “weekly review …” (Weekly Review)
-
-To add your own skill, edit `data/skills.json` (see `guide.md` → “How to add your own Companion Skill”).
+- A skill matches when the user text **contains** one of the skill's `triggers` (case-insensitive substring).
+- When matched, Mai executes the skill using the existing ReAct pipeline.
 
 ### Follow-Up Mode
 After Mai responds, you have **15 seconds** to ask a follow-up without saying the wake word again.
@@ -368,12 +490,11 @@ Enable intelligent routing between local and cloud models:
 
 ```yaml
 llm:
-  provider: "openai"      # Cloud provider
+  provider: "openai"
   model: "gpt-4o-mini"
   url: "https://api.openai.com/v1/chat/completions"
   api_key: "sk-..."
-  hybrid_mode: true       # Enable hybrid routing
-  system_prompt: "You are Mai, a helpful AI assistant."
+  hybrid_mode: true
 
 privacy:
   detection_enabled: true
@@ -382,8 +503,6 @@ privacy:
     - "secret"
     - "credit card"
 ```
-
-**How it works**: The PrivacyGuard scans every prompt for sensitive keywords. If detected, the request routes to your local Ollama model. Otherwise, it uses the cloud provider for higher capability.
 
 ---
 
@@ -403,8 +522,6 @@ Mai's agentic mode includes a universal tool registry with category-based discov
 | `file_write` | file | Write to files | `"Save this note to todo.txt"` |
 | `ui_automation` | automation | UI control (click, type) | `"Press Ctrl+F"` |
 
-Tools are dynamically discovered by category and keyword relevance. The LLM uses structured function calling to invoke tools with JSON parameters.
-
 ---
 
 ## Memory System
@@ -420,204 +537,59 @@ Mai implements a hierarchical memory architecture with RAG support:
 | **RAG Pipeline** | Semantic + Episodic → LLM | Retrieve-augmented generation with confidence scoring | ✅ Implemented |
 | **User Profile** | JSON (`data/user_profile.json`) | Preferences, habits, frequent apps, topics | ✅ Implemented |
 
-The memory manager provides unified retrieval across all layers for the ReAct loop and conversation handler.
-
----
-
-## Architecture & Core Systems
-
-Mai is built on a high-concurrency, event-driven architecture designed for low-latency offline interaction.
-
-### Request Flow (Agentic Mode)
-
-```
-User Speech → ASR → Transcription
-    ↓
-Orchestrator.HandleInput()
-    ├── Echo Detection (ignore TTS echo)
-    ├── Emotion Detection (text keywords)
-    ├── User Model Recording (interaction, topics, patterns)
-    ├── Prosody Analysis (if audio samples available)
-    ├── Interrupt Classification (critical/high/normal/low)
-    ├── Memory Storage (working + episodic)
-    │
-    ├── SMART ROUTING:
-    │   ├── Regex Fast Path → DirectAction (legacy, most reliable)
-    │   ├── Knowledge Request → ReAct Loop (deep_search)
-    │   ├── Multi-Step Command → Planner → Sequential Execution
-    │   ├── Command → Function Calling (structured JSON tool calls)
-    │   ├── Reasoning → ReAct Loop (think → act → observe)
-    │   └── Conversation → Prompt Engine → LLM (JARVIS personality)
-    │
-    ├── Response Adaptation (emotion-aware truncation, prefix)
-    └── TTS with Emotion-Adaptive Parameters (speed, pitch, volume)
-```
-
-### 1. Perception Layer (`internal/perception`)
-- **Audio Bridge**: Captures microphone input via `malgo` (miniaudio) and routes it through VAD (Silero) and ASR (NeMo/Zipformer/Qwen).
-- **Vision Bridge**: Performs periodic or on-demand screen understanding using local Vision LLMs (via Ollama).
-- **Event Bus**: An in-process pub/sub bus that decouples perception from cognition.
-
-### 2. Cognitive Layer (`internal/cognition`)
-- **Prompt Engine**: Dynamic, context-aware prompt generation with JARVIS personality. 8 task types with tailored templates. Emotion-aware tone directives.
-- **Function Caller**: LLM structured JSON tool invocation — single calls and chain execution.
-- **ReAct Engine**: Reasoning + Acting loop with anti-hallucination, loop detection, and reflexion.
-- **Planner**: LLM-based task decomposition with dependency tracking and sequential execution.
-- **Verifier**: Claim verification and tool call result validation.
-
-### 3. Agent Layer (`internal/agent`)
-- **Orchestrator**: Central brain — routes inputs, manages state, coordinates all subsystems.
-- **User Model**: Profile persistence, preference learning, habit tracking, topic extraction.
-- **Proactive Engine**: Pattern analysis (time-of-day, frequency), anticipatory actions, idle reminders.
-- **Interrupt Manager**: 4-level priority system with queue management.
-- **Goal Manager**: Priority queue with heap for long-running task management.
-- **Meta-Cognition**: Performance tracking, strategy analysis, self-improvement loop.
-- **Privacy Guard**: Sensitive data detection for hybrid cloud/local routing.
-
-### 4. Emotional Layer (`internal/personality`)
-- **Emotion Detector**: Text-based keyword scoring + prosody-based arousal/valence mapping.
-- **Prosody Analyzer**: Audio feature extraction (RMS, ZCR, spectral centroid, pitch, volume variance, pause ratio) with template matching.
-- **TTS Adapter**: Emotion-aware parameter control — speed, pitch, volume, emphasis, pause scale.
-
-### 5. Action Layer (`internal/tools` & `cmd/mai`)
-- **Tool Registry**: Dynamic discovery with categories, semantic search, runtime registration/unregistration.
-- **Action Executor**: High-reliability legacy system for precise UI control.
-- **RobotGo Automation**: Direct OS-level control for typing, shortcut execution, and application management.
-
----
-
-## Technical Package Breakdown
-
-| Package | Responsibility |
-|---------|----------------|
-| `cmd/mai/` | Entry point, audio drivers, and the high-reliability legacy automation core |
-| `internal/agent/` | Orchestrator, user model, proactive engine, interrupt manager, goal manager, meta-cognition, privacy guard |
-| `internal/cognition/` | Prompt engine, function caller, ReAct loop, planner, verifier |
-| `internal/personality/` | Emotion detector, prosody analyzer, TTS adapter |
-| `internal/llm/` | Multi-provider LLM client (Ollama, OpenAI, Gemini, Claude, OpenRouter, NVIDIA, Hybrid) |
-| `internal/memory/` | Hierarchical memory system (Working, Episodic, Semantic, Procedural, RAG) |
-| `internal/tools/` | Tool registry with category-based discovery and adapters (Shell, Web, YouTube, WhatsApp, etc.) |
-| `internal/perception/` | Bridges for ASR, VAD, and Vision data |
-| `internal/events/` | Async pub/sub event bus for decoupled communication |
-| `internal/observability/` | Metrics collector, structured logger, health checker |
-| `pkg/interfaces/` | Core interface definitions ensuring modularity and testability |
-| `pkg/models/` | Configuration structs (YAML mapping) |
-
 ---
 
 ## Technology Stack
 
 - **Language**: Go 1.25+ (concurrency-first architecture)
+- **Frontend**: Three.js, @pixiv/three-vrm, PixiJS, Web Audio API
 - **Inference**: ONNX Runtime (CPU-optimized for speech/VAD/ASR)
 - **Automation**: RobotGo (Cross-platform UI control)
 - **Audio**: Malgo (C-bindings for miniaudio)
 - **LLM Backends**: Ollama (default), llama.cpp, OpenAI, Gemini, Claude, OpenRouter, NVIDIA
 - **Memory**: SQLite (episodic), JSON vectors (semantic), JSON files (procedural, user profile)
 - **Models**: NeMo CTC, Silero VAD, Supertonic TTS, Qwen/Gemma LLMs
-
----
-
-## Performance Targets
-
-| Metric | Target | Actual (Optimized) |
-|--------|--------|-------------------|
-| **Fast Path Latency** | < 100ms | ~20-50ms (Regex matching) |
-| **Function Calling Latency** | < 3s | ~1.5-2.5s (LLM structured output) |
-| **Reasoning Latency** | < 5s | ~2-4s (ReAct multi-step) |
-| **ASR Accuracy** | > 95% | Excellent (NeMo / Qwen3) |
-| **TTS Jitter** | < 5ms | Near-zero (Buffered playback) |
+- **Rendering**: WebGPU → WebGL fallback, PixiJS 2D background
 
 ---
 
 ## Configuration Reference
 
+### Companion Server
+```yaml
+server:
+  enabled: true
+  port: 8080
+  token: ""           # Optional auth token
+```
+
 ### Audio Settings
 ```yaml
 audio:
-  sample_rate: 16000        # Mic sample rate (16kHz required for speech models)
-  capture_buffer_ms: 100    # Audio buffer size
-  playback_device: ""       # "" = default output device
+  sample_rate: 16000
+  capture_buffer_ms: 100
+  playback_device: ""
 ```
 
-### Wake Word (KWS)
-```yaml
-kws:
-  provider: "cpu"
-  num_threads: 2
-  model_dir: "./sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
-  keywords: "▁MA I @mai, ▁MY @mai, ▁HE Y ▁MA I @mai"
-  confidence_threshold: 0.02
-  cooldown_ms: 1500         # Prevent re-triggering
-```
-
-### Voice Activity Detection (VAD)
-```yaml
-vad:
-  provider: "cpu"
-  num_threads: 2
-  model: "./silero_vad.onnx"
-  threshold: 0.6            # Speech detection threshold (0-1)
-  min_silence_duration: 0.8 # Seconds of silence to end segment
-  min_speech_duration: 0.5  # Minimum speech length
-  max_speech_duration: 10.0 # Maximum speech length before forced split
-```
-
-### Speech Recognition (ASR)
-```yaml
-asr:
-  type: "nemo"              # "nemo", "zipformer", or "qwen3"
-  provider: "cpu"
-  num_threads: 2
-  model_dir: "./sherpa-onnx-nemo-streaming-fast-conformer-ctc-en-480ms"
-  decoding_method: "greedy_search"
-  enable_endpoint: 1        # Auto-detect end of utterance
-```
-
-### Text-to-Speech (TTS)
+### TTS
 ```yaml
 tts:
-  active_model: "supertonic"  # "supertonic" | "pocket" | "zipvoice"
+  active_model: "supertonic"
   num_threads: 2
   output_sample_rate: 44100
-
   supertonic:
     model_dir: "./sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
     speed: 1.25
-    num_steps: 5
-
-  voice_cloning:
-    enabled: false
-    model: "pocket"           # "pocket" or "zipvoice"
-    reference_audio: "./mai_san_v2.wav"
 ```
 
 ### LLM
 ```yaml
 llm:
-  provider: "ollama"        # "ollama", "openai", "gemini", "claude", "openrouter", "nvidia", "llamacpp"
+  provider: "ollama"
   model: "gemma2:2b"
   url: "http://localhost:11434/api/generate"
   auto_start: true
-  hybrid_mode: false        # Enable for local/cloud routing
-  api_key: ""               # Required for cloud providers
-  system_prompt: "You are Mai, a helpful and concise offline AI assistant."
-```
-
-### Agentic Mode
-```yaml
-agentic:
-  enabled: false            # Set to true to enable agentic architecture
-```
-
-### Privacy (Hybrid Mode)
-```yaml
-privacy:
-  detection_enabled: true
-  sensitive_words:
-    - "password"
-    - "secret"
-    - "credit card"
-    - "ssn"
+  hybrid_mode: false
 ```
 
 ---
@@ -628,49 +600,38 @@ privacy:
 
 ```
 cmd/mai/
-├── main.go          # Application entry point and pipeline orchestration
-├── audio.go         # Audio capture (malgo) and playback
+├── main.go          # Entry point, pipeline orchestration, companion server
+├── audio.go         # Audio capture (malgo), playback, streaming TTS
 ├── automation.go    # UI automation via RobotGo
 ├── actions.go       # Regex-based action parser
 └── vision.go        # Vision processing via Ollama
 internal/
-├── agent/           # Orchestrator, user model, proactive engine, interrupt manager, goals, meta-cognition
-├── cognition/       # Prompt engine, function caller, ReAct loop, planner, verifier
+├── agent/           # Orchestrator, user model, proactive engine, interrupt manager
+├── cognition/       # Prompt engine, function caller, ReAct loop, planner
 ├── personality/     # Emotion detector, prosody analyzer, TTS adapter
 ├── llm/             # Multi-provider LLM clients and factory
-├── memory/          # Working, episodic, semantic, procedural memory + RAG pipeline
+├── memory/          # Working, episodic, semantic, procedural memory + RAG
 ├── perception/      # Audio and vision bridges
 ├── tools/           # Tool registry with categories and adapters
+├── server/          # WebSocket hub, HTTP server, static file serving
 ├── events/          # Pub/sub event bus
 └── observability/   # Metrics, logging, health checks
 pkg/
-├── interfaces/      # Core Go interfaces (agent, cognition, llm, memory, tools, events)
+├── interfaces/      # Core Go interfaces
 └── models/          # Configuration structs
-data/
-├── memory/          # SQLite databases, procedural.json, user_profile.json
-├── vector/          # Semantic vector store (JSON)
-└── cache/           # Temporary caches
-config.example.yaml  # Configuration template
-go.mod / go.sum      # Go module definitions
-prd.md              # Product Requirements Document
-ROADMAP.md          # Implementation roadmap
-progress.md         # Implementation progress tracker
-```
-
-### Build Commands
-
-```bash
-# Standard build
-go build -o mai.exe ./cmd/mai
-
-# With optimizations
-go build -ldflags="-s -w" -o mai.exe ./cmd/mai
-
-# Run tests
-go test ./...
-
-# Static analysis
-go vet ./cmd/mai ./internal/... ./pkg/...
+internal/server/static/
+├── js/
+│   ├── character.js     # VRM 3D character renderer with alive-ness system
+│   ├── motion3-loader.js # Motion3.json animation parser
+│   ├── app.js           # Main app orchestration
+│   ├── audio.js         # AudioPlayer with streaming clock
+│   ├── chat.js          # Chat UI
+│   ├── ws-client.js     # WebSocket client with auto-reconnect
+│   ├── settings.js      # Settings panel
+│   └── utils.js         # Viseme scheduler, energy gate, helpers
+├── css/             # Character, chat, main, settings styles
+├── assets/          # VRM model, motion files, character layers
+└── index.html       # Companion web UI
 ```
 
 ---
@@ -680,93 +641,53 @@ go vet ./cmd/mai ./internal/... ./pkg/...
 | Phase | Feature | Status | Notes |
 |-------|---------|--------|-------|
 | 1 | Project Foundation | ✅ Complete | Go module, config system, audio I/O |
-| 2 | Wake Word Detection | ✅ Complete | Zipformer KWS with cooldown and confidence thresholds |
+| 2 | Wake Word Detection | ✅ Complete | Zipformer KWS with cooldown |
 | 3 | VAD Integration | ✅ Complete | Silero VAD with circular buffer |
-| 4 | Streaming ASR | ✅ Complete | NeMo CTC + Zipformer + Qwen3 support |
-| 5 | TTS Integration | ✅ Complete | Supertonic / Pocket / ZipVoice model support |
-| 6 | Voice Pipeline Orchestration | ✅ Complete | State machine, follow-up mode, interruptible playback |
-| 7 | LLM Integration | ✅ Complete | Multi-provider: Ollama, OpenAI, Gemini, Claude, OpenRouter, NVIDIA, Hybrid |
-| 7b | Command Parser & Action System | ✅ Complete | High-reliability regex (Fast Path) + LLM fallback |
-| 8 | Automation (RobotGo) | ✅ Complete | WhatsApp, Telegram, YouTube, and System App control |
-| 9 | Memory System | ✅ Complete | Working + Episodic + Semantic + Procedural + RAG pipeline |
-| 10 | Vision (Screen OCR) | 🚧 Partial | Vision bridge exists; continuous monitoring needs work |
-| 11 | Emotion Engine | ✅ Complete | Text emotion detection, prosody analysis, emotion-adaptive TTS |
-| 12 | Dynamic Prompt Engine | ✅ Complete | JARVIS personality, 8 task types, emotion-aware tone directives |
-| 13 | Function Calling | ✅ Complete | Structured JSON tool invocation from LLM |
-| 14 | Multi-step Task Planning | ✅ Complete | ReAct reasoning engine + LLM planner for complex sequences |
-| 15 | User Modeling | ✅ Complete | Preference learning, habit tracking, topic extraction, persistent profile |
-| 16 | Proactive Intelligence | ✅ Complete | Pattern learning, anticipatory actions, idle reminders |
-| 17 | Interrupt Hierarchy | ✅ Complete | 4-level priority system with queue management |
-| 18 | Polish & Performance Tuning | 🚧 In Progress | Routing optimization, latency reduction, stability fixes |
-
-See [`ROADMAP.md`](ROADMAP.md) for detailed implementation tasks. See [`progress.md`](progress.md) for implementation tracking.
+| 4 | Streaming ASR | ✅ Complete | NeMo CTC + Zipformer + Qwen3 |
+| 5 | TTS Integration | ✅ Complete | Supertonic / Pocket / ZipVoice |
+| 6 | Voice Pipeline | ✅ Complete | State machine, follow-up, interruptible |
+| 7 | LLM Integration | ✅ Complete | Multi-provider: Ollama, OpenAI, Gemini, Claude, OpenRouter, NVIDIA |
+| 8 | Automation | ✅ Complete | WhatsApp, Telegram, YouTube, App control |
+| 9 | Memory System | ✅ Complete | Working + Episodic + Semantic + Procedural + RAG |
+| 10 | Emotion Engine | ✅ Complete | Text + prosody detection, adaptive TTS |
+| 11 | Dynamic Prompts | ✅ Complete | JARVIS personality, 8 task types |
+| 12 | Function Calling | ✅ Complete | Structured JSON tool invocation |
+| 13 | Task Planning | ✅ Complete | ReAct + LLM planner |
+| 14 | User Modeling | ✅ Complete | Preferences, habits, topics |
+| 15 | Proactive Intel | ✅ Complete | Pattern learning, idle reminders |
+| 16 | Companion UI | ✅ Complete | VRM character, streaming TTS, mic input, alive-ness |
+| 17 | Motion3 System | ✅ Complete | VRoid parameter animation playback |
+| 18 | Polish & Performance | 🚧 In Progress | Routing optimization, latency reduction |
 
 ---
 
 ## Troubleshooting
 
+### Companion UI not loading
+- Ensure `--companion` flag is passed
+- Check `server.port` in config (default: 8080)
+- Verify `node_modules` exists (`npm install`)
+
+### VRM character not rendering
+- Check browser console for import errors
+- Ensure `three` and `@pixiv/three-vrm` are installed locally
+- Try refreshing with cache clear (Ctrl+Shift+R)
+
+### Mic not working
+- Grant microphone permission in browser
+- Check WebSocket connection in DevTools Network tab
+- Ensure `audio.input` messages are being sent
+
 ### "Failed to create keyword spotter"
 - Verify model paths in `config.yaml` match actual directories
-- Ensure ONNX model files are not corrupted (check file sizes)
 
 ### No audio output
-- Check `audio.playback_device` in config (leave empty for default)
+- Check `audio.playback_device` in config
 - Verify Windows audio output is not muted
 
 ### Ollama connection refused
 - Ensure Ollama is running: `ollama serve`
-- Check `llm.url` matches Ollama's actual port (default: 11434)
-- Try disabling `auto_start` and manually starting Ollama
-
-### High CPU usage
-- Reduce `num_threads` in KWS, VAD, and TTS configs
-- Use a smaller LLM model (e.g., `gemma2:2b` instead of 7B models)
-- Ensure `provider: "cpu"` is set for speech models (GPU not needed for these)
-
-### TTS sounds distorted
-- Verify `output_sample_rate` matches your model's native rate:
-  - Supertonic: 44100 Hz
-  - Pocket: 24000 Hz
-  - ZipVoice: 24000 Hz
-
----
-
-
-## Recent Optimizations & Bug Fixes
-
-### Two-Way Communication — Barge-In, Thinking Chime, Reduced Dead Time
-- **Barge-in with VAD confirmation**: Speak during TTS playback to interrupt Mai. Uses a two-layer detector: RMS threshold as the first filter, then Silero VAD as the second layer to confirm the sound is actually human speech (not echo, fans, or door slams). This provides true noise immunity. Configurable via `audio.barge_in_enabled` and `audio.barge_in_threshold`.
-- **Thinking chime**: A subtle 80ms tone plays when LLM processing starts, so you know you've been heard. No more dead air. Configurable via `audio.thinking_chime`.
-- **`waitForMicSilence` reduced** from 3s max to 500ms max with 3 consecutive checks for faster turn-taking. On barge-in, skipped entirely since the user is already speaking.
-- **200ms pre-TTS sleep removed** — eliminates the defensive delay before every utterance.
-- **`playAudio` interruptible** — supports mid-stream cancellation via context + stop flag, checked in both the audio callback and poll loop.
-- **Audio callback restructured**: RMS computed once at callback entry, shared between barge-in detection and silence wait.
-- **TTS Voice Style**: The system prompt's tone (calm, warm, energetic, etc.) now automatically influences TTS speed, pitch, and volume. If your prompt says "be calm and composed", TTS will speak slower and softer. Override via `tts.voice_style` in config.
-
-### Supertonic TTS v2 → v3 Migration
-- Upgraded from `sherpa-onnx-supertonic-tts-int8-2026-03-06` (Supertonic 2) to `sherpa-onnx-supertonic-3-tts-int8-2026-05-11` (Supertonic 3)
-- Zero code changes required — model files are fully backward-compatible
-- Supertonic 3 reduces repeat/skip failures and improves voice quality
-
-### Bug Fixes
-- **Panic recovery**: Added `defer/recover` guards in the audio callback and event bus dispatch — a panic in either no longer crashes the process
-- **C memory leak**: VAD circular buffer now properly freed before reallocation on each wake-word trigger
-- **`sessionSamples` reset**: Streaming ASR path properly resets the sample buffer at VAD segment boundaries
-- **`lastResponseTime` initialization**: Fixed from zero-value (which caused a ~17000-year startup follow-up window bug) to `time.Now()`
-- **Episodic QueryEvents**: Now uses `LIKE` query instead of ignoring the parameter — enables proper context retrieval in the RAG pipeline
-- **Prosody SpeechRate**: `SpeechRate` feature is now computed via syllable-like energy peak detection (was always 0)
-- **Spectral centroid**: Normalized to 0-1 range and clamped at Nyquist frequency for more accurate feature matching
-- **Pitch estimation**: Clamped to human speech range (50-500 Hz) and normalized to 0-1
-- **MCP client race condition**: Added `sync.RWMutex` protection around `sessionID` field for concurrent access safety
-
-### Hallucination Reduction
-- **Verifier integration**: The `Verifier` is now wired into the `ReActLoop` — tool call results and final answers are verified for plausibility before acceptance
-- **ReAct timeout**: Added 30-second per-iteration context timeout — prevents stalled tool calls from hanging indefinitely
-- **Reduced max iterations**: From 5 to 3 — most tasks resolve in 1-2 iterations, reducing latency
-
-### Performance
-- **`waitForMicSilence()` helper**: Extracted 3 duplicated silence-wait loops (30 lines each) into a shared closure — reduces code duplication and improves maintainability
-- **Personality fully wired**: `publishTTS()` now includes emotion-adapted speed and pitch params from `TTSAdapter`, and `handleTranscription()` already included them — emotion-aware voice is active in all TTS paths
+- Check `llm.url` matches Ollama's actual port
 
 ---
 
@@ -787,3 +708,7 @@ This project is licensed under the MIT License — see [`LICENSE.md`](LICENSE.md
 - [gen2brain/malgo](https://github.com/gen2brain/malgo) — Go bindings for miniaudio
 - [Ollama](https://ollama.com) — Local LLM serving
 - [Supertone](https://supertone.ai) — Supertonic TTS model
+- [Three.js](https://threejs.org) — 3D rendering
+- [@pixiv/three-vrm](https://github.com/pixiv/three-vrm) — VRM model loading and animation
+- [PixiJS](https://pixijs.com) — 2D rendering for background
+- [AIRI](https://airi.moeru.ai/) — Alive-ness system inspiration (CPT saccades, spring physics, lip sync)
