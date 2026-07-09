@@ -191,7 +191,6 @@ class CharacterRenderer {
 
         this._init();
         this._loadModel();
-        this._setupCameraControls();
         this._animate();
     }
 
@@ -265,6 +264,9 @@ class CharacterRenderer {
         this.renderer.toneMappingExposure = 1.15;
         this.renderer.shadowMap.enabled = false;
         this.container.appendChild(this.renderer.domElement);
+        
+        // Setup camera controls after renderer is created
+        this._setupCameraControls();
 
         // Three.js scene + camera (transparent background)
         this.scene = new THREE.Scene();
@@ -559,19 +561,16 @@ class CharacterRenderer {
         loader.register((parser) => new VRMLoaderPlugin(parser));
         loader.register((parser) => new VRMAnimationLoaderPlugin(parser));
 
-        // Load VRM + VRMA + bone animation + facial expressions files in parallel
+        // Load VRM + VRMA + motion3 files in parallel
         const motionPromises = MOTION_FILES.map(url =>
-            loadBoneAnimation(url).catch(e => { console.warn(`[VRM] Failed to load motion: ${url}`, e); return null; })
+            loadMotion3(url).catch(e => { console.warn(`[VRM] Failed to load motion: ${url}`, e); return null; })
         );
-        const expressionsPromise = loadFacialExpressions('/motion/facial_expressions.json')
-            .catch(e => { console.warn(`[VRM] Failed to load expressions: ${e}`); return {}; });
 
         Promise.all([
             new Promise((resolve) => loader.load('/assets/mai.vrm', resolve)),
             new Promise((resolve) => loader.load('/assets/idle_loop.vrma', resolve)),
             Promise.all(motionPromises),
-            expressionsPromise,
-        ]).then(([vrmGltf, vrmaGltf, motionClips, facialExpressions]) => {
+        ]).then(([vrmGltf, vrmaGltf, motionClips]) => {
             const vrm = vrmGltf.userData.vrm;
             if (!vrm) { console.error('[VRM] No VRM data'); return; }
 
@@ -616,12 +615,8 @@ class CharacterRenderer {
             this.motionTime = 0;
             this.motionPlaying = false;
             console.log(`[VRM] Loaded ${this.motionClips.length} motion clips`);
-            
-            // Store facial expressions
-            this.facialExpressions = facialExpressions;
-            console.log(`[VRM] Loaded ${Object.keys(facialExpressions).length} facial expressions`);
-            
-            // Auto-play standby animation for natural idle movement
+
+            // Auto-play first motion for natural idle movement
             if (this.motionClips.length > 0) {
                 this.playMotion(0);
             }
@@ -681,27 +676,15 @@ class CharacterRenderer {
     }
 
     _updateMotion3(delta) {
-        if (!this.motionPlaying || !this.currentMotion || !this.vrm?.humanoid) return;
+        if (!this.motionPlaying || !this.currentMotion || !this.vrm?.expressionManager) return;
 
         this.motionTime += delta;
 
-        // Apply bone transforms from the animation
-        const boneNames = ['Hips', 'Spine', 'LeftUpperArm', 'RightUpperArm', 'LeftUpperLeg', 'RightUpperLeg', 'Neck'];
-        
-        for (const boneName of boneNames) {
-            const transform = this.currentMotion.getBoneTransform(boneName + '.position', this.motionTime);
-            const rotation = this.currentMotion.getBoneTransform(boneName + '.quaternion', this.motionTime);
-            
-            if (transform || rotation) {
-                const bone = this.vrm.humanoid.getNormalizedBoneNode(boneName.toLowerCase());
-                if (bone) {
-                    if (transform) {
-                        bone.position.copy(transform);
-                    }
-                    if (rotation) {
-                        bone.quaternion.copy(rotation);
-                    }
-                }
+        // Apply parameter curves to VRM model
+        for (const paramId of Object.keys(PARAM_MAP)) {
+            const value = this.currentMotion.evaluate(paramId, this.motionTime);
+            if (value !== null) {
+                this.vrm.expressionManager.setValue(paramId, value);
             }
         }
 
@@ -1466,6 +1449,7 @@ class CharacterRenderer {
 
     _animate() {
         requestAnimationFrame(() => this._animate());
+        if (!this.renderer) return; // Wait for async _init to complete
         const delta = Math.min(this.clock.getDelta(), 0.1);
         const elapsed = this.clock.getElapsedTime();
 
