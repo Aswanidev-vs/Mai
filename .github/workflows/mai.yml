@@ -1,0 +1,382 @@
+name: Mai Bot
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# IMPORTANT: For the bot to work, enable these in your repo:
+# 1. Settings > Actions > General > Workflow permissions > Read and write permissions
+# 2. Settings > Collaborators > Add bot with write access
+# 3. Ensure OPENCODE_API_KEY secret is set in Settings > Secrets
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  # ============================================================
+  # Job 1: Auto PR Review + Conflict Handling (on PR events)
+  # ============================================================
+  pr-auto-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git
+        run: |
+          git config user.name "Mai Bot"
+          git config user.email "mai-bot[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+
+      - name: Detect and resolve merge conflicts
+        id: conflicts
+        run: |
+          BASE_REF="${{ github.event.pull_request.base.ref }}"
+          PR_BRANCH="${{ github.event.pull_request.head.ref }}"
+
+          echo "Checking for merge conflicts with $BASE_REF..."
+
+          # Fetch the base branch
+          git fetch origin "$BASE_REF"
+
+          # Attempt merge to detect conflicts
+          if git merge --no-commit --no-ff "origin/$BASE_REF" 2>&1 | tee /tmp/merge_output.txt; then
+            echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
+            echo "No merge conflicts detected."
+          else
+            # Check for actual conflicts vs other merge errors
+            if grep -q "CONFLICT" /tmp/merge_output.txt; then
+              echo "has_conflicts=true" >> "$GITHUB_OUTPUT"
+              echo "Merge conflicts detected. Attempting auto-resolution..."
+
+              # Abort the failed merge
+              git merge --abort
+
+              # Attempt auto-resolution with strategy
+              git merge --no-edit -X theirs "origin/$BASE_REF" 2>&1 || true
+
+              # Check if conflicts remain
+              UNMERGED=$(git diff --name-only --diff-filter=U 2>/dev/null | wc -l)
+              if [ "$UNMERGED" -gt 0 ]; then
+                echo "auto_resolved=false" >> "$GITHUB_OUTPUT"
+                echo "Cannot auto-resolve all conflicts."
+                CONFLICTED_FILES=$(git diff --name-only --diff-filter=U | head -20)
+                echo "conflicted_files<<EOF" >> "$GITHUB_OUTPUT"
+                echo "$CONFLICTED_FILES" >> "$GITHUB_OUTPUT"
+                echo "EOF" >> "$GITHUB_OUTPUT"
+              else
+                echo "auto_resolved=true" >> "$GITHUB_OUTPUT"
+                echo "Conflicts auto-resolved successfully."
+
+                # Commit the resolution
+                git commit -m "resolve: auto-merge origin/$BASE_REF - Automated conflict resolution by Mai Bot. Please review before merging."
+
+                # Push to PR branch
+                git push origin "HEAD:$PR_BRANCH"
+              fi
+            else
+              echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
+              echo "Merge failed but no conflicts detected (other error)."
+            fi
+          fi
+
+      - name: Post conflict resolution comment
+        if: steps.conflicts.outputs.has_conflicts == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const autoResolved = '${{ steps.conflicts.outputs.auto_resolved }}';
+            const conflictedFiles = `${{ steps.conflicts.outputs.conflicted_files }}`;
+            const baseRef = '${{ github.event.pull_request.base.ref }}';
+            const prNumber = context.payload.pull_request.number;
+
+            let body;
+            if (autoResolved === 'true') {
+              body = `## Mai Bot - Conflict Resolution
+
+            **Status**: Conflicts auto-resolved
+
+            Merge conflicts with \`${baseRef}\` have been automatically resolved.
+            A new commit has been pushed to this PR with the resolution.
+
+            **Please review the changes before merging.**
+            `;
+            } else {
+              body = `## Mai Bot - Conflict Resolution
+
+            **Status**: Manual resolution required
+
+            Merge conflicts with \`${baseRef}\` could not be automatically resolved.
+
+            ### Conflicting Files
+            \`\`\`
+            ${conflictedFiles}
+            \`\`\`
+
+            ### How to resolve
+            1. Pull the latest changes: \`git pull origin ${baseRef}\`
+            2. Resolve conflicts in your editor
+            3. Commit and push the resolution
+
+            Or use the \`/resolve\` command for AI-assisted resolution.
+            `;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: body
+            });
+
+      - name: Run Mai AI review
+        id: review
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: opencode/deepseek-v4-flash-free
+          prompt: |
+            You are an expert code reviewer. Review this pull request and provide feedback.
+
+            Analyze the diff and:
+            1. Identify bugs, security issues, and logic errors
+            2. Check for code style and formatting issues
+            3. Look for unused imports, variables, and dead code
+            4. Verify error handling and edge cases
+            5. Check for performance issues
+            6. Ensure Go best practices are followed (if Go code)
+
+            Format your response as:
+            - SUMMARY: One-line assessment
+            - ISSUES: List each issue with file:line and description
+            - AUTO_FIXABLE: Issues that can be automatically fixed
+            - VERDICT: APPROVE, REQUEST_CHANGES, or NEEDS_DISCUSSION
+
+      - name: Post review comment
+        if: steps.review.outputs.result != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const reviewResult = `${{ steps.review.outputs.result }}`;
+            const prNumber = context.payload.pull_request.number;
+
+            // Parse the review result
+            const lines = reviewResult.split('\n');
+            let summary = '';
+            let issues = [];
+            let autoFixable = [];
+            let verdict = 'NEEDS_DISCUSSION';
+
+            for (const line of lines) {
+              if (line.startsWith('SUMMARY:')) {
+                summary = line.replace('SUMMARY:', '').trim();
+              } else if (line.startsWith('ISSUES:')) {
+                // Issues will follow
+              } else if (line.startsWith('AUTO_FIXABLE:')) {
+                // Auto-fixable issues will follow
+              } else if (line.startsWith('VERDICT:')) {
+                verdict = line.replace('VERDICT:', '').trim();
+              } else if (line.match(/^\d+\./)) {
+                issues.push(line);
+              }
+            }
+
+            // Format verdict
+            let verdictText = 'Request Changes';
+            if (verdict.includes('APPROVE')) {
+              verdictText = 'Approve';
+            } else if (verdict.includes('NEEDS_DISCUSSION')) {
+              verdictText = 'Needs Discussion';
+            }
+
+            const body = `## Mai Bot Review
+
+            **Summary**: ${summary || 'Review completed'}
+
+            ### Issues Found
+            ${issues.length > 0 ? issues.map(i => i).join('\n') : 'No issues found.'}
+
+            ### Auto-Fixed
+            Check the commits on this PR for any automatic fixes applied.
+
+            ### Verdict
+            **${verdictText}**
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: body
+            });
+
+  # ============================================================
+  # Job 2: Slash Command Handler (on comment events)
+  # ============================================================
+  command-handler:
+    if: |
+      github.event_name == 'issue_comment' ||
+      github.event_name == 'pull_request_review_comment'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git
+        run: |
+          git config user.name "Mai Bot"
+          git config user.email "mai-bot[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+
+      - name: Parse command
+        id: command
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commentBody = context.payload.comment.body;
+            let command = 'mai'; // default
+            let args = '';
+
+            if (commentBody.includes('/review')) {
+              command = 'review';
+              args = commentBody.replace(/.*\/review\s*/, '').trim();
+            } else if (commentBody.includes('/fix')) {
+              command = 'fix';
+              args = commentBody.replace(/.*\/fix\s*/, '').trim();
+            } else if (commentBody.includes('/resolve')) {
+              command = 'resolve';
+              args = commentBody.replace(/.*\/resolve\s*/, '').trim();
+            } else if (commentBody.includes('/mai')) {
+              command = 'mai';
+              args = commentBody.replace(/.*\/mai\s*/, '').trim();
+            }
+
+            core.setOutput('command', command);
+            core.setOutput('args', args);
+
+      - name: Handle /mai command
+        if: steps.command.outputs.command == 'mai'
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: opencode/deepseek-v4-flash-free
+
+      - name: Handle /review command
+        if: steps.command.outputs.command == 'review'
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: opencode/deepseek-v4-flash-free
+          prompt: |
+            Perform a thorough code review of this PR.
+            Analyze the code changes and provide detailed feedback on:
+            - Bugs and potential issues
+            - Code quality and maintainability
+            - Security concerns
+            - Performance implications
+            - Go best practices (if applicable)
+            Format as a detailed review with file:line references.
+
+      - name: Handle /fix command
+        if: steps.command.outputs.command == 'fix'
+        run: |
+          ARGS="${{ steps.command.outputs.args }}"
+          echo "Fix command received with args: $ARGS"
+
+          # Get the PR number from context
+          PR_NUMBER="${{ github.event.issue.number }}"
+
+          # Get the PR diff
+          DIFF=$(gh pr diff "$PR_NUMBER" 2>/dev/null || echo "")
+
+          if [ -z "$DIFF" ]; then
+            echo "No diff available or not a PR context."
+            exit 0
+          fi
+
+          # The opencode action will handle the actual fix logic
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Mai for /fix
+        if: steps.command.outputs.command == 'fix'
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: opencode/deepseek-v4-flash-free
+          prompt: |
+            Fix the issues mentioned in this comment.
+            Analyze the code, identify the problems, and apply fixes.
+            Commit any changes with descriptive commit messages.
+            The user asked: ${{ steps.command.outputs.args }}
+
+      - name: Handle /resolve command
+        if: steps.command.outputs.command == 'resolve'
+        run: |
+          PR_NUMBER="${{ github.event.issue.number }}"
+          PR_BRANCH=$(gh pr view "$PR_NUMBER" --json headRefName --jq '.headRefName' 2>/dev/null)
+          BASE_BRANCH=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName' 2>/dev/null)
+
+          if [ -z "$PR_BRANCH" ] || [ -z "$BASE_BRANCH" ]; then
+            echo "Could not determine PR branches."
+            exit 0
+          fi
+
+          echo "Attempting to resolve conflicts between $PR_BRANCH and $BASE_BRANCH..."
+
+          # Fetch and attempt merge
+          git fetch origin "$BASE_BRANCH"
+
+          if git merge --no-commit --no-ff "origin/$BASE_BRANCH" 2>&1 | grep -q "CONFLICT"; then
+            echo "Conflicts detected, attempting auto-resolution..."
+            git merge --abort
+            git merge --no-edit -X theirs "origin/$BASE_BRANCH" 2>&1 || true
+
+            UNMERGED=$(git diff --name-only --diff-filter=U 2>/dev/null | wc -l)
+            if [ "$UNMERGED" -gt 0 ]; then
+              echo "::warning::Cannot auto-resolve all conflicts. Manual intervention required."
+            else
+              git commit -m "resolve: auto-merge origin/$BASE_BRANCH - AI-assisted conflict resolution by Mai Bot. Please review before merging."
+              git push origin "HEAD:$PR_BRANCH"
+              echo "Conflicts resolved and pushed."
+            fi
+          else
+            echo "No conflicts found."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Mai for /resolve
+        if: steps.command.outputs.command == 'resolve'
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: opencode/deepseek-v4-flash-free
+          prompt: |
+            Help resolve merge conflicts in this PR.
+            Analyze the conflicting changes and suggest the best resolution.
+            If possible, apply the resolution and commit.
