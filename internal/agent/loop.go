@@ -495,7 +495,7 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 
 	fullPrompt := o.promptEngine.BuildPrompt(promptCtx)
 
-	response, err := o.llm.Generate(ctx, fullPrompt, interfaces.GenerationOptions{})
+	response, err := o.llm.Generate(ctx, fullPrompt, interfaces.GenerationOptions{Temperature: 0.4})
 	if err != nil {
 		return nil, err
 	}
@@ -572,7 +572,7 @@ func (o *Orchestrator) handleMultiStep(ctx context.Context, text string) (*inter
 				o.meta.RecordActionResult(true)
 			}
 		} else {
-			response, err := o.llm.Generate(ctx, task.Description, interfaces.GenerationOptions{})
+			response, err := o.llm.Generate(ctx, task.Description, interfaces.GenerationOptions{Temperature: 0.4})
 			if err == nil {
 				results = append(results, fmt.Sprintf("DONE (%s): %s", task.Description, response))
 				o.planner.MarkCompleted(plan, task.ID)

@@ -910,6 +910,11 @@ func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt strin
 		"prompt": prompt,
 		"system": cfg.LLM.SystemPrompt,
 		"stream": false,
+		"options": map[string]interface{}{
+			"temperature": 0.4,
+			"top_p":       0.9,
+			"num_predict": 256,
+		},
 	})
 
 	log.Printf("[OLLAMA] Requesting response from %s...", cfg.LLM.Model)

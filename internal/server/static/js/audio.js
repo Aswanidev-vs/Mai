@@ -1,4 +1,4 @@
-// Audio playback with queue-based sequential playback and lip-sync hooks
+// Audio playback with overlap-add smooth streaming and lip-sync hooks
 
 class AudioPlayer {
     constructor() {
@@ -8,12 +8,16 @@ class AudioPlayer {
         this.playing = false;
         this.onSpeakingStart = null;
         this.onSpeakingEnd = null;
-        this._currentSource = null;
         this._draining = false;
 
         // Playback clock for viseme-accurate lip sync
-        this._utteranceStartCtx = null; // AudioContext.currentTime when current utterance began
-        this._knownDuration = 0;        // cumulative seconds of queued audio for current utterance
+        this._utteranceStartCtx = null;
+        this._knownDuration = 0;
+
+        // Overlap-add scheduling
+        this._nextStartTime = 0;       // AudioContext time when next chunk should start
+        this._crossfadeMs = 40;        // 40ms crossfade between chunks
+        this._activeSources = [];      // Track active sources for cleanup
     }
 
     init() {
@@ -34,7 +38,7 @@ class AudioPlayer {
         }
     }
 
-    // Queue a chunk for sequential playback
+    // Queue a chunk for smooth sequential playback
     queueChunk(base64Audio, sampleRate, done) {
         if (!this.audioContext) this.init();
         this.resume();
@@ -57,9 +61,9 @@ class AudioPlayer {
         // Signal speaking start
         if (!this.playing && this.queue.length > 0) {
             this.playing = true;
-            // Mark utterance start time on the audio clock for viseme playhead
             if (this.audioContext) {
                 this._utteranceStartCtx = this.audioContext.currentTime;
+                this._nextStartTime = this.audioContext.currentTime;
             }
             if (this.onSpeakingStart) this.onSpeakingStart();
         }
@@ -67,24 +71,29 @@ class AudioPlayer {
         while (this.queue.length > 0) {
             const chunk = this.queue.shift();
             try {
-                await this._playRaw(chunk.base64Audio, chunk.sampleRate);
+                await this._playSmooth(chunk.base64Audio, chunk.sampleRate);
             } catch (e) {
                 console.error('[Audio] Chunk play error:', e);
             }
 
-            // If this was the final chunk and queue is empty, end speaking
             if (chunk.done && this.queue.length === 0) {
                 break;
             }
         }
 
+        // Wait for the last source to finish
+        await this._waitForLastSource();
+
         this.playing = false;
         this._draining = false;
         this._utteranceStartCtx = null;
+        this._nextStartTime = 0;
         if (this.onSpeakingEnd) this.onSpeakingEnd();
     }
 
-    _playRaw(base64Audio, sampleRate) {
+    // Smooth overlap-add playback — schedules chunk on AudioContext timeline
+    // with crossfade gain to eliminate gaps between chunks
+    _playSmooth(base64Audio, sampleRate) {
         return new Promise((resolve, reject) => {
             try {
                 const binaryString = atob(base64Audio);
@@ -93,30 +102,74 @@ class AudioPlayer {
                     bytes[i] = binaryString.charCodeAt(i);
                 }
 
-                // Convert int16 PCM to float32
                 const int16Array = new Int16Array(bytes.buffer);
                 const float32Array = new Float32Array(int16Array.length);
                 for (let i = 0; i < int16Array.length; i++) {
                     float32Array[i] = int16Array[i] / 32768.0;
                 }
 
-                const audioBuffer = this.audioContext.createBuffer(1, float32Array.length, sampleRate || 24000);
+                const sr = sampleRate || 24000;
+                const audioBuffer = this.audioContext.createBuffer(1, float32Array.length, sr);
                 audioBuffer.getChannelData(0).set(float32Array);
 
                 const source = this.audioContext.createBufferSource();
                 source.buffer = audioBuffer;
-                source.connect(this.analyser);
-                this._currentSource = source;
+
+                // Gain node for crossfade
+                const gainNode = this.audioContext.createGain();
+                source.connect(gainNode);
+                gainNode.connect(this.analyser);
+
+                // Schedule start time: either now or at the previously planned end
+                const now = this.audioContext.currentTime;
+                const startTime = Math.max(this._nextStartTime, now);
+                const chunkDuration = float32Array.length / sr;
+                const crossfade = this._crossfadeMs / 1000;
+
+                // Crossfade in (first 40ms of this chunk)
+                gainNode.gain.setValueAtTime(0, startTime);
+                gainNode.gain.linearRampToValueAtTime(1, startTime + crossfade);
+
+                // Crossfade out (last 40ms of this chunk) — only if more chunks coming
+                if (this.queue.length > 0 || !this._isLastChunk()) {
+                    const fadeOutStart = startTime + chunkDuration - crossfade;
+                    gainNode.gain.setValueAtTime(1, fadeOutStart);
+                    gainNode.gain.linearRampToValueAtTime(0, startTime + chunkDuration);
+                }
+
+                // Schedule the next chunk to start slightly before this one ends
+                this._nextStartTime = startTime + chunkDuration - crossfade;
+
+                source.start(startTime);
+
+                // Track for cleanup
+                const srcInfo = { source, gainNode };
+                this._activeSources.push(srcInfo);
 
                 source.onended = () => {
-                    this._currentSource = null;
+                    // Clean up
+                    const idx = this._activeSources.indexOf(srcInfo);
+                    if (idx >= 0) this._activeSources.splice(idx, 1);
+                    try { gainNode.disconnect(); } catch (e) { /* already disconnected */ }
                     resolve();
                 };
-                source.start();
             } catch (e) {
                 reject(e);
             }
         });
+    }
+
+    _isLastChunk() {
+        // Check if this is the last chunk being processed (queue empty and no more coming)
+        return this.queue.length === 0;
+    }
+
+    async _waitForLastSource() {
+        // Wait up to 500ms for the last active source to finish
+        const deadline = performance.now() + 500;
+        while (this._activeSources.length > 0 && performance.now() < deadline) {
+            await new Promise(r => setTimeout(r, 10));
+        }
     }
 
     // Legacy: direct play without queue (for backwards compat)
@@ -131,7 +184,6 @@ class AudioPlayer {
                 bytes[i] = binaryString.charCodeAt(i);
             }
 
-            // Convert int16 PCM to float32
             const int16Array = new Int16Array(bytes.buffer);
             const float32Array = new Float32Array(int16Array.length);
             for (let i = 0; i < int16Array.length; i++) {
@@ -163,24 +215,25 @@ class AudioPlayer {
 
     stop() {
         this.queue = [];
-        if (this._currentSource) {
-            try { this._currentSource.stop(); } catch (e) { /* already stopped */ }
-            this._currentSource = null;
+        // Stop all active sources
+        for (const src of this._activeSources) {
+            try { src.source.stop(); } catch (e) { /* already stopped */ }
+            try { src.gainNode.disconnect(); } catch (e) { /* already disconnected */ }
         }
+        this._activeSources = [];
         this.playing = false;
         this._draining = false;
         this._utteranceStartCtx = null;
         this._knownDuration = 0;
+        this._nextStartTime = 0;
     }
 
     // ── Lip-sync playback clock ──
-    // Seconds elapsed since the current utterance started playing.
     getPlayhead() {
         if (this._utteranceStartCtx === null || !this.audioContext) return 0;
         return Math.max(0, this.audioContext.currentTime - this._utteranceStartCtx);
     }
 
-    // Cumulative seconds of audio queued for the current utterance.
     getKnownDuration() {
         return this._knownDuration;
     }
