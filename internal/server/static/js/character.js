@@ -593,12 +593,20 @@ class CharacterRenderer {
             this.scene.add(this.vrmGroup);
 
             vrm.springBoneManager?.reset();
-            // Optimize spring bones for performance
+            // Tune spring bones for realistic hair movement
             if (vrm.springBoneManager) {
                 vrm.springBoneManager.colliderGroups.forEach(group => {
                     group.colliders.forEach(collider => {
-                        if (collider.radius) collider.radius *= 0.9; // Slightly reduce collider size
+                        if (collider.radius) collider.radius *= 0.9;
                     });
+                });
+                // Reduce stiffness on all spring bone joints for more fluid motion
+                vrm.springBoneManager.joints.forEach(joint => {
+                    if (joint.settings) {
+                        joint.settings.stiffness *= 0.6;
+                        joint.settings.dragForce *= 0.85;
+                        joint.settings.gravityPower *= 1.3;
+                    }
                 });
             }
             this.vrmGroup.updateMatrixWorld(true);
@@ -1452,6 +1460,50 @@ class CharacterRenderer {
         if (rightHand) rightHand.rotation.z += Math.sin(elapsed * 0.35) * 0.002;
     }
 
+    // ── Procedural Hair Sway ──
+    // Adds ambient wind/drift on top of spring bone physics for realistic hair movement
+    _updateHairSway(elapsed, delta) {
+        if (!this.vrm?.humanoid) return;
+        const h = this.vrm.humanoid;
+
+        // Multi-frequency wind layers for organic feel
+        const wind1 = Math.sin(elapsed * 0.7) * 0.008;   // Slow, broad sway
+        const wind2 = Math.sin(elapsed * 1.3 + 0.5) * 0.004; // Medium flutter
+        const wind3 = Math.sin(elapsed * 2.1 + 1.2) * 0.002; // Fast micro-tremor
+        const windX = wind1 + wind2 + wind3;
+        const windZ = Math.sin(elapsed * 0.9 + 0.8) * 0.005 + Math.sin(elapsed * 1.7) * 0.003;
+
+        // Head movement influence — hair follows head with delay
+        const headNode = h.getNormalizedBoneNode('head');
+        const headVelX = headNode ? headNode.rotation.y * 0.15 : 0;
+        const headVelZ = headNode ? headNode.rotation.x * 0.1 : 0;
+
+        // Apply to hair-related bones
+        const hairBones = [
+            'leftHair', 'rightHair', 'frontHair', 'backHair',
+            'leftLowerArm', 'rightLowerArm', // subtle cloth/hair chain effect
+        ];
+
+        for (const boneName of hairBones) {
+            const node = h.getNormalizedBoneNode(boneName);
+            if (!node) continue;
+
+            // Hair sway — multiple frequencies + head influence
+            const swayX = (windX + headVelX) * (boneName.includes('Hair') ? 1.0 : 0.3);
+            const swayZ = (windZ + headVelZ) * (boneName.includes('Hair') ? 0.7 : 0.2);
+
+            node.rotation.x += swayZ;
+            node.rotation.z += swayX;
+        }
+
+        // Ahoge (antenna hair) — extra bouncy, independent motion
+        // The ahoge is typically a child bone of the head
+        if (headNode) {
+            const ahogeBounce = Math.sin(elapsed * 2.5) * 0.012 + Math.sin(elapsed * 4.1) * 0.006;
+            headNode.rotation.x += ahogeBounce * 0.3;
+        }
+    }
+
     // ── Speech Body Animation (Phase 3) ──
     // Natural head nods, breathing sync, and body movement during speech
     _updateSpeechBody(delta, elapsed) {
@@ -1547,10 +1599,11 @@ class CharacterRenderer {
             this._updateGaze(delta);              // gaze last so it owns the lookAt target
 
             this.vrm.humanoid?.update();
-            // Reduce spring bone update frequency for performance
-            if (Math.floor(elapsed * 60) % 2 === 0) { // Update at 30fps instead of 60fps
-                this.vrm.springBoneManager?.update(delta * 2);
-            }
+            // Update spring bones every frame for smooth hair physics
+            this.vrm.springBoneManager?.update(delta);
+
+            // Procedural hair sway — adds ambient wind/drift on top of spring physics
+            this._updateHairSway(elapsed, delta);
 
             this._updateBlink(delta);
             this._updateExpressions(delta);
