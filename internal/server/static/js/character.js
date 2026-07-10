@@ -788,9 +788,11 @@ class CharacterRenderer {
         const phase = clamp(playhead / this.visemeDuration, 0, 1);
         const seg = visemeSegmentAt(this.visemeSchedule, phase);
 
-        // Real voice amplitude (time-domain RMS)
+        // Real voice amplitude — non-linear perceptual response curve
         const rms = this._computeRMS();
-        const amp = Math.min(rms * 0.9, 1) ** 0.7;
+        // 0.55 exponent: more responsive at low volumes (whisper visible),
+        // 1.2 multiplier: compensates at high volumes for natural emphasis
+        const amp = Math.pow(Math.min(rms * 1.2, 1), 0.55);
         const gate = energyGate(rms, LIP_SILENCE_VOL, 0.10);
 
         // Map current viseme to vowel
@@ -1345,6 +1347,9 @@ class CharacterRenderer {
     prepareVisemes(text) {
         const sched = buildVisemeSchedule(text);
         this.visemeSchedule = sched.segments;
+        // Store for sentence pitch contour detection
+        this._lastUtteranceText = text;
+        this._lastUtteranceEndsWithQuestion = /[?]$/.test(text.trim()) || /[？]$/.test(text.trim());
     }
 
     setVisemeDuration(d) {
@@ -1447,6 +1452,88 @@ class CharacterRenderer {
         if (rightHand) rightHand.rotation.z += Math.sin(elapsed * 0.35) * 0.002;
     }
 
+    // ── Speech Body Animation (Phase 3) ──
+    // Natural head nods, breathing sync, and body movement during speech
+    _updateSpeechBody(delta, elapsed) {
+        if (!this.speaking || !this.vrm?.humanoid) return;
+        const h = this.vrm.humanoid;
+
+        // RMS amplitude drives speech intensity
+        const rms = this._computeRMS();
+        const intensity = Math.min(rms * 2, 1); // 0..1 speech intensity
+
+        // Head nod on emphasis (high amplitude = forward nod)
+        if (intensity > 0.4) {
+            const nodAmount = (intensity - 0.4) * 0.05; // max 0.03 rad
+            const head = h.getNormalizedBoneNode('head');
+            if (head) head.rotation.x += nodAmount * Math.sin(elapsed * 6);
+        }
+
+        // Subtle head tilt on questions (detected by viseme schedule ending)
+        if (this.visemeSchedule && this.visemeDuration > 0) {
+            const playhead = this.audioPlayer ? this.audioPlayer.getPlayhead() : 0;
+            const phase = playhead / this.visemeDuration;
+            // In the last 20% of speech, check if utterance ends with question
+            if (phase > 0.8 && this._lastUtteranceEndsWithQuestion) {
+                const head = h.getNormalizedBoneNode('head');
+                if (head) head.rotation.z += 0.015 * (phase - 0.8) * 5; // gentle tilt
+            }
+        }
+
+        // Breathing increases during speech (using air to speak)
+        // Already handled by _updateIdle's breathScale — just boost it
+        this.breathScale = Math.max(this.breathScale, 1.2);
+
+        // Subtle shoulder lift during louder passages
+        if (intensity > 0.3) {
+            const lift = (intensity - 0.3) * 0.015;
+            const leftShoulder = h.getNormalizedBoneNode('leftShoulder');
+            const rightShoulder = h.getNormalizedBoneNode('rightShoulder');
+            if (leftShoulder) leftShoulder.rotation.x += lift;
+            if (rightShoulder) rightShoulder.rotation.x += lift;
+        }
+
+        // Hand gesture during expressive moments (amplitude spikes)
+        if (intensity > 0.6) {
+            const gesture = Math.sin(elapsed * 4) * 0.015 * (intensity - 0.6);
+            const leftHand = h.getNormalizedBoneNode('leftHand');
+            const rightHand = h.getNormalizedBoneNode('rightHand');
+            if (leftHand) leftHand.rotation.z += gesture;
+            if (rightHand) rightHand.rotation.z -= gesture;
+        }
+    }
+
+    // ── Sentence Pitch Contour (Phase 5) ──
+    // Adds natural intonation to head movement based on sentence type
+    _updateSentencePitch(delta) {
+        if (!this.speaking || !this.vrm?.humanoid) return;
+
+        const playhead = this.audioPlayer ? this.audioPlayer.getPlayhead() : 0;
+        const phase = this.visemeDuration > 0 ? playhead / this.visemeDuration : 0;
+
+        // Detect sentence type from last prepared text
+        const text = this._lastUtteranceText || '';
+        const endsWithQuestion = /[?]$/.test(text.trim()) || /[？]$/.test(text.trim());
+        const endsWithExclamation = /[!]$/.test(text.trim()) || /[！]$/.test(text.trim());
+
+        if (endsWithQuestion) {
+            // Questions: head tilts UP at the end
+            const rise = Math.max(0, phase - 0.7) / 0.3; // 0..1 in last 30%
+            const head = this.vrm.humanoid.getNormalizedBoneNode('head');
+            if (head) head.rotation.x -= rise * 0.025; // pitch up (negative = up)
+        } else if (endsWithExclamation) {
+            // Exclamations: head lifts with energy
+            const lift = Math.max(0, phase - 0.8) / 0.2;
+            const head = this.vrm.humanoid.getNormalizedBoneNode('head');
+            if (head) head.rotation.x -= lift * 0.02;
+        } else {
+            // Statements: head nods down at the end
+            const drop = Math.max(0, phase - 0.8) / 0.2;
+            const head = this.vrm.humanoid.getNormalizedBoneNode('head');
+            if (head) head.rotation.x += drop * 0.015;
+        }
+    }
+
     _animate() {
         requestAnimationFrame(() => this._animate());
         if (!this.renderer) return; // Wait for async _init to complete
@@ -1470,6 +1557,8 @@ class CharacterRenderer {
             this._updateMicroExpressions(delta);
             this._updateSpontaneousSmile(delta);
             this._updateLipSync(delta);
+            this._updateSpeechBody(delta, elapsed);
+            this._updateSentencePitch(delta);
             this._updateMotion3(delta);
 
             this.vrm.expressionManager?.update();

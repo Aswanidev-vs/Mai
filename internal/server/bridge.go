@@ -55,7 +55,8 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		audio, _ := event.Payload["audio"].(string)
 		sampleRate, _ := event.Payload["sample_rate"].(int)
 		done, _ := event.Payload["done"].(bool)
-		if audio == "" {
+		// Skip empty non-done chunks, but always forward done signals
+		if audio == "" && !done {
 			return
 		}
 		if sampleRate == 0 {
