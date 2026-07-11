@@ -705,8 +705,9 @@ func (a *Automation) PlayMedia(platform, query, browser string) error {
 			return err
 		}
 
-		// Wait for browser to open and load search results
-		time.Sleep(4 * time.Second)
+		// Wait for browser to open and fully load search results.
+		// 7s gives enough time for slow connections and heavy YouTube pages.
+		time.Sleep(7 * time.Second)
 
 		// Focus the browser window using the known window title
 		if browser != "" {
@@ -719,7 +720,7 @@ func (a *Automation) PlayMedia(platform, query, browser string) error {
 		} else {
 			robotgo.ActiveName("YouTube")
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(1 * time.Second)
 
 		return a.clickFirstYouTubeVideo()
 	}
@@ -744,7 +745,7 @@ func (a *Automation) clickFirstYouTubeVideo() error {
 	clickY := screenH * 35 / 100
 	log.Printf("[AUTO] Strategy 1: Clicking first video thumbnail at (%d, %d) on %dx%d screen", clickX, clickY, screenW, screenH)
 	a.MouseClick(clickX, clickY)
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	// Strategy 2: Tab-navigate from the search bar to the first video link.
 	// On YouTube search results, pressing Tab from the page body cycles through

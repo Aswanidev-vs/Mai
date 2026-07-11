@@ -5,9 +5,9 @@
 # --------------------------------------------
 # Local Configuration (machine-specific paths)
 # --------------------------------------------
-config.yaml
-config.txt
 
+config.txt
+node_modules/
 # --------------------------------------------
 # Go Build Artifacts
 # --------------------------------------------
@@ -63,7 +63,7 @@ sherpa-onnx-nemo-parakeet-*/
 sherpa-onnx-nemotron-speech-streaming-*/
 sherpa-onnx-pocket-tts-*/
 sherpa-onnx-streaming-zipformer-en-*/
-sherpa-onnx-supertonic-tts-*/
+sherpa-onnx-supertonic-*/
 sherpa-onnx-zipvoice-distill-*/
 sherpa-onnx-qwen3-asr-0.6B-int8-*/
 sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/
@@ -128,3 +128,12 @@ recordings/
 models/
 TODO.md
 .env
+
+#Ignore vscode AI rules
+.github\instructions\codacy.instructions.md
+
+data/user_profile.json
+dlib-20.0.zip
+faceai/
+.mimocode/
+refer/

@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"math"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gen2brain/malgo"
@@ -95,13 +99,127 @@ func (c *audioCapture) onRecvFrames(_, pSample []byte, frameCount uint32) {
 	c.onSamples(samples)
 }
 
-// playAudio plays float32 samples through the default output device.
-func playAudio(samples []float32, sampleRate int) error {
-	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
+// playAudioStreaming plays TTS chunks as they arrive on a channel.
+// The generator function is called in a goroutine and should send
+// float32 sample slices into the returned channel, then close it when done.
+// Returns once the channel is closed and all buffered audio has been played.
+func playAudioStreaming(ctx context.Context, sampleRate int, stop *int32, generate func(ch chan<- []float32)) error {
+	ch := make(chan []float32, 64)
+
+	// Run the TTS generator in a goroutine.
+	go func() {
+		defer close(ch)
+		generate(ch)
+	}()
+
+	devCtx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
 	if err != nil {
 		return err
 	}
-	defer ctx.Free()
+	defer devCtx.Free()
+
+	deviceConfig := malgo.DefaultDeviceConfig(malgo.Playback)
+	deviceConfig.Playback.Format = malgo.FormatS16
+	deviceConfig.Playback.Channels = 1
+	deviceConfig.SampleRate = uint32(sampleRate)
+
+	var mu sync.Mutex
+	var buf []float32
+	var readIdx int
+	var streamDone bool
+
+	onSamples := func(pOutputSample, _ []byte, frameCount uint32) {
+		if stop != nil && atomic.LoadInt32(stop) != 0 {
+			return
+		}
+		mu.Lock()
+		n := int(frameCount)
+		written := 0
+		for written < n {
+			if readIdx >= len(buf) {
+				if streamDone {
+					break
+				}
+				mu.Unlock()
+				time.Sleep(time.Millisecond)
+				mu.Lock()
+				continue
+			}
+			s := buf[readIdx]
+			readIdx++
+			s16 := int16(s * 32767.0)
+			pOutputSample[written*2] = byte(s16 & 0xFF)
+			pOutputSample[written*2+1] = byte(s16 >> 8)
+			written++
+		}
+		// Trim consumed data periodically to avoid unbounded growth.
+		if readIdx > 8192 && readIdx > len(buf)/2 {
+			buf = buf[readIdx:]
+			readIdx = 0
+		}
+		mu.Unlock()
+	}
+
+	device, err := malgo.InitDevice(devCtx.Context, deviceConfig, malgo.DeviceCallbacks{Data: onSamples})
+	if err != nil {
+		return err
+	}
+	defer device.Uninit()
+
+	if err := device.Start(); err != nil {
+		return err
+	}
+
+	// Drain channel into the shared buffer.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for chunk := range ch {
+			if stop != nil && atomic.LoadInt32(stop) != 0 {
+				return
+			}
+			mu.Lock()
+			buf = append(buf, chunk...)
+			mu.Unlock()
+		}
+		mu.Lock()
+		streamDone = true
+		mu.Unlock()
+	}()
+
+	// Wait for generation to finish.
+	<-done
+
+	// Wait for playback to drain.
+	for {
+		mu.Lock()
+		remaining := len(buf) - readIdx
+		mu.Unlock()
+		if remaining <= 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if stop != nil && atomic.LoadInt32(stop) != 0 {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return nil
+}
+
+// playAudio plays float32 samples through the default output device.
+// It can be interrupted midway via ctx cancellation or the stop flag.
+func playAudio(ctx context.Context, samples []float32, sampleRate int, stop *int32) error {
+	devCtx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
+	if err != nil {
+		return err
+	}
+	defer devCtx.Free()
 
 	deviceConfig := malgo.DefaultDeviceConfig(malgo.Playback)
 	deviceConfig.Playback.Format = malgo.FormatS16
@@ -110,6 +228,9 @@ func playAudio(samples []float32, sampleRate int) error {
 
 	var playbackIndex int
 	onSamples := func(pOutputSample, _ []byte, frameCount uint32) {
+		if stop != nil && atomic.LoadInt32(stop) != 0 {
+			return // Stop playback immediately on barge-in
+		}
 		n := int(frameCount)
 		for i := 0; i < n; i++ {
 			if playbackIndex >= len(samples) {
@@ -122,7 +243,7 @@ func playAudio(samples []float32, sampleRate int) error {
 		}
 	}
 
-	device, err := malgo.InitDevice(ctx.Context, deviceConfig, malgo.DeviceCallbacks{Data: onSamples})
+	device, err := malgo.InitDevice(devCtx.Context, deviceConfig, malgo.DeviceCallbacks{Data: onSamples})
 	if err != nil {
 		return err
 	}
@@ -132,10 +253,34 @@ func playAudio(samples []float32, sampleRate int) error {
 		return err
 	}
 
+	// Poll loop with context awareness and stop flag support
 	for playbackIndex < len(samples) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if stop != nil && atomic.LoadInt32(stop) != 0 {
+			return nil
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	return nil
+}
+
+// generateThinkingChime creates a short 440Hz sine wave tone for the thinking indicator.
+// Duration ~80ms, amplitude ~-12dB (0.25) to be subtle.
+func generateThinkingChime(sampleRate int) []float32 {
+	duration := 0.08 // 80ms
+	numSamples := int(float64(sampleRate) * duration)
+	samples := make([]float32, numSamples)
+	for i := 0; i < numSamples; i++ {
+		t := float64(i) / float64(sampleRate)
+		// Sine wave at 440Hz with a quick fade-out envelope
+		envelope := 1.0 - float64(i)/float64(numSamples)
+		samples[i] = float32(0.25 * math.Sin(2*math.Pi*440*t) * envelope)
+	}
+	return samples
 }
 

@@ -55,9 +55,20 @@ func (s *EpisodicStore) StoreEvent(entry interfaces.MemoryEntry) error {
 }
 
 func (s *EpisodicStore) QueryEvents(queryStr string, limit int) ([]interfaces.MemoryEntry, error) {
-	// Simple query for now, ignoring queryStr and just returning latest events
-	// In a real implementation, we would use FTS5 for queryStr searching
-	rows, err := s.db.Query(`SELECT id, type, content, metadata, timestamp FROM events ORDER BY timestamp DESC LIMIT ?`, limit)
+	var rows *sql.Rows
+	var err error
+
+	if queryStr != "" {
+		// Use FTS5 if available, fall back to LIKE on content
+		rows, err = s.db.Query(
+			`SELECT id, type, content, metadata, timestamp FROM events
+			 WHERE content LIKE '%' || ? || '%' AND content != ''
+			 ORDER BY timestamp DESC LIMIT ?`, queryStr, limit)
+	} else {
+		rows, err = s.db.Query(
+			`SELECT id, type, content, metadata, timestamp FROM events
+			 ORDER BY timestamp DESC LIMIT ?`, limit)
+	}
 	if err != nil {
 		return nil, err
 	}

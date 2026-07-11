@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/user/mai/pkg/interfaces"
 )
@@ -24,6 +25,7 @@ type ReActLoop struct {
 	llm           interfaces.LLMProvider
 	registry      interfaces.ToolRegistry
 	memory        interfaces.WorkingMemory
+	verifier      *Verifier
 	maxIterations int
 }
 
@@ -32,7 +34,8 @@ func NewReActLoop(llm interfaces.LLMProvider, registry interfaces.ToolRegistry, 
 		llm:           llm,
 		registry:      registry,
 		memory:        memory,
-		maxIterations: 5,
+		verifier:      NewVerifier(llm),
+		maxIterations: 3, // 3 is sufficient — most tasks resolve in 1-2 iterations
 	}
 }
 
@@ -47,7 +50,24 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 	}
 	callHistory := []toolCall{}
 
+	// Apply per-iteration timeout — a single ReAct cycle should not hang forever
+	iterCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		iterCtx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
+
 	for i := 0; i < r.maxIterations; i++ {
+		// Check context cancellation
+		select {
+		case <-iterCtx.Done():
+			if toolCalled && len(steps) > 0 {
+				return steps[len(steps)-1].Observation, nil
+			}
+			return "", fmt.Errorf("ReAct loop cancelled: %w", iterCtx.Err())
+		default:
+		}
 		// 1. Build the prompt
 		prompt := r.buildPrompt(goal, steps)
 
@@ -124,6 +144,15 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 				r.reflectOnFailure(ctx, step.Action, result.Error)
 			} else {
 				step.Observation = result.Output
+				// Verify the tool output for plausibility
+				if result.Output != "" && len(result.Output) < 500 {
+					verification, vErr := r.verifier.VerifyToolCall(ctx, step.Action, params, result.Output)
+					if vErr == nil && verification != nil && !verification.IsValid && verification.Confidence > 0.6 {
+						log.Printf("[ReAct] VERIFICATION FAILED: %s — %v", step.Action, verification.Issues)
+						step.Observation = fmt.Sprintf("WARNING: Result may be unreliable — %s. Raw output: %s",
+							strings.Join(verification.Issues, "; "), result.Output)
+					}
+				}
 			}
 
 			toolCalled = true
@@ -145,7 +174,17 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 				steps = append(steps, step)
 				continue
 			}
-			// A tool WAS called previously, so this final_answer is legitimate.
+			// A tool WAS called previously — verify before accepting.
+			lastStep := steps[len(steps)-1]
+			verification, vErr := r.verifier.VerifyClaim(ctx, step.FinalAnswer, lastStep.Observation)
+			if vErr == nil && verification != nil && !verification.IsValid && verification.Confidence > 0.6 {
+				log.Printf("[ReAct] FINAL ANSWER FAILED VERIFICATION: %v. Forcing retry.", verification.Issues)
+				step.Action = "none"
+				step.Observation = fmt.Sprintf("Your proposed answer appears incorrect: %v. Review the observation and try again.", strings.Join(verification.Issues, "; "))
+				step.FinalAnswer = ""
+				steps = append(steps, step)
+				continue
+			}
 			return step.FinalAnswer, nil
 		}
 

@@ -2,6 +2,7 @@ package events
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -42,7 +43,14 @@ func (b *Bus) Publish(event interfaces.Event) error {
 	}
 
 	for _, handler := range handlers {
-		handler(event)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[BUS] Panic recovered in handler for %s: %v", event.Type, r)
+				}
+			}()
+			handler(event)
+		}()
 	}
 	return nil
 }

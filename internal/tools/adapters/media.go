@@ -55,18 +55,19 @@ func (t *YouTubePlayTool) Execute(ctx context.Context, params json.RawMessage) (
 		return interfaces.ToolResult{Error: err}, nil
 	}
 
-	// Wait for the search results page to load, then click the first video.
+	// Wait for the search results page to fully load, then click the first video.
 	// YouTube search results layout: filter chips sit at ~15% height,
 	// first video thumbnail starts at ~35% height.
-	time.Sleep(4 * time.Second)
+	// 7s gives enough time for slow connections and heavy pages to finish rendering.
+	time.Sleep(7 * time.Second)
 
 	screenW, screenH := robotgo.GetScreenSize()
 	clickX := screenW * 30 / 100
 	clickY := screenH * 35 / 100
 	robotgo.Move(clickX, clickY)
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	robotgo.Click()
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	// Tab-navigate as fallback to ensure we land on the first video link
 	for i := 0; i < 5; i++ {

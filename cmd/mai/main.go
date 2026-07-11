@@ -12,6 +12,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,6 +36,8 @@ import (
 	"github.com/user/mai/internal/llm"
 	"github.com/user/mai/internal/memory"
 	"github.com/user/mai/internal/perception"
+	"github.com/user/mai/internal/personality"
+	"github.com/user/mai/internal/server"
 	"github.com/user/mai/internal/tools"
 	"github.com/user/mai/internal/tools/adapters"
 	"github.com/user/mai/internal/tools/mcp"
@@ -50,8 +54,10 @@ func main() {
 
 	var configPath string
 	var testCloud bool
+	var companionMode bool
 	flag.StringVar(&configPath, "config", "config.yaml", "Path to configuration file")
 	flag.BoolVar(&testCloud, "test-cloud", false, "Test cloud LLM provider and exit")
+	flag.BoolVar(&companionMode, "companion", false, "Enable companion Web UI (overrides config)")
 	flag.Parse()
 
 	// Load config
@@ -81,12 +87,67 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var isSpeaking bool
-	var lastResponseTime time.Time
+	var isSpeaking int32 // atomic: 1=speaking, 0=idle
+	var lastResponseTime = time.Now()
+	var lastResponseMu sync.Mutex
 	var lastDetected time.Time = time.Now().Add(-time.Hour)
 	var sessionSamples []float32
-	var ttsMu sync.Mutex    // Mutex for thread-safe TTS
+	var ttsMu sync.Mutex // Mutex for thread-safe TTS
+
+	// atomic: 1=speaking/assistant-audio-muting, 0=idle
+	var ttsPlaying int32 // atomic: 1=playing TTS, 0=not
+	var stopPlayback int32 // atomic: 1=stop current TTS playback (barge-in), 0=normal
+	var lastMicRMS float64
+	var lastMicMu sync.Mutex
 	var sherpaMu sync.Mutex // Mutex for all other Sherpa-ONNX calls
+
+	// Shared across main scope so greeting / TTS / browser-mic paths can reach the bus.
+	var bus interfaces.EventBus
+	var companionServer *server.Server
+	var browserMicActive int32
+	companionHasClient := func() bool { return companionServer != nil && companionServer.ClientCount() > 0 }
+	var capture *audioCapture           // forward-declared; assigned later
+	var handleAudioFrame func([]float32, bool) // forward-declared; assigned later
+
+	// waitForMicSilence blocks until the mic stays quiet (RMS < 0.0015 for 3 consecutive checks)
+	// or a 500ms deadline is reached. Returns true if silence was detected, false if timed out.
+	waitForMicSilence := func() bool {
+		const (
+			silenceRMS = 0.0015
+			consecN    = 3
+			checkEvery = 50 * time.Millisecond
+		)
+		consec := 0
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			lastMicMu.Lock()
+			rms := lastMicRMS
+			lastMicMu.Unlock()
+			if rms < silenceRMS {
+				consec++
+				if consec >= consecN {
+					return true
+				}
+			} else {
+				consec = 0
+			}
+			time.Sleep(checkEvery)
+		}
+		return false
+	}
+
+	// thinkingChime plays a short tone to indicate LLM processing has started.
+	playingChime := int32(0)
+	playThinkingChime := func() {
+		if !cfg.Audio.ThinkingChime || !atomic.CompareAndSwapInt32(&playingChime, 0, 1) {
+			return
+		}
+		go func() {
+			chime := generateThinkingChime(16000)
+			_ = playAudio(ctx, chime, 16000, nil)
+			atomic.StoreInt32(&playingChime, 0)
+		}()
+	}
 
 	// Audio Lookback Buffer (1.5s at 16000Hz = 24000 samples)
 	lookbackSize := 24000
@@ -149,6 +210,10 @@ func main() {
 
 	vadBuffer := sherpa.NewCircularBuffer(10 * 16000)
 	defer sherpa.DeleteCircularBuffer(vadBuffer)
+
+	// Separate VAD buffer for barge-in detection (smaller — just enough for VAD window)
+	bargeVadBuffer := sherpa.NewCircularBuffer(2 * 16000)
+	defer sherpa.DeleteCircularBuffer(bargeVadBuffer)
 
 	log.Println("[VAD] Voice activity detector ready")
 
@@ -250,11 +315,60 @@ func main() {
 	defer sherpa.DeleteOfflineTts(tts)
 
 	log.Printf("[TTS] Synthesizer ready (%s)", cfg.TTS.ActiveModel)
+
+	// speak generates audio and plays it where the user can hear it.
+	// When a browser companion is connected, it streams chunks as they're
+	// synthesised (true streaming) so the first audio arrives almost immediately.
+	speak := func(text string, speed float32) {
+		if speed == 0 {
+			speed = cfg.TTS.Supertonic.Speed
+		}
+		atomic.StoreInt32(&isSpeaking, 1)
+
+		if bus != nil && cfg.Server.Enabled && companionHasClient() {
+			// ── Streaming path: publish each callback chunk in real time ──
+			const outSR = 44100 // Supertonic output rate
+			ttsMu.Lock()
+			tts.GenerateWithCallback(text, cfg.TTS.Supertonic.Sid, speed,
+				func(samples []float32) bool {
+					publishTTSAudioChunk(bus, samples, outSR, false)
+					return true // keep generating
+				},
+			)
+			ttsMu.Unlock()
+			// Signal "end of utterance" so the browser knows playback is done.
+			publishTTSAudioChunk(bus, nil, outSR, true)
+
+		} else {
+			// ── Local-only path: streaming playback ──
+			atomic.StoreInt32(&ttsPlaying, 1)
+			atomic.StoreInt32(&stopPlayback, 0)
+			_ = playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
+				ttsMu.Lock()
+				tts.GenerateWithCallback(text, cfg.TTS.Supertonic.Sid, speed,
+					func(samples []float32) bool {
+						ch <- samples
+						return true
+					},
+				)
+				ttsMu.Unlock()
+			})
+			atomic.StoreInt32(&ttsPlaying, 0)
+			if atomic.LoadInt32(&stopPlayback) == 0 {
+				waitForMicSilence()
+			}
+		}
+
+		atomic.StoreInt32(&isSpeaking, 0)
+		lastResponseMu.Lock()
+		lastResponseTime = time.Now()
+		lastResponseMu.Unlock()
+	}
 	// Test TTS on startup
 	go func() {
 		testAudio := tts.Generate("System ready.", cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
 		if testAudio != nil {
-			playAudio(testAudio.Samples, testAudio.SampleRate)
+			playAudio(ctx, testAudio.Samples, testAudio.SampleRate, nil)
 		}
 	}()
 
@@ -266,7 +380,7 @@ func main() {
 	var agentBridge *perception.Bridge
 	if cfg.Agentic.Enabled {
 		log.Println("[BOOT] Initializing Agentic Architecture...")
-		bus := events.NewBus()
+		bus = events.NewBus()
 
 		// LLM (create first — memory needs it for embeddings)
 		llmFactory := llm.NewFactory(cfg)
@@ -329,35 +443,92 @@ func main() {
 		// Orchestrator
 		orch := agent.NewOrchestrator(bus, memManager, llmProvider, registry, react)
 		orch.DirectAction = executor.ParseAndExecute // Wire up the legacy highly-reliable regex parser
+
+		// Apply TTS voice style from system prompt
+		ttsStyle := cfg.TTS.TTSVoiceStyle
+		if ttsStyle == "" {
+			ttsStyle = personality.ParseVoiceStyle(cfg.LLM.SystemPrompt)
+		}
+		if ttsStyle != "" && ttsStyle != "neutral" {
+			orch.SetTTSVoiceStyle(ttsStyle)
+		}
+
 		go orch.Start(ctx)
 
 		// Bridge for Perception
 		agentBridge = perception.NewBridge(bus)
 
-		// Bridge for TTS
+	// WebSocket companion server
+	if companionMode {
+		cfg.Server.Enabled = true
+		log.Println("[BOOT] Companion mode enabled via --companion flag")
+	}
+	if cfg.Server.Enabled {
+			srv := server.New(server.ServerConfig{
+				Enabled: cfg.Server.Enabled,
+				Port:    cfg.Server.Port,
+				Token:   cfg.Server.Token,
+			}, bus, &isSpeaking, &ttsPlaying, func() string {
+				return string(orch.GetStatus())
+			})
+			if err := srv.Start(); err != nil {
+				log.Printf("[SERVER] Failed to start: %v", err)
+			}
+			companionServer = srv
+			// When the browser disconnects, restore the local mic if a browser mic was active.
+			srv.OnClientDisconnect = func() {
+				if atomic.LoadInt32(&browserMicActive) == 1 && companionServer.ClientCount() == 0 {
+					capture.Start()
+				}
+			}
+			srv.SetOnClientGone(func() {
+				if srv.OnClientDisconnect != nil {
+					srv.OnClientDisconnect()
+				}
+			})
+		}
+
+		// Thinking chime — plays when speech transcription is received (LLM processing begins)
+		bus.Subscribe("perception.audio.transcription", func(event interfaces.Event) {
+			playThinkingChime()
+		})
+
+		// Bridge for TTS — with emotion-adaptive parameters
 		bus.Subscribe("action.tts.request", func(event interfaces.Event) {
 			text, _ := event.Payload["text"].(string)
-			log.Printf("[AGENT] Speaking: %s", text)
-			isSpeaking = true
-			time.Sleep(200 * time.Millisecond) // Drain any in-flight audio callback
-			ttsMu.Lock()
-			audio := tts.Generate(text, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
-			ttsMu.Unlock()
-			if audio != nil {
-				playAudio(audio.Samples, audio.SampleRate)
-			}
-			time.Sleep(1500 * time.Millisecond) // Wait for room echo to fully die down
-			isSpeaking = false
-			lastResponseTime = time.Now()
+			speed, _ := event.Payload["speed"].(float32)
+			log.Printf("[AGENT] Speaking (speed=%.2f): %s", speed, text)
+			speak(text, speed)
 			log.Printf("[FOLLOW-UP] Listening for follow-up (15s window)...")
 		})
+
+		// Browser mic audio frames → same VAD/ASR pipeline as local mic.
+		bus.Subscribe("perception.audio.frame", func(event interfaces.Event) {
+			samples, _ := event.Payload["samples"].([]float32)
+			if len(samples) > 0 {
+				handleAudioFrame(samples, true)
+			}
+		})
+
+		// Pause/resume local system mic when browser mic is active (avoid double input).
+		bus.Subscribe("companion.audio.start", func(event interfaces.Event) {
+			log.Println("[MIC] Browser mic active — pausing local capture")
+			atomic.StoreInt32(&browserMicActive, 1)
+			capture.Stop()
+		})
+		bus.Subscribe("companion.audio.stop", func(event interfaces.Event) {
+			atomic.StoreInt32(&browserMicActive, 0)
+			if !companionHasClient() {
+				log.Println("[MIC] Browser mic stopped — restoring local capture")
+				capture.Start()
+			}
+		})
 	}
+
 	log.Println("[AUTO] Automation system ready")
 
 	// 5. Initialize audio capture
-
-	// 5. Initialize audio capture
-	capture := newAudioCapture(16000, 1)
+	capture = newAudioCapture(16000, 1)
 	defer capture.Close()
 
 	log.Println("[AUDIO] Capture initialized")
@@ -369,13 +540,16 @@ func main() {
 	workerChan := make(chan Task, 10)
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for task := range workerChan {
-			isSpeaking = true // Pause ASR while thinking and talking
-			log.Printf("[LLM] Thinking about: %s", task.Text)
+		go func() {
+			defer wg.Done()
+			for task := range workerChan {
+				atomic.StoreInt32(&isSpeaking, 1) // Pause ASR while thinking and talking
+				log.Printf("[LLM] Thinking about: %s", task.Text)
 
-			// Try to parse and execute automation action
+				// Play thinking chime to indicate LLM processing
+				playThinkingChime()
+
+				// Try to parse and execute automation action
 			executed, feedback, actionErr := executor.ParseAndExecute(task.Text)
 			if actionErr != nil {
 				log.Printf("[ACTION] Error executing action: %v", actionErr)
@@ -398,25 +572,40 @@ func main() {
 				response, err = generateOllamaResponse(ctx, cfg, task.Text)
 				if err != nil {
 					log.Printf("[LLM] Error: %v", err)
-					isSpeaking = false
+					atomic.StoreInt32(&isSpeaking, 0)
 					continue
 				}
 			}
 
 			log.Printf("[LLM] Response received. Starting TTS...")
 
-			// TTS
-			ttsMu.Lock()
-			audio := tts.Generate(response, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
-			ttsMu.Unlock()
-			if audio != nil {
-				log.Println("[TTS] Playing response...")
-				playAudio(audio.Samples, audio.SampleRate)
+			// Streaming TTS: generate chunks and play them as they arrive.
+			atomic.StoreInt32(&ttsPlaying, 1)
+			atomic.StoreInt32(&stopPlayback, 0)
+			playErr := playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
+				ttsMu.Lock()
+				tts.GenerateWithCallback(response, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed,
+					func(samples []float32) bool {
+						ch <- samples
+						return true
+					},
+				)
+				ttsMu.Unlock()
+			})
+			if playErr != nil {
+				log.Printf("[TTS] Play error: %v", playErr)
+			}
+			atomic.StoreInt32(&ttsPlaying, 0)
+
+			// If barge-in was triggered, skip silence wait
+			if atomic.LoadInt32(&stopPlayback) == 0 {
+				waitForMicSilence()
 			}
 
-			time.Sleep(400 * time.Millisecond) // Wait for room echo to die down
-			isSpeaking = false // Resume ASR
+			atomic.StoreInt32(&isSpeaking, 0) // Resume ASR
+			lastResponseMu.Lock()
 			lastResponseTime = time.Now()
+			lastResponseMu.Unlock()
 			log.Println("[FOLLOW-UP] Listening for follow-up (15s window)...")
 		}
 	}()
@@ -433,23 +622,140 @@ func main() {
 	var sessionText string
 
 	// Audio callback
-	capture.onSamples = func(samples []float32) {
+	// runListening: the VAD + ASR + segment-end detection pipeline.
+	// Shared by local mic (in listening state) and browser mic.
+	runListening := func(samples []float32) {
+		if atomic.LoadInt32(&ttsPlaying) != 0 {
+			return
+		}
+		vadBuffer.Push(samples)
+		for vadBuffer.Size() >= cfg.VAD.WindowSize {
+			head := vadBuffer.Head()
+			chunk := vadBuffer.Get(head, cfg.VAD.WindowSize)
+			vadBuffer.Pop(cfg.VAD.WindowSize)
+			vadDetector.AcceptWaveform(chunk)
+		}
+
+		if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
+			asrStream.AcceptWaveform(16000, samples)
+			for recognizer.IsReady(asrStream) {
+				recognizer.Decode(asrStream)
+			}
+			text := recognizer.GetResult(asrStream).Text
+			if text != "" && text != lastText {
+				lastText = text
+				fmt.Printf("\r[ASR] Live: %s%s", sessionText, text)
+			}
+		} else {
+			sessionSamples = append(sessionSamples, samples...)
+			fmt.Printf("\r[ASR] Listening... (buffered %d samples)", len(sessionSamples))
+		}
+
+		for !vadDetector.IsEmpty() {
+			vadDetector.Pop()
+
+			if asrStream != nil {
+				text := recognizer.GetResult(asrStream).Text
+				if text != "" {
+					sessionText += text + " "
+				}
+				sessionSamples = nil
+			} else if offlineRecognizer != nil {
+				log.Println("\n[ASR] Processing segment with Offline Qwen3...")
+				offlineStream := sherpa.NewOfflineStream(offlineRecognizer)
+				if cfg.ASR.Language != "" {
+					offlineStream.SetOption("language", cfg.ASR.Language)
+				}
+				offlineStream.AcceptWaveform(16000, sessionSamples)
+				offlineRecognizer.Decode(offlineStream)
+				result := offlineStream.GetResult()
+				if result != nil {
+					sessionText = result.Text
+				}
+				sherpa.DeleteOfflineStream(offlineStream)
+				sessionSamples = nil
+			}
+
+			log.Println("\n[VAD] End of segment detected.")
+			if sessionText != "" {
+				if agentBridge != nil {
+					log.Println("[AGENT] Routing to cognitive orchestrator...")
+					go agentBridge.PublishTranscription(sessionText)
+				} else {
+					log.Println("[PIPELINE] Routing to legacy pipeline...")
+					workerChan <- Task{Text: sessionText}
+				}
+				state = StateWakeWord
+				sessionText = ""
+				sessionSamples = nil
+				if recognizer != nil {
+					recognizer.Reset(asrStream)
+				}
+				lastText = ""
+				return
+			}
+		}
+	}
+
+	// handleAudioFrame: entry point for audio frames from any source.
+	// fromBrowser=true  → browser mic (skips wake word, goes straight to listening)
+	// fromBrowser=false → local system mic (full state machine: wake word + follow-up + listening)
+	handleAudioFrame = func(samples []float32, fromBrowser bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[AUDIO] Panic recovered in audio callback: %v", r)
+			}
+		}()
 		sherpaMu.Lock()
 		defer sherpaMu.Unlock()
 
-		if isSpeaking {
-			return // Ignore samples while Mai is talking
+		var sum float32
+		for _, s := range samples {
+			sum += s * s
 		}
+		rms := math.Sqrt(float64(sum / float32(len(samples))))
+		lastMicMu.Lock()
+		lastMicRMS = rms
+		lastMicMu.Unlock()
+
+		if atomic.LoadInt32(&ttsPlaying) != 0 {
+			if cfg.Audio.BargeInEnabled && rms > cfg.Audio.BargeInThreshold {
+				bargeVadBuffer.Push(samples)
+				for bargeVadBuffer.Size() >= cfg.VAD.WindowSize {
+					head := bargeVadBuffer.Head()
+					chunk := bargeVadBuffer.Get(head, cfg.VAD.WindowSize)
+					bargeVadBuffer.Pop(cfg.VAD.WindowSize)
+					vadDetector.AcceptWaveform(chunk)
+				}
+				if !vadDetector.IsEmpty() {
+					log.Printf("[BARGE-IN] VAD confirmed speech during TTS (RMS=%.4f). Stopping playback.", rms)
+					atomic.StoreInt32(&stopPlayback, 1)
+					for !vadDetector.IsEmpty() {
+						vadDetector.Pop()
+					}
+				}
+			}
+			return
+		}
+
+		if atomic.LoadInt32(&isSpeaking) != 0 {
+			return
+		}
+
+		if fromBrowser {
+			runListening(samples)
+			return
+		}
+
+		// ── Local mic: existing state machine ──
 		switch state {
 		case StateWakeWord:
-			// If in follow-up window, allow VAD to trigger listening
+			// Follow-up: if the user speaks within the 15s window, skip wake word.
 			if time.Since(lastResponseTime) < 15*time.Second {
-				// Feed to ASR continuously if streaming
-				if asrStream != nil {
+				if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
 					asrStream.AcceptWaveform(16000, samples)
 				}
 
-				// Feed to VAD buffer for speech detection
 				vadBuffer.Push(samples)
 				var lastChunk []float32
 				for vadBuffer.Size() >= cfg.VAD.WindowSize {
@@ -459,32 +765,28 @@ func main() {
 					vadDetector.AcceptWaveform(lastChunk)
 				}
 
-				// Check if VAD has detected speech segments
 				if !vadDetector.IsEmpty() {
-					// Check RMS level to ensure it's not just silence/noise
 					var sum float32
 					for _, s := range samples {
 						sum += s * s
 					}
 					rms := math.Sqrt(float64(sum / float32(len(samples))))
 
-					if rms > 0.001 { // Much more sensitive for follow-up
+					if rms > 0.001 {
 						log.Printf("[FOLLOW-UP] Speech detected (Level %.4f)! Skipping wake word.", rms)
 						state = StateListening
-						
-						// Prepend the lookback buffer to catch the start of the sentence
+
 						preBuffer := make([]float32, lookbackSize)
 						for i := 0; i < lookbackSize; i++ {
 							preBuffer[i] = lookbackBuffer[(lookbackIdx+i)%lookbackSize]
 						}
 						sessionSamples = append(preBuffer, lastChunk...)
-						
+
 						sessionText = ""
 						lastText = ""
 						if recognizer != nil {
 							recognizer.Reset(asrStream)
 						}
-						// Clear VAD segments
 						for !vadDetector.IsEmpty() {
 							vadDetector.Pop()
 						}
@@ -498,23 +800,11 @@ func main() {
 				lookbackIdx = (lookbackIdx + 1) % lookbackSize
 			}
 
-			// Feed to KWS/VAD buffer
 			kwsStream.AcceptWaveform(16000, samples)
-
-			if asrStream != nil {
+			if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
 				asrStream.AcceptWaveform(16000, samples)
-			} else {
-				// For offline models, we still want to keep track of the audio
-				// if we might be in a follow-up window.
-				// However, we don't buffer HERE yet, because we haven't switched to StateListening.
 			}
 
-			// Volume check (RMS)
-			var sum float32
-			for _, s := range samples {
-				sum += s * s
-			}
-			rms := math.Sqrt(float64(sum / float32(len(samples))))
 			fmt.Printf("\r[AUDIO] Level: %.4f ", rms)
 
 			if time.Since(lastDetected) < time.Duration(cfg.KWS.CooldownMs)*time.Millisecond {
@@ -522,33 +812,29 @@ func main() {
 			}
 			for spotter.IsReady(kwsStream) {
 				spotter.Decode(kwsStream)
-				fmt.Print("*") // Small star for every decode attempt
+				fmt.Print("*")
 				result := spotter.GetResult(kwsStream)
 				if result.Keyword != "" {
 					spotter.Reset(kwsStream)
 					lastDetected = time.Now()
 					log.Println("\n[WAKE] Detected! Listening...")
 
-					// JARVIS-style acknowledgement
+					// Route greeting through the same speak() helper so it streams
+					// to the browser companion (lips sync) when a client is connected.
 					go func() {
-						// JARVIS-style acknowledgment (more sophisticated)
 						greetings := []string{
 							"Yes Sir. How can I assist you?",
 							"At your service. What is the objective?",
 							"I'm here. What do you need?",
 						}
 						greet := greetings[time.Now().UnixNano()%int64(len(greetings))]
-						ttsMu.Lock()
-						audio := tts.Generate(greet, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
-						ttsMu.Unlock()
-						if audio != nil {
-							playAudio(audio.Samples, audio.SampleRate)
-						}
+						speak(greet, cfg.TTS.Supertonic.Speed)
 					}()
 
 					state = StateListening
-					sessionText = "" // Reset session text
+					sessionText = ""
 					sessionSamples = nil
+					sherpa.DeleteCircularBuffer(vadBuffer)
 					vadBuffer = sherpa.NewCircularBuffer(10 * 16000)
 					if recognizer != nil {
 						recognizer.Reset(asrStream)
@@ -559,81 +845,12 @@ func main() {
 			}
 
 		case StateListening:
-			// Feed to VAD
-			vadBuffer.Push(samples)
-			for vadBuffer.Size() >= cfg.VAD.WindowSize {
-				head := vadBuffer.Head()
-				chunk := vadBuffer.Get(head, cfg.VAD.WindowSize)
-				vadBuffer.Pop(cfg.VAD.WindowSize)
-				vadDetector.AcceptWaveform(chunk)
-			}
-
-			// Feed to ASR
-			if asrStream != nil {
-				asrStream.AcceptWaveform(16000, samples)
-				for recognizer.IsReady(asrStream) {
-					recognizer.Decode(asrStream)
-				}
-				text := recognizer.GetResult(asrStream).Text
-				if text != "" && text != lastText {
-					lastText = text
-					fmt.Printf("\r[ASR] Live: %s%s", sessionText, text)
-				}
-			} else {
-				// Offline ASR - buffer audio samples
-				sessionSamples = append(sessionSamples, samples...)
-				fmt.Printf("\r[ASR] Listening... (buffered %d samples)", len(sessionSamples))
-			}
-
-			// Check VAD for speech end
-			for !vadDetector.IsEmpty() {
-				vadDetector.Pop()
-
-				// When a segment ends, add it to our session buffer
-				if asrStream != nil {
-					text := recognizer.GetResult(asrStream).Text
-					if text != "" {
-						sessionText += text + " "
-					}
-				} else if offlineRecognizer != nil {
-					// Process full buffer with Offline ASR
-					log.Println("\n[ASR] Processing segment with Offline Qwen3...")
-					offlineStream := sherpa.NewOfflineStream(offlineRecognizer)
-					if cfg.ASR.Language != "" {
-						offlineStream.SetOption("language", cfg.ASR.Language)
-					}
-					offlineStream.AcceptWaveform(16000, sessionSamples)
-					offlineRecognizer.Decode(offlineStream)
-					result := offlineStream.GetResult()
-					if result != nil {
-						sessionText = result.Text
-					}
-					sherpa.DeleteOfflineStream(offlineStream)
-					sessionSamples = nil // Clear buffer
-				}
-
-				log.Println("\n[VAD] End of segment detected.")
-
-				if sessionText != "" {
-					if agentBridge != nil {
-						log.Println("[AGENT] Routing to cognitive orchestrator...")
-						// Use a goroutine to avoid blocking the audio thread
-						go agentBridge.PublishTranscription(sessionText)
-					} else {
-						log.Println("[PIPELINE] Routing to legacy pipeline...")
-						workerChan <- Task{Text: sessionText}
-					}
-					state = StateWakeWord
-					sessionText = ""
-					if recognizer != nil {
-						recognizer.Reset(asrStream)
-					}
-					lastText = ""
-					return
-				}
-
-			}
+			runListening(samples)
 		}
+	}
+
+	capture.onSamples = func(samples []float32) {
+		handleAudioFrame(samples, false)
 	}
 
 	// Start capture
@@ -648,7 +865,7 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	log.Println("\n[SYSTEM] Shutting down immediately...")
-	
+
 	cancel() // Cancel the background context (stops Ollama requests, etc.)
 	capture.Stop()
 	close(workerChan)
@@ -686,13 +903,18 @@ func startOllama() func() {
 
 // generateOllamaResponse sends text to Ollama and returns the generated text.
 func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt string) (string, error) {
-	client := &http.Client{} 
+	client := &http.Client{}
 
 	requestBody, _ := json.Marshal(map[string]interface{}{
 		"model":  cfg.LLM.Model,
 		"prompt": prompt,
 		"system": cfg.LLM.SystemPrompt,
 		"stream": false,
+		"options": map[string]interface{}{
+			"temperature": 0.4,
+			"top_p":       0.9,
+			"num_predict": 256,
+		},
 	})
 
 	log.Printf("[OLLAMA] Requesting response from %s...", cfg.LLM.Model)
@@ -786,4 +1008,78 @@ func resolveEnv(val string) string {
 		return envVal
 	}
 	return val
+}
+
+// publishTTSAudioChunk encodes a single callback chunk and pushes it onto the
+// event bus so the bridge can forward it to the browser in real time.
+func publishTTSAudioChunk(bus interfaces.EventBus, samples []float32, sampleRate int, done bool) {
+	if bus == nil {
+		return
+	}
+	var encoded string
+	if len(samples) > 0 {
+		buf := make([]byte, len(samples)*2)
+		for j, s := range samples {
+			if s > 1.0 {
+				s = 1.0
+			} else if s < -1.0 {
+				s = -1.0
+			}
+			s16 := int16(s * 32767.0)
+			buf[j*2] = byte(s16 & 0xFF)
+			buf[j*2+1] = byte(s16 >> 8)
+		}
+		encoded = base64.StdEncoding.EncodeToString(buf)
+	}
+	bus.Publish(interfaces.Event{
+		Type:   "tts.audio.chunk",
+		Source: "main",
+		Payload: map[string]interface{}{
+			"audio":       encoded,
+			"sample_rate": sampleRate,
+			"done":        done,
+		},
+	})
+}
+
+func publishTTSAudio(bus interfaces.EventBus, samples []float32, sampleRate int, done bool) {
+	if bus == nil || len(samples) == 0 {
+		return
+	}
+
+	const chunkSize = 8192
+	totalSamples := len(samples)
+	
+	for i := 0; i < totalSamples; i += chunkSize {
+		end := i + chunkSize
+		isLastChunk := false
+		if end >= totalSamples {
+			end = totalSamples
+			isLastChunk = true
+		}
+		
+		chunk := samples[i:end]
+		buf := make([]byte, len(chunk)*2)
+		for j, s := range chunk {
+			if s > 1.0 {
+				s = 1.0
+			} else if s < -1.0 {
+				s = -1.0
+			}
+			s16 := int16(s * 32767.0)
+			buf[j*2] = byte(s16 & 0xFF)
+			buf[j*2+1] = byte(s16 >> 8)
+		}
+		
+		encoded := base64.StdEncoding.EncodeToString(buf)
+		bus.Publish(interfaces.Event{
+			Type:   "tts.audio.chunk",
+			Source: "main",
+			Payload: map[string]interface{}{
+				"audio":       encoded,
+				"sample_rate": sampleRate,
+				"done":        done && isLastChunk,
+			},
+		})
+	}
 }
