@@ -41,10 +41,10 @@ jobs:
 
       - name: Detect and resolve merge conflicts
         id: conflicts
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
-          BASE_REF="${{ github.event.pull_request.base.ref }}"
-          PR_BRANCH="${{ github.event.pull_request.head.ref }}"
-
           echo "Checking for merge conflicts with $BASE_REF..."
 
           # Fetch the base branch
