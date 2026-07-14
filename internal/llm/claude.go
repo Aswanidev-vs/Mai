@@ -48,6 +48,9 @@ func (p *ClaudeProvider) Generate(ctx context.Context, prompt string, opts inter
 	if opts.Temperature > 0 {
 		body["temperature"] = opts.Temperature
 	}
+	if opts.TopP > 0 {
+		body["top_p"] = opts.TopP
+	}
 	if len(opts.StopSequences) > 0 {
 		body["stop_sequences"] = opts.StopSequences
 	}
@@ -80,16 +83,27 @@ func (p *ClaudeProvider) Generate(ctx context.Context, prompt string, opts inter
 	return "", fmt.Errorf("no response from claude")
 }
 
-func (p *ClaudeProvider) Stream(ctx context.Context, prompt string, callback func(chunk string)) error {
-	requestBody, _ := json.Marshal(map[string]interface{}{
+func (p *ClaudeProvider) Stream(ctx context.Context, prompt string, opts interfaces.GenerationOptions, callback func(chunk string)) error {
+	maxTokens := opts.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = 4096
+	}
+	body := map[string]interface{}{
 		"model":      p.model,
-		"max_tokens": 4096,
+		"max_tokens": maxTokens,
 		"system":     p.systemPrompt,
 		"messages": []map[string]interface{}{
 			{"role": "user", "content": prompt},
 		},
 		"stream": true,
-	})
+	}
+	if opts.Temperature > 0 {
+		body["temperature"] = opts.Temperature
+	}
+	if opts.TopP > 0 {
+		body["top_p"] = opts.TopP
+	}
+	requestBody, _ := json.Marshal(body)
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", bytes.NewBuffer(requestBody))
 	p.setHeaders(req)

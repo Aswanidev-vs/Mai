@@ -39,22 +39,11 @@ type PromptContext struct {
 
 type PromptEngine struct {
 	personalityName string
-	jarvisTraits    []string
 }
 
 func NewPromptEngine() *PromptEngine {
 	return &PromptEngine{
 		personalityName: "Mai",
-		jarvisTraits: []string{
-			"precise and efficient",
-			"anticipates needs before they're stated",
-			"uses dry wit appropriately",
-			"maintains professional composure",
-			"adapts communication style to the user's emotional state",
-			"provides concise, actionable information",
-			"remembers context from previous interactions",
-			"takes initiative when appropriate",
-		},
 	}
 }
 
@@ -84,17 +73,11 @@ func (pe *PromptEngine) BuildPrompt(ctx PromptContext) string {
 func (pe *PromptEngine) buildConversationPrompt(ctx PromptContext) string {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf(`You are %s — a personal AI assistant modeled after JARVIS from Iron Man.
+	b.WriteString(fmt.Sprintf(`You are %s. Speak and act exactly as the companion persona defined in your system instructions — do not adopt a different identity.
 
-CORE TRAITS:
-- %s
-- You speak naturally, like a trusted advisor
-- You remember past conversations and reference them naturally
-- You adapt your tone to the user's emotional state
-- You are proactive — offering relevant information without being asked
-- You never say "As an AI language model" or similar disclaimers
+Here is the current interaction context:
 
-`, pe.personalityName, strings.Join(pe.jarvisTraits, "\n- ")))
+`, pe.personalityName))
 
 	pe.appendTimeContext(&b, ctx)
 	pe.appendEmotionContext(&b, ctx)
@@ -223,7 +206,7 @@ Be brief, relevant, and helpful. Don't be intrusive.
 func (pe *PromptEngine) buildGreetingPrompt(ctx PromptContext) string {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf(`You are %s greeting your user. Be warm but efficient — like JARVIS.
+	b.WriteString(fmt.Sprintf(`You are %s greeting your user. Be warm and natural, as the companion defined in your system instructions.
 
 Vary your greetings. Reference time of day. If you have pending items, briefly mention them.
 Never use the same greeting twice in a row.

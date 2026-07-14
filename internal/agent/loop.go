@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/user/mai/internal/cognition"
@@ -34,6 +35,11 @@ type Orchestrator struct {
 	prosody        *personality.ProsodyAnalyzer
 	ttsAdapter     *personality.TTSAdapter
 
+	genOpts interfaces.GenerationOptions
+
+	turnMu       sync.Mutex
+	currentCancel context.CancelFunc // cancels the in-flight LLM stream (barge-in)
+
 	status       interfaces.AgentStatus
 	cancel       context.CancelFunc
 	lastUserTime time.Time
@@ -52,6 +58,7 @@ func NewOrchestrator(
 	llm interfaces.LLMProvider,
 	registry interfaces.ToolRegistry,
 	reactLoop *cognition.ReActLoop,
+	genOpts interfaces.GenerationOptions,
 ) *Orchestrator {
 	userModel := NewUserModel("data")
 	proactive := NewProactiveEngine(userModel)
@@ -78,6 +85,7 @@ func NewOrchestrator(
 		ttsAdapter:     personality.NewTTSAdapter(1.25, 1.0, 1.0),
 		status:         interfaces.StatusIdle,
 		skillsRunner:   skillsRunner,
+		genOpts:        genOpts,
 	}
 }
 
@@ -495,9 +503,46 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 
 	fullPrompt := o.promptEngine.BuildPrompt(promptCtx)
 
-	response, err := o.llm.Generate(ctx, fullPrompt, interfaces.GenerationOptions{Temperature: 0.4})
-	if err != nil {
+	// Stream the reply token-by-token and speak each completed sentence as it
+	// is produced, so the first audio starts long before the full answer exists.
+	ctx, cancel := context.WithCancel(ctx)
+	o.setTurnCancel(cancel)
+	defer func() {
+		cancel()
+		o.setTurnCancel(nil)
+	}()
+
+	var full strings.Builder
+	var pending strings.Builder
+
+	onChunk := func(chunk string) {
+		full.WriteString(chunk)
+		pending.WriteString(chunk)
+		for {
+			seg, ok := takeSentence(&pending)
+			if !ok {
+				break
+			}
+			sentence := cleanResponse(seg)
+			if strings.TrimSpace(sentence) != "" {
+				o.publishTTS(sentence)
+			}
+		}
+	}
+
+	if err := o.llm.Stream(ctx, fullPrompt, o.genOpts, onChunk); err != nil && ctx.Err() == nil {
 		return nil, err
+	}
+	// Flush any trailing text that didn't end on a sentence boundary (unless interrupted).
+	if ctx.Err() == nil {
+		if rem := cleanResponse(pending.String()); strings.TrimSpace(rem) != "" {
+			o.publishTTS(rem)
+		}
+	}
+
+	response := full.String()
+	if strings.TrimSpace(response) == "" {
+		response = "..."
 	}
 
 	if strings.Contains(response, "[ACTION]") {
@@ -511,15 +556,15 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 			executed, feedback, err := o.DirectAction(actionCmd)
 			if err == nil && executed {
 				o.meta.RecordActionResult(true)
-				return &interfaces.AgentResponse{Text: feedback, Success: true}, nil
+				return &interfaces.AgentResponse{Text: feedback, Success: true, Spoken: true}, nil
 			}
 		}
 
 		log.Printf("[Agent] DirectAction failed for [ACTION] %q, routing to ReAct", actionCmd)
-		response, err := o.react.Execute(ctx, actionCmd)
+		reactResp, err := o.react.Execute(ctx, actionCmd)
 		if err == nil {
 			o.meta.RecordActionResult(true)
-			return &interfaces.AgentResponse{Text: response, Success: true}, nil
+			return &interfaces.AgentResponse{Text: reactResp, Success: true, Spoken: true}, nil
 		}
 	}
 
@@ -537,8 +582,53 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	})
 
 	adapted := o.adaptResponse(response, emotion)
-	return &interfaces.AgentResponse{Text: adapted, Success: true}, nil
+	return &interfaces.AgentResponse{Text: adapted, Success: true, Spoken: true}, nil
 }
+
+// takeSentence extracts the next complete sentence from buf, mutating buf to
+// remove what it took. A sentence ends at .!? or a newline; if the buffer grows
+// past maxLen without a boundary it cuts at the last clause break. Returns
+// ("", false) when no sentence is ready yet.
+func takeSentence(buf *strings.Builder) (string, bool) {
+	s := buf.String()
+	const maxLen = 160
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '!' || c == '?' || c == '\n' {
+			return consumeSentence(buf, s, i+1)
+		}
+		if c == '.' {
+			// Don't split on common abbreviations like "Dr." or "e.g.".
+			if i > 0 && i+1 < len(s) && isLowerByte(s[i-1]) && s[i+1] == ' ' {
+				continue
+			}
+			return consumeSentence(buf, s, i+1)
+		}
+	}
+
+	if len(s) >= maxLen {
+		cut := strings.LastIndex(s[:maxLen], ",")
+		if cut < 0 {
+			cut = strings.LastIndex(s[:maxLen], " ")
+		}
+		if cut < 0 {
+			cut = maxLen
+		}
+		return consumeSentence(buf, s, cut+1)
+	}
+
+	return "", false
+}
+
+func consumeSentence(buf *strings.Builder, s string, end int) (string, bool) {
+	rem := strings.TrimLeft(s[end:], " \n\t")
+	buf.Reset()
+	buf.WriteString(rem)
+	return strings.TrimRight(s[:end], " \n\t"), true
+}
+
+func isLowerByte(b byte) bool { return b >= 'a' && b <= 'z' }
 
 func (o *Orchestrator) handleMultiStep(ctx context.Context, text string) (*interfaces.AgentResponse, error) {
 	log.Printf("[Agent] Multi-step task detected, engaging planner...")
@@ -572,7 +662,7 @@ func (o *Orchestrator) handleMultiStep(ctx context.Context, text string) (*inter
 				o.meta.RecordActionResult(true)
 			}
 		} else {
-			response, err := o.llm.Generate(ctx, task.Description, interfaces.GenerationOptions{Temperature: 0.4})
+			response, err := o.llm.Generate(ctx, task.Description, o.genOpts)
 			if err == nil {
 				results = append(results, fmt.Sprintf("DONE (%s): %s", task.Description, response))
 				o.planner.MarkCompleted(plan, task.ID)
@@ -581,7 +671,7 @@ func (o *Orchestrator) handleMultiStep(ctx context.Context, text string) (*inter
 	}
 
 	summaryPrompt := fmt.Sprintf("Summarize these task results concisely:\n%s", strings.Join(results, "\n"))
-	summary, err := o.llm.Generate(ctx, summaryPrompt, interfaces.GenerationOptions{Temperature: 0.3})
+	summary, err := o.llm.Generate(ctx, summaryPrompt, o.genOpts)
 	if err != nil {
 		summary = fmt.Sprintf("Completed %d/%d steps.", len(results), len(plan.Root))
 	}
@@ -670,6 +760,29 @@ func (o *Orchestrator) SetTTSVoiceStyle(style string) {
 	o.ttsAdapter.SetVoiceStyle(style)
 }
 
+// SetTTSBaseSpeed overrides the baseline speech rate (warmth), applied after voice style.
+func (o *Orchestrator) SetTTSBaseSpeed(speed float32) {
+	o.ttsAdapter.SetBaseSpeed(speed)
+}
+
+// setTurnCancel stores the cancel func for the current generation turn so a
+// barge-in can abort the in-flight LLM stream.
+func (o *Orchestrator) setTurnCancel(c context.CancelFunc) {
+	o.turnMu.Lock()
+	defer o.turnMu.Unlock()
+	o.currentCancel = c
+}
+
+// InterruptCurrent cancels the in-flight LLM stream (called on barge-in).
+func (o *Orchestrator) InterruptCurrent() {
+	o.turnMu.Lock()
+	c := o.currentCancel
+	o.turnMu.Unlock()
+	if c != nil {
+		c()
+	}
+}
+
 func (o *Orchestrator) AnalyzeProsody(samples []float32, sampleRate int) personality.EmotionState {
 	features := o.prosody.Analyze(samples, sampleRate)
 	return o.prosody.DetectEmotion(features)
@@ -691,8 +804,20 @@ func (o *Orchestrator) publishTTS(text string) {
 	o.lastSpoken = strings.ToLower(text)
 	o.lastSpokenAt = time.Now()
 
+	// Terminal transcript of everything Mai says (streamed sentences,
+	// greetings, proactive messages). The live path otherwise produces no
+	// console output for the response.
+	log.Printf("[Mai] %s", text)
+
 	emotion := o.emotion.GetCurrent()
 	ttsParams := o.GetTTSParams(emotion, text)
+
+	// If a direct TTS sink is wired (streaming sentence queue), use it so the
+	// bus subscribers don't double-play. Otherwise fall back to the event bus.
+	if o.TTSFunc != nil {
+		o.TTSFunc(text, ttsParams.Speed)
+		return
+	}
 
 	o.bus.Publish(interfaces.Event{
 		Type:   "action.tts.request",
@@ -732,18 +857,21 @@ func (o *Orchestrator) handleTranscription(event interfaces.Event) {
 		return
 	}
 
-	emotion := o.emotion.GetCurrent()
-	ttsParams := o.GetTTSParams(emotion, resp.Text)
+	// If the handler already streamed the reply to TTS (Spoken), don't repeat it.
+	if !resp.Spoken {
+		emotion := o.emotion.GetCurrent()
+		ttsParams := o.GetTTSParams(emotion, resp.Text)
 
-	o.bus.Publish(interfaces.Event{
-		Type:   "action.tts.request",
-		Source: "agent.orchestrator",
-		Payload: map[string]interface{}{
-			"text":  resp.Text,
-			"speed": ttsParams.Speed,
-			"pitch": ttsParams.Pitch,
-		},
-	})
+		o.bus.Publish(interfaces.Event{
+			Type:   "action.tts.request",
+			Source: "agent.orchestrator",
+			Payload: map[string]interface{}{
+				"text":  resp.Text,
+				"speed": ttsParams.Speed,
+				"pitch": ttsParams.Pitch,
+			},
+		})
+	}
 }
 
 func (o *Orchestrator) handleVision(event interfaces.Event) {
