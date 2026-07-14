@@ -30,15 +30,24 @@ func NewOllamaProvider(model, url, systemPrompt string) *OllamaProvider {
 }
 
 func (p *OllamaProvider) Generate(ctx context.Context, prompt string, opts interfaces.GenerationOptions) (string, error) {
+	options := map[string]interface{}{
+		"temperature": opts.Temperature,
+	}
+	if opts.TopP > 0 {
+		options["top_p"] = opts.TopP
+	}
+	if opts.MaxTokens > 0 {
+		options["num_predict"] = opts.MaxTokens
+	}
+	if len(opts.StopSequences) > 0 {
+		options["stop"] = opts.StopSequences
+	}
 	requestBody, err := json.Marshal(map[string]interface{}{
 		"model":  p.model,
 		"prompt": prompt,
 		"system": p.systemPrompt,
 		"stream": false,
-		"options": map[string]interface{}{
-			"temperature": opts.Temperature,
-			"stop":        opts.StopSequences,
-		},
+		"options": options,
 	})
 	if err != nil {
 		return "", err
@@ -75,12 +84,22 @@ func (p *OllamaProvider) Generate(ctx context.Context, prompt string, opts inter
 	return result.Response, nil
 }
 
-func (p *OllamaProvider) Stream(ctx context.Context, prompt string, callback func(chunk string)) error {
+func (p *OllamaProvider) Stream(ctx context.Context, prompt string, opts interfaces.GenerationOptions, callback func(chunk string)) error {
+	options := map[string]interface{}{
+		"temperature": opts.Temperature,
+	}
+	if opts.TopP > 0 {
+		options["top_p"] = opts.TopP
+	}
+	if opts.MaxTokens > 0 {
+		options["num_predict"] = opts.MaxTokens
+	}
 	requestBody, err := json.Marshal(map[string]interface{}{
-		"model":  p.model,
-		"prompt": prompt,
-		"system": p.systemPrompt,
-		"stream": true,
+		"model":   p.model,
+		"prompt":  prompt,
+		"system":  p.systemPrompt,
+		"stream":  true,
+		"options": options,
 	})
 	if err != nil {
 		return err

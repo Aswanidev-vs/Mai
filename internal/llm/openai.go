@@ -54,6 +54,9 @@ func (p *OpenAIProvider) Generate(ctx context.Context, prompt string, opts inter
 	if opts.MaxTokens > 0 {
 		body["max_tokens"] = opts.MaxTokens
 	}
+	if opts.TopP > 0 {
+		body["top_p"] = opts.TopP
+	}
 	if len(opts.StopSequences) > 0 {
 		body["stop"] = opts.StopSequences
 	}
@@ -89,17 +92,27 @@ func (p *OpenAIProvider) Generate(ctx context.Context, prompt string, opts inter
 	return "", fmt.Errorf("no response from openai")
 }
 
-func (p *OpenAIProvider) Stream(ctx context.Context, prompt string, callback func(chunk string)) error {
+func (p *OpenAIProvider) Stream(ctx context.Context, prompt string, opts interfaces.GenerationOptions, callback func(chunk string)) error {
 	messages := []map[string]string{
 		{"role": "system", "content": p.systemPrompt},
 		{"role": "user", "content": prompt},
 	}
 
-	requestBody, _ := json.Marshal(map[string]interface{}{
+	body := map[string]interface{}{
 		"model":    p.model,
 		"messages": messages,
 		"stream":   true,
-	})
+	}
+	if opts.Temperature > 0 {
+		body["temperature"] = opts.Temperature
+	}
+	if opts.TopP > 0 {
+		body["top_p"] = opts.TopP
+	}
+	if opts.MaxTokens > 0 {
+		body["max_tokens"] = opts.MaxTokens
+	}
+	requestBody, _ := json.Marshal(body)
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", p.url, bytes.NewBuffer(requestBody))
 	p.setHeaders(req)

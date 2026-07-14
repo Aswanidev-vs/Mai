@@ -35,11 +35,11 @@ func (p *HybridProvider) Generate(ctx context.Context, prompt string, opts inter
 	return p.cloud.Generate(ctx, prompt, opts)
 }
 
-func (p *HybridProvider) Stream(ctx context.Context, prompt string, callback func(chunk string)) error {
+func (p *HybridProvider) Stream(ctx context.Context, prompt string, opts interfaces.GenerationOptions, callback func(chunk string)) error {
 	if p.guard.IsSensitive(prompt) {
-		return p.local.Stream(ctx, prompt, callback)
+		return p.local.Stream(ctx, prompt, opts, callback)
 	}
-	return p.cloud.Stream(ctx, prompt, callback)
+	return p.cloud.Stream(ctx, prompt, opts, callback)
 }
 
 func (p *HybridProvider) GenerateStructured(ctx context.Context, prompt string, schema json.RawMessage) (json.RawMessage, error) {

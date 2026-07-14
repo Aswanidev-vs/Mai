@@ -46,10 +46,15 @@ func (p *GeminiProvider) Generate(ctx context.Context, prompt string, opts inter
 			},
 		},
 	}
-	if opts.Temperature > 0 {
-		body["generationConfig"] = map[string]interface{}{
-			"temperature": opts.Temperature,
+	if opts.Temperature > 0 || opts.TopP > 0 {
+		genCfg := map[string]interface{}{}
+		if opts.Temperature > 0 {
+			genCfg["temperature"] = opts.Temperature
 		}
+		if opts.TopP > 0 {
+			genCfg["top_p"] = opts.TopP
+		}
+		body["generationConfig"] = genCfg
 	}
 
 	requestBody, _ := json.Marshal(body)
@@ -70,10 +75,10 @@ func (p *GeminiProvider) Generate(ctx context.Context, prompt string, opts inter
 	return p.parseGenerateResponse(resp.Body)
 }
 
-func (p *GeminiProvider) Stream(ctx context.Context, prompt string, callback func(chunk string)) error {
+func (p *GeminiProvider) Stream(ctx context.Context, prompt string, opts interfaces.GenerationOptions, callback func(chunk string)) error {
 	url := p.baseURL() + ":streamGenerateContent?alt=sse&key=" + p.apiKey
 
-	requestBody, _ := json.Marshal(map[string]interface{}{
+	contents := map[string]interface{}{
 		"contents": []map[string]interface{}{
 			{
 				"parts": []map[string]interface{}{
@@ -81,7 +86,18 @@ func (p *GeminiProvider) Stream(ctx context.Context, prompt string, callback fun
 				},
 			},
 		},
-	})
+	}
+	if opts.Temperature > 0 || opts.TopP > 0 {
+		genCfg := map[string]interface{}{}
+		if opts.Temperature > 0 {
+			genCfg["temperature"] = opts.Temperature
+		}
+		if opts.TopP > 0 {
+			genCfg["top_p"] = opts.TopP
+		}
+		contents["generationConfig"] = genCfg
+	}
+	requestBody, _ := json.Marshal(contents)
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(requestBody))
 	req.Header.Set("Content-Type", "application/json")

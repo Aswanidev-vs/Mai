@@ -28,6 +28,7 @@ type Goal struct {
 type AgentResponse struct {
 	Text     string `json:"text"`
 	Success  bool   `json:"success"`
+	Spoken   bool   `json:"spoken"` // true if the response was already streamed to TTS by the handler
 }
 
 // Agent defines the main orchestrator interface

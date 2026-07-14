@@ -28,7 +28,7 @@ var voiceStyles = map[string]struct {
 	volume float32
 }{
 	"calm":       {0.9, 0.95, 0.9},    // Composed, measured
-	"warm":       {1.0, 1.05, 1.05},   // Gentle, friendly
+	"warm":       {1.05, 1.05, 1.05},  // Gentle, friendly, affectionate cadence
 	"energetic":  {1.15, 1.08, 1.1},   // Bright, fast
 	"serious":    {0.95, 0.95, 1.0},   // Even, authoritative
 	"soft":       {0.85, 0.95, 0.85},  // Quiet, gentle
@@ -105,6 +105,14 @@ func (ta *TTSAdapter) SetVoiceStyle(style string) {
 
 func (ta *TTSAdapter) GetStyleName() string {
 	return ta.styleName
+}
+
+// SetBaseSpeed overrides the baseline speech rate (the real warmth lever for
+// supertonic, which only exposes speed). Call after SetVoiceStyle so it wins.
+func (ta *TTSAdapter) SetBaseSpeed(speed float32) {
+	if speed > 0 {
+		ta.baseSpeed = speed
+	}
 }
 
 func (ta *TTSAdapter) AdaptToEmotion(emotion EmotionState) TTSParams {
