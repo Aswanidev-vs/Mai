@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -351,7 +350,7 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		}
 	}
 
-	knowledgeTriggers := []string{"list me", "list the", "top ", "best ", "show me", "recommend", "what are the", "what is the best", "what are some"}
+	knowledgeTriggers := []string{"list me", "list the", "top ", "best ", "recommend", "compare ", "pros and cons", "alternatives to", "how do i choose"}
 	isKnowledgeRequest := false
 	for _, kw := range knowledgeTriggers {
 		if strings.Contains(lowerText, kw) {
@@ -391,8 +390,7 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	reasoningKeywords := []string{
 		"invent", "create", "solve", "design", "think", "analyze", "plan",
 		"research", "investigate", "calculate", "compare", "evaluate",
-		"why is", "how does", "explain", "what if", "summarize", "write",
-		"what time", "what date", "what day", "tell me the time", "current time", "what is the date",
+		"why is", "how does", "what if", "summarize",
 	}
 
 	requiresReasoning := false
@@ -459,31 +457,40 @@ func (o *Orchestrator) handleFunctionCall(ctx context.Context, text string, emot
 }
 
 func (o *Orchestrator) handleConversation(ctx context.Context, text string, emotion personality.EmotionState, taskType cognition.TaskType) (*interfaces.AgentResponse, error) {
+	lowerText := strings.ToLower(text)
 	var contextParts []string
 
 	if wm := o.memory.Working().GetContext(); wm != "" {
 		contextParts = append(contextParts, "Recent conversation:\n"+wm)
 	}
 
-	if o.memory.RAG() != nil {
-		ragResult, err := o.memory.RAG().Query(ctx, text)
-		if err == nil && ragResult != nil && ragResult.Answer != "" && ragResult.Confidence > 0.3 {
-			contextParts = append(contextParts, "Relevant memory:\n"+ragResult.Answer)
+	// Skip RAG and procedural lookups for short/trivial inputs (greetings, short questions).
+	// These are expensive vector queries that rarely help with simple conversational turns.
+	// Also skip for short self-contained questions that don't need historical context.
+	wordCount := len(strings.Fields(text))
+	simpleQuestionPrefixes := []string{"what ", "how ", "when ", "where ", "who ", "is ", "are ", "can ", "do ", "does ", "have "}
+	isSimpleQuestion := wordCount < 15
+	if isSimpleQuestion {
+		for _, p := range simpleQuestionPrefixes {
+			if strings.HasPrefix(lowerText, p) {
+				isSimpleQuestion = true
+				break
+			}
 		}
 	}
-
-	if procStore, ok := o.memory.Procedural().(*memory.ProceduralStore); ok {
-		if pattern, score := procStore.GetBestPattern(text); pattern != "" && score > 0.7 {
-			contextParts = append(contextParts, "Learned pattern:\n"+pattern)
+	needsContext := wordCount >= 5 && !isSimpleQuestion
+	if needsContext {
+		if o.memory.RAG() != nil {
+			ragResult, err := o.memory.RAG().Query(ctx, text)
+			if err == nil && ragResult != nil && ragResult.Answer != "" && ragResult.Confidence > 0.3 {
+				contextParts = append(contextParts, "Relevant memory:\n"+ragResult.Answer)
+			}
 		}
-	}
 
-	toolsJSON := ""
-	if o.registry != nil {
-		tools := o.registry.List()
-		if len(tools) > 0 {
-			toolsData, _ := json.Marshal(tools)
-			toolsJSON = string(toolsData)
+		if procStore, ok := o.memory.Procedural().(*memory.ProceduralStore); ok {
+			if pattern, score := procStore.GetBestPattern(text); pattern != "" && score > 0.7 {
+				contextParts = append(contextParts, "Learned pattern:\n"+pattern)
+			}
 		}
 	}
 
@@ -493,12 +500,17 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		Emotion:        emotion,
 		WorkingMemory:  o.memory.Working().GetContext(),
 		RAGContext:     "",
-		UserProfile:    o.userModel.GetContextString(),
-		AvailableTools: toolsJSON,
+		UserProfile:    "",
+		AvailableTools: "",
 	}
 
 	if len(contextParts) > 0 {
 		promptCtx.RAGContext = strings.Join(contextParts, "\n---\n")
+	}
+
+	// Only include user profile and tools for substantive conversations, not short turns.
+	if wordCount >= 8 {
+		promptCtx.UserProfile = o.userModel.GetContextString()
 	}
 
 	fullPrompt := o.promptEngine.BuildPrompt(promptCtx)

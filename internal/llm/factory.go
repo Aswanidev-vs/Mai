@@ -90,7 +90,7 @@ func (f *Factory) CreateHybridProvider() (interfaces.LLMProvider, error) {
 		localModel = f.config.LLM.Model
 	}
 	localURL := "http://localhost:11434/api/generate"
-	local := NewOllamaProvider(localModel, localURL, f.config.LLM.SystemPrompt)
+	local := NewOllamaProvider(localModel, localURL, f.config.LLM.SystemPrompt, f.config.LLM.Think)
 
 	// 2. If hybrid mode is off, just return local
 	if !f.config.LLM.HybridMode {
@@ -127,7 +127,7 @@ func (f *Factory) createCloudProvider(provider, model, url, apiKey string) (inte
 		if url == "" {
 			url = "http://localhost:11434/api/generate"
 		}
-		return NewOllamaProvider(model, url, f.config.LLM.SystemPrompt), nil
+		return NewOllamaProvider(model, url, f.config.LLM.SystemPrompt, f.config.LLM.Think), nil
 	case "openai":
 		if url == "" {
 			url = "https://api.openai.com/v1/chat/completions"
@@ -160,7 +160,7 @@ func (f *Factory) createCloudProvider(provider, model, url, apiKey string) (inte
 func (f *Factory) CreateProvider(providerType string) (interfaces.LLMProvider, error) {
 	switch providerType {
 	case "ollama":
-		return NewOllamaProvider(f.config.LLM.Model, f.config.LLM.URL, f.config.LLM.SystemPrompt), nil
+		return NewOllamaProvider(f.config.LLM.Model, f.config.LLM.URL, f.config.LLM.SystemPrompt, f.config.LLM.Think), nil
 	case "openai", "nvidia", "openrouter", "llamacpp":
 		return NewOpenAIProvider(f.config.LLM.Model, f.config.LLM.URL, f.config.LLM.APIKey, f.config.LLM.SystemPrompt), nil
 	case "gemini":

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -17,14 +18,16 @@ type OllamaProvider struct {
 	model        string
 	url          string
 	systemPrompt string
+	think        *bool // nil = use model default, false = disable thinking
 	client       *http.Client
 }
 
-func NewOllamaProvider(model, url, systemPrompt string) *OllamaProvider {
+func NewOllamaProvider(model, url, systemPrompt string, think *bool) *OllamaProvider {
 	return &OllamaProvider{
 		model:        model,
 		url:          url,
 		systemPrompt: systemPrompt,
+		think:        think,
 		client:       &http.Client{Timeout: 5 * time.Minute},
 	}
 }
@@ -42,13 +45,18 @@ func (p *OllamaProvider) Generate(ctx context.Context, prompt string, opts inter
 	if len(opts.StopSequences) > 0 {
 		options["stop"] = opts.StopSequences
 	}
-	requestBody, err := json.Marshal(map[string]interface{}{
-		"model":  p.model,
-		"prompt": prompt,
-		"system": p.systemPrompt,
-		"stream": false,
+	reqBody := map[string]interface{}{
+		"model":   p.model,
+		"prompt":  prompt,
+		"system":  p.systemPrompt,
+		"stream":  false,
 		"options": options,
-	})
+	}
+	if p.think != nil {
+		reqBody["think"] = *p.think
+		log.Printf("[OLLAMA] think mode: %v", *p.think)
+	}
+	requestBody, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", err
 	}
@@ -69,7 +77,7 @@ func (p *OllamaProvider) Generate(ctx context.Context, prompt string, opts inter
 		return "", fmt.Errorf("ollama error status: %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -77,7 +85,7 @@ func (p *OllamaProvider) Generate(ctx context.Context, prompt string, opts inter
 	var result struct {
 		Response string `json:"response"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
+	if err := json.Unmarshal(respBody, &result); err != nil {
 		return "", err
 	}
 
@@ -94,13 +102,17 @@ func (p *OllamaProvider) Stream(ctx context.Context, prompt string, opts interfa
 	if opts.MaxTokens > 0 {
 		options["num_predict"] = opts.MaxTokens
 	}
-	requestBody, err := json.Marshal(map[string]interface{}{
+	reqBody := map[string]interface{}{
 		"model":   p.model,
 		"prompt":  prompt,
 		"system":  p.systemPrompt,
 		"stream":  true,
 		"options": options,
-	})
+	}
+	if p.think != nil {
+		reqBody["think"] = *p.think
+	}
+	requestBody, err := json.Marshal(reqBody)
 	if err != nil {
 		return err
 	}
@@ -140,13 +152,17 @@ func (p *OllamaProvider) Stream(ctx context.Context, prompt string, opts interfa
 
 func (p *OllamaProvider) GenerateStructured(ctx context.Context, prompt string, schema json.RawMessage) (json.RawMessage, error) {
 	// Ollama support for format: "json"
-	requestBody, err := json.Marshal(map[string]interface{}{
+	reqBody := map[string]interface{}{
 		"model":  p.model,
 		"prompt": prompt,
 		"system": p.systemPrompt,
 		"stream": false,
 		"format": "json",
-	})
+	}
+	if p.think != nil {
+		reqBody["think"] = *p.think
+	}
+	requestBody, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +179,7 @@ func (p *OllamaProvider) GenerateStructured(ctx context.Context, prompt string, 
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +187,7 @@ func (p *OllamaProvider) GenerateStructured(ctx context.Context, prompt string, 
 	var result struct {
 		Response string `json:"response"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
+	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, err
 	}
 
