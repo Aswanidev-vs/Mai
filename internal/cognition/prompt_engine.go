@@ -315,7 +315,7 @@ func (pe *PromptEngine) ClassifyTask(text string, hasCommandTriggers bool) TaskT
 	}
 
 	reasoningKeywords := []string{
-		"analyze", "explain", "why", "how does", "compare", "evaluate",
+		"analyze", "why", "how does", "compare", "evaluate",
 		"think", "reason", "consider", "what if", "implications",
 	}
 	for _, kw := range reasoningKeywords {

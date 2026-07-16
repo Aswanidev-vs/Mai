@@ -4,8 +4,8 @@
   "preferences": [],
   "patterns": [],
   "first_seen": "2026-05-28T20:28:44.0033523+05:30",
-  "last_seen": "2026-07-14T19:08:42.2767163+05:30",
-  "total_interactions": 210,
+  "last_seen": "2026-07-16T15:06:40.6387683+05:30",
+  "total_interactions": 218,
   "frequent_apps": [
     "I'm here. What do you need? I'm here. Play Perfect on YouTube.",
     "Open YouTube app directly.",
@@ -17,6 +17,7 @@
   "topics": {
     "coding": 4,
     "food": 1,
+    "movies": 1,
     "music": 4,
     "research": 8
   }

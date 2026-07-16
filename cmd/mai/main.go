@@ -327,6 +327,71 @@ func main() {
 	}
 	defer sherpa.DeleteOfflineTts(tts)
 
+	// Voice cloning: load reference audio if enabled and active model supports it.
+	var refAudio []float32
+	var refSampleRate int
+	voiceCloneEnabled := cfg.TTS.VoiceCloning.Enabled &&
+		(cfg.TTS.ActiveModel == "pocket" || cfg.TTS.ActiveModel == "zipvoice")
+	if voiceCloneEnabled && cfg.TTS.VoiceCloning.ReferenceAudio != "" {
+		wav := sherpa.ReadWaveMultiChannel(cfg.TTS.VoiceCloning.ReferenceAudio)
+		if wav != nil && wav.SamplesPerChannel > 0 && wav.SampleRate > 0 {
+			// Mix down to mono if stereo
+			if wav.ChannelCount > 1 {
+				mono := make([]float32, wav.SamplesPerChannel)
+				for i := 0; i < wav.SamplesPerChannel; i++ {
+					sum := float32(0)
+					for ch := 0; ch < wav.ChannelCount; ch++ {
+						sum += wav.Samples[ch*wav.SamplesPerChannel+i]
+					}
+					mono[i] = sum / float32(wav.ChannelCount)
+				}
+				refAudio = mono
+			} else {
+				refAudio = make([]float32, wav.SamplesPerChannel)
+				copy(refAudio, wav.Samples[:wav.SamplesPerChannel])
+			}
+			refSampleRate = wav.SampleRate
+			wav.Release()
+			log.Printf("[TTS] Voice cloning loaded: %s (%d samples, %d Hz, %d ch)",
+				cfg.TTS.VoiceCloning.ReferenceAudio, len(refAudio), refSampleRate, wav.ChannelCount)
+		} else {
+			sr := 0
+			ns := 0
+			if wav != nil {
+				sr = wav.SampleRate
+				ns = wav.SamplesPerChannel
+			}
+			log.Printf("[TTS] WARNING: Failed to load reference audio %s (sample_rate=%d, samples=%d), falling back to default voice",
+				cfg.TTS.VoiceCloning.ReferenceAudio, sr, ns)
+			if wav != nil {
+				wav.Release()
+			}
+			voiceCloneEnabled = false
+		}
+	}
+
+	// synthesize picks the right TTS method based on active model and voice cloning config.
+	// For supertonic or when cloning is off: uses GenerateWithCallback (fast, default voice).
+	// For pocket/zipvoice with cloning on: uses GenerateWithConfig with reference audio.
+	synthesize := func(text string, speed float32, cb func([]float32) bool) {
+		if voiceCloneEnabled && refAudio != nil {
+			ttsMu.Lock()
+			tts.GenerateWithConfig(text, &sherpa.GenerationConfig{
+				Speed:               speed,
+				ReferenceAudio:      refAudio,
+				ReferenceSampleRate: refSampleRate,
+				ReferenceText:       cfg.TTS.VoiceCloning.ReferenceText,
+			}, func(samples []float32, _ float32) bool {
+				return cb(samples)
+			})
+			ttsMu.Unlock()
+		} else {
+			ttsMu.Lock()
+			tts.GenerateWithCallback(text, cfg.TTS.Supertonic.Sid, speed, cb)
+			ttsMu.Unlock()
+		}
+	}
+
 	// Realtime TTS: streamed sentences are enqueued here and played one at a
 	// time by a single player goroutine, so the first audio starts as soon as
 	// the first sentence is ready and playback never overlaps.
@@ -358,36 +423,27 @@ func main() {
 
 		if bus != nil && cfg.Server.Enabled && companionHasClient() {
 			// ── Browser companion: stream chunks, stop on barge-in ──
-			const outSR = 44100 // Supertonic output rate
-			ttsMu.Lock()
-			tts.GenerateWithCallback(text, cfg.TTS.Supertonic.Sid, speed,
-				func(samples []float32) bool {
-					if atomic.LoadInt32(&stopPlayback) != 0 {
-						return false
-					}
-					publishTTSAudioChunk(bus, samples, outSR, false)
-					return true
-				},
-			)
-			ttsMu.Unlock()
-			// End-of-utterance marker (also used to halt the browser on barge-in).
+			const outSR = 44100
+			synthesize(text, speed, func(samples []float32) bool {
+				if atomic.LoadInt32(&stopPlayback) != 0 {
+					return false
+				}
+				publishTTSAudioChunk(bus, samples, outSR, false)
+				return true
+			})
 			publishTTSAudioChunk(bus, nil, outSR, true)
 		} else {
 			// ── Local-only path: streaming playback ──
 			atomic.StoreInt32(&ttsPlaying, 1)
 			atomic.StoreInt32(&stopPlayback, 0)
 			_ = playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
-				ttsMu.Lock()
-				tts.GenerateWithCallback(text, cfg.TTS.Supertonic.Sid, speed,
-					func(samples []float32) bool {
-						if atomic.LoadInt32(&stopPlayback) != 0 {
-							return false
-						}
-						ch <- samples
-						return true
-					},
-				)
-				ttsMu.Unlock()
+				synthesize(text, speed, func(samples []float32) bool {
+					if atomic.LoadInt32(&stopPlayback) != 0 {
+						return false
+					}
+					ch <- samples
+					return true
+				})
 			})
 			atomic.StoreInt32(&ttsPlaying, 0)
 		}
@@ -414,10 +470,17 @@ func main() {
 	}()
 	// Test TTS on startup
 	go func() {
-		testAudio := tts.Generate("System ready.", cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
-		if testAudio != nil {
-			playAudio(ctx, testAudio.Samples, testAudio.SampleRate, nil)
+		if voiceCloneEnabled {
+			log.Printf("[TTS] Voice cloning active (model: %s)", cfg.TTS.ActiveModel)
 		}
+		sr := cfg.TTS.OutputSampleRate
+		if sr == 0 {
+			sr = 44100
+		}
+		synthesize("System ready.", cfg.TTS.Supertonic.Speed, func(samples []float32) bool {
+			playAudio(ctx, samples, sr, nil)
+			return true
+		})
 	}()
 
 	// Initialize automation system
@@ -649,14 +712,10 @@ func main() {
 			bargeCount = 0
 			atomic.StoreInt32(&stopPlayback, 0)
 			playErr := playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
-				ttsMu.Lock()
-				tts.GenerateWithCallback(response, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed,
-					func(samples []float32) bool {
-						ch <- samples
-						return true
-					},
-				)
-				ttsMu.Unlock()
+				synthesize(response, cfg.TTS.Supertonic.Speed, func(samples []float32) bool {
+					ch <- samples
+					return true
+				})
 			})
 			if playErr != nil {
 				log.Printf("[TTS] Play error: %v", playErr)
@@ -1007,7 +1066,7 @@ func startOllama() func() {
 func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt string) (string, error) {
 	client := &http.Client{}
 
-	requestBody, _ := json.Marshal(map[string]interface{}{
+	body := map[string]interface{}{
 		"model":  cfg.LLM.Model,
 		"prompt": prompt,
 		"system": cfg.LLM.SystemPrompt,
@@ -1017,7 +1076,11 @@ func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt strin
 			"top_p":       cfg.LLM.Sampling.TopP,
 			"num_predict": cfg.LLM.Sampling.MaxTokens,
 		},
-	})
+	}
+	if cfg.LLM.Think != nil {
+		body["think"] = *cfg.LLM.Think
+	}
+	requestBody, _ := json.Marshal(body)
 
 	log.Printf("[OLLAMA] Requesting response from %s...", cfg.LLM.Model)
 	req, _ := http.NewRequestWithContext(ctx, "POST", cfg.LLM.URL, bytes.NewBuffer(requestBody))
@@ -1032,11 +1095,11 @@ func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt strin
 		return "", fmt.Errorf("ollama error status: %d", resp.StatusCode)
 	}
 
-	body, _ := io.ReadAll(resp.Body)
+	respBody, _ := io.ReadAll(resp.Body)
 	var result struct {
 		Response string `json:"response"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
+	if err := json.Unmarshal(respBody, &result); err != nil {
 		return "", err
 	}
 
