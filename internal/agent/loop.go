@@ -45,6 +45,11 @@ type Orchestrator struct {
 	lastSpoken   string
 	lastSpokenAt time.Time
 
+	// recentUserInputs guards against the TTS→STT loop: if the mic picks up
+	// Mai's own voice (or the user's own words echoed back) and it reaches ASR
+	// a second time, we drop it instead of speaking it back.
+	recentUserInputs []string
+
 	DirectAction func(text string) (bool, string, error)
 	TTSFunc      func(text string, speed float32)
 
@@ -233,12 +238,28 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return nil, fmt.Errorf("input must contain 'text' field")
 	}
 
-	if time.Since(o.lastSpokenAt) < 5*time.Second && o.lastSpoken != "" {
-		inputLower := strings.ToLower(text)
-		if isEcho(inputLower, o.lastSpoken) {
-			log.Printf("[Agent] Echo detected — ignoring: %q", text)
+	// Echo guard: drop inputs that are just Mai's own previous speech echoed
+	// back through the mic, or the user's own words repeated (the TTS→STT loop).
+	// Window measured from when she FINISHED speaking would be ideal, but
+	// lastSpokenAt is set when speech starts; widen it so long replies still
+	// covered, and also reject near-duplicate recent user inputs.
+	inputLower := strings.ToLower(text)
+	if o.lastSpoken != "" && isEcho(inputLower, o.lastSpoken) {
+		log.Printf("[Agent] Echo of Mai's speech detected — ignoring: %q", text)
+		return &interfaces.AgentResponse{Text: "", Success: true}, nil
+	}
+	for _, prev := range o.recentUserInputs {
+		if isEcho(inputLower, prev) {
+			log.Printf("[Agent] Repeat of recent user input detected — ignoring: %q", text)
 			return &interfaces.AgentResponse{Text: "", Success: true}, nil
 		}
+	}
+
+	// Record this as a genuine user turn (bounded ring) so we can reject it if
+	// the mic echoes it back within the loop window.
+	o.recentUserInputs = append(o.recentUserInputs, inputLower)
+	if len(o.recentUserInputs) > 5 {
+		o.recentUserInputs = o.recentUserInputs[1:]
 	}
 
 	o.status = interfaces.StatusThinking
@@ -530,6 +551,18 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	onChunk := func(chunk string) {
 		full.WriteString(chunk)
 		pending.WriteString(chunk)
+		// Publish the raw token to the event bus so the bridge can
+		// forward it to the browser for low-latency text streaming.
+		if o.bus != nil {
+			o.bus.Publish(interfaces.Event{
+				Type:   "chat.response",
+				Source: "agent.orchestrator",
+				Payload: map[string]interface{}{
+					"text": chunk,
+					"done": false,
+				},
+			})
+		}
 		for {
 			seg, ok := takeSentence(&pending)
 			if !ok {
@@ -549,6 +582,17 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	if ctx.Err() == nil {
 		if rem := cleanResponse(pending.String()); strings.TrimSpace(rem) != "" {
 			o.publishTTS(rem)
+		}
+		// Signal stream completion so the browser companion finalizes the transcript.
+		if o.bus != nil {
+			o.bus.Publish(interfaces.Event{
+				Type:   "chat.response",
+				Source: "agent.orchestrator",
+				Payload: map[string]interface{}{
+					"text": "",
+					"done": true,
+				},
+			})
 		}
 	}
 
@@ -603,7 +647,7 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 // ("", false) when no sentence is ready yet.
 func takeSentence(buf *strings.Builder) (string, bool) {
 	s := buf.String()
-	const maxLen = 160
+	const maxLen = 100
 
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -622,12 +666,25 @@ func takeSentence(buf *strings.Builder) (string, bool) {
 	if len(s) >= maxLen {
 		cut := strings.LastIndex(s[:maxLen], ",")
 		if cut < 0 {
+			cut = strings.LastIndex(s[:maxLen], ";")
+		}
+		if cut < 0 {
 			cut = strings.LastIndex(s[:maxLen], " ")
 		}
 		if cut < 0 {
 			cut = maxLen
 		}
 		return consumeSentence(buf, s, cut+1)
+	}
+
+	// Early flush at 60 chars on clause breaks (comma/semicolon + space) to
+	// reduce first-audio latency without waiting for the full maxLen.
+	if len(s) >= 60 {
+		for i := len(s) - 1; i >= 50; i-- {
+			if (s[i] == ',' || s[i] == ';') && i+1 < len(s) && s[i+1] == ' ' {
+				return consumeSentence(buf, s, i+2)
+			}
+		}
 	}
 
 	return "", false
@@ -823,6 +880,19 @@ func (o *Orchestrator) publishTTS(text string) {
 
 	emotion := o.emotion.GetCurrent()
 	ttsParams := o.GetTTSParams(emotion, text)
+
+	// Always publish a transcript event so the browser companion gets
+	// progressive text even when TTSFunc is wired (bypassing the bus for audio).
+	if o.bus != nil {
+		o.bus.Publish(interfaces.Event{
+			Type:   "chat.response",
+			Source: "agent.orchestrator",
+			Payload: map[string]interface{}{
+				"text": text,
+				"done": false,
+			},
+		})
+	}
 
 	// If a direct TTS sink is wired (streaming sentence queue), use it so the
 	// bus subscribers don't double-play. Otherwise fall back to the event bus.

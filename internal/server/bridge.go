@@ -41,13 +41,21 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		})
 	})
 
-	// Orchestrator response → WS clients
+	// Orchestrator response → WS clients (legacy path via action.tts.request)
 	bus.Subscribe("action.tts.request", func(event interfaces.Event) {
 		text, _ := event.Payload["text"].(string)
 		if text == "" {
 			return
 		}
 		b.hub.BroadcastNotification(NotifChatResponse, ChatResponseChunk{Text: text, Done: true})
+	})
+
+	// Streaming transcript from orchestrator (publishTTS sends per-sentence
+	// chat.response events when TTSFunc is wired, bypassing action.tts.request).
+	bus.Subscribe("chat.response", func(event interfaces.Event) {
+		text, _ := event.Payload["text"].(string)
+		done, _ := event.Payload["done"].(bool)
+		b.hub.BroadcastNotification(NotifChatResponse, ChatResponseChunk{Text: text, Done: done})
 	})
 
 	// TTS audio chunks → WS clients (for browser-side lip sync)

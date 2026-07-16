@@ -90,13 +90,16 @@ ws.on('status.changed', (params) => {
 
 // TTS audio chunks — queue for sequential playback with lip sync
 ws.on('tts.chunk', (params) => {
+    // Always queue: even done-only chunks (empty audio, done=true) must be
+    // enqueued so the drain loop knows when synthesis has ended.
+    if (!params.audio && !params.done) return; // skip truly empty chunks
+    // Ensure analyser is connected before first chunk
+    if (audio.analyser && !character.analyser) {
+        character.setAnalyser(audio.analyser);
+    }
+    audio.queueChunk(params.audio || '', params.sample_rate, !!params.done);
+    // Feed the running audio duration so the viseme schedule stays scaled to reality
     if (params.audio) {
-        // Ensure analyser is connected before first chunk
-        if (audio.analyser && !character.analyser) {
-            character.setAnalyser(audio.analyser);
-        }
-        audio.queueChunk(params.audio, params.sample_rate, !!params.done);
-        // Feed the running audio duration so the viseme schedule stays scaled to reality
         character.setVisemeDuration(audio.getKnownDuration());
     }
 });

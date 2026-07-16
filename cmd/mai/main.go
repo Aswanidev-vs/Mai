@@ -125,6 +125,9 @@ func main() {
 	echoCanceller := NewEchoCanceller(1024)
 	var bargeCount int
 	var ttsStartedAt time.Time
+	// Resampler so browser-path TTS audio (44.1k) can be fed to the 16k echo
+	// reference ring, matching what audio.go does for the local speaker.
+	ttsRefResampler := newResampler(44100, 16000)
 
 	// waitForMicSilence blocks until the mic stays quiet (RMS < 0.0015 for 3 consecutive checks)
 	// or a 500ms deadline is reached. Returns true if silence was detected, false if timed out.
@@ -386,8 +389,22 @@ func main() {
 			})
 			ttsMu.Unlock()
 		} else {
+			// Build the per-request config so supertonic gets NumSteps and the
+			// Extra JSON (e.g. {"lang": "en"}). GenerateWithCallback would drop
+			// these, leaving NumSteps=0 and no language hint — which makes
+			// supertonic synthesize silence.
+			genCfg := &sherpa.GenerationConfig{
+				Speed:    speed,
+				Sid:      cfg.TTS.Supertonic.Sid,
+				NumSteps: cfg.TTS.Supertonic.NumSteps,
+			}
+			if cfg.TTS.Supertonic.Extra != "" {
+				genCfg.Extra = json.RawMessage(cfg.TTS.Supertonic.Extra)
+			}
 			ttsMu.Lock()
-			tts.GenerateWithCallback(text, cfg.TTS.Supertonic.Sid, speed, cb)
+			tts.GenerateWithConfig(text, genCfg, func(samples []float32, _ float32) bool {
+				return cb(samples)
+			})
 			ttsMu.Unlock()
 		}
 	}
@@ -420,6 +437,15 @@ func main() {
 			speed = cfg.TTS.Supertonic.Speed
 		}
 		atomic.StoreInt32(&isSpeaking, 1)
+		// Mark TTS as playing so handleAudioFrame's echo-cancel/drop guard runs
+		// for the browser mic too. Without this, the companion path never sets
+		// ttsPlaying and Mai's own voice (echoed through the browser mic) reaches
+		// ASR and gets transcribed as a user turn — the classic feedback loop.
+		atomic.StoreInt32(&ttsPlaying, 1)
+		ttsStartedAt = time.Now()
+		atomic.StoreInt32(&stopPlayback, 0)
+		defer atomic.StoreInt32(&ttsPlaying, 0)
+		log.Printf("[TTS-PLAY] Starting synthesis: speed=%.2f, text=%.80s...", speed, text)
 
 		if bus != nil && cfg.Server.Enabled && companionHasClient() {
 			// ── Browser companion: stream chunks, stop on barge-in ──
@@ -427,6 +453,13 @@ func main() {
 			synthesize(text, speed, func(samples []float32) bool {
 				if atomic.LoadInt32(&stopPlayback) != 0 {
 					return false
+				}
+				// Feed the synthesized samples into the echo reference so the
+				// AEC can subtract Mai's own voice (echoed through the browser
+				// mic) — otherwise barge-in detection would misread her echo as
+				// a user interruption and cut her off.
+				if len(samples) > 0 {
+					refBuffer.Push(ttsRefResampler.resample(samples))
 				}
 				publishTTSAudioChunk(bus, samples, outSR, false)
 				return true
@@ -459,9 +492,12 @@ func main() {
 	go func() {
 		for item := range ttsSentCh {
 			if atomic.LoadInt32(&stopPlayback) != 0 {
+				log.Printf("[TTS-PLAYER] Skipping sentence due to barge-in: %.60s...", item.text)
 				continue // dropped due to an interruption
 			}
+			log.Printf("[TTS-PLAYER] Playing sentence (len=%d): %.80s...", len(item.text), item.text)
 			playSentence(item.text, item.speed)
+			log.Printf("[TTS-PLAYER] Finished playing sentence, queue_depth=%d", len(ttsSentCh))
 			if len(ttsSentCh) == 0 {
 				atomic.StoreInt32(&isSpeaking, 0)
 			}
@@ -561,9 +597,14 @@ func main() {
 				MaxTokens:   cfg.LLM.Sampling.MaxTokens,
 			})
 
-		// Stream generated sentences directly into the serialized TTS queue
-		// (bypasses the event bus so subscribers don't double-play).
+		// Stream generated sentences into the serialized TTS queue.
+		// The playSentence function handles routing: when a browser client
+		// is connected it publishes audio chunks via the event bus (bridge
+		// forwards them to the browser); when no client is connected it
+		// falls back to local audio playback.  The bus subscription added
+		// below covers the local-only fallback path as well.
 		orch.TTSFunc = func(text string, speed float32) {
+			log.Printf("[TTS-FUNC] Enqueuing sentence (len=%d, speed=%.2f): %.80s...", len(text), speed, text)
 			ttsSentCh <- ttsItem{text: text, speed: speed}
 		}
 		interruptCurrent = orch.InterruptCurrent
@@ -705,6 +746,18 @@ func main() {
 			}
 
 			log.Printf("[LLM] Response received. Starting TTS...")
+
+			// Send transcript to browser companion (legacy path).
+			if bus != nil && cfg.Server.Enabled && companionHasClient() {
+				bus.Publish(interfaces.Event{
+					Type:   "chat.response",
+					Source: "main",
+					Payload: map[string]interface{}{
+						"text": response,
+						"done": true,
+					},
+				})
+			}
 
 			// Streaming TTS: generate chunks and play them as they arrive.
 			atomic.StoreInt32(&ttsPlaying, 1)
@@ -861,7 +914,11 @@ func main() {
 
 				if crms > cfg.Audio.BargeInThreshold {
 					bargeCount++
-					if bargeCount >= 2 {
+					// Require sustained residual (not a single-frame echo leak)
+					// and a margin above threshold, so Mai's own voice echoing
+					// through the mic doesn't get misread as a user interruption
+					// and fed back to ASR (which makes her "say back" what was said).
+					if bargeCount >= 4 && crms > cfg.Audio.BargeInThreshold*2 {
 						log.Printf("[BARGE-IN] Real speech over TTS detected (residual RMS=%.4f). Stopping playback.", crms)
 						atomic.StoreInt32(&stopPlayback, 1)
 						if interruptCurrent != nil {
