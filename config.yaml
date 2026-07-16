@@ -61,8 +61,6 @@ tts:
 
   # Select active model: "supertonic" | "pocket" | "zipvoice"
   active_model: "supertonic"
-  # active_model: "pocket"
-
   voice_style: ""  # Optional: "calm", "warm", "energetic", "serious", "soft". Auto-detected from system prompt if empty.
   base_speed: 1.05  # Baseline speech rate. Lower = warmer/calmer. Tune to taste (supertonic honors speed only).
 

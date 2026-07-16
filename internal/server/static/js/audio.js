@@ -76,13 +76,13 @@ class AudioPlayer {
                 console.error('[Audio] Chunk play error:', e);
             }
 
+            // After playing: if this was the final chunk (done=true) and queue
+            // is now empty, wait for audio to finish then exit.
             if (chunk.done && this.queue.length === 0) {
+                await this._waitForLastSource();
                 break;
             }
         }
-
-        // Wait for the last source to finish
-        await this._waitForLastSource();
 
         this.playing = false;
         this._draining = false;
@@ -97,6 +97,11 @@ class AudioPlayer {
         return new Promise((resolve, reject) => {
             try {
                 const binaryString = atob(base64Audio);
+                // Zero-length chunk = done marker; resolve immediately.
+                if (binaryString.length === 0) {
+                    resolve();
+                    return;
+                }
                 const bytes = new Uint8Array(binaryString.length);
                 for (let i = 0; i < binaryString.length; i++) {
                     bytes[i] = binaryString.charCodeAt(i);
