@@ -493,6 +493,11 @@ func main() {
 		for item := range ttsSentCh {
 			if atomic.LoadInt32(&stopPlayback) != 0 {
 				log.Printf("[TTS-PLAYER] Skipping sentence due to barge-in: %.60s...", item.text)
+				// If we've skipped the last item in the queue, clear stopPlayback
+				// so a fresh TTS response can start playing.
+				if len(ttsSentCh) == 0 {
+					atomic.StoreInt32(&stopPlayback, 0)
+				}
 				continue // dropped due to an interruption
 			}
 			log.Printf("[TTS-PLAYER] Playing sentence (len=%d): %.80s...", len(item.text), item.text)
@@ -500,9 +505,11 @@ func main() {
 			log.Printf("[TTS-PLAYER] Finished playing sentence, queue_depth=%d", len(ttsSentCh))
 			if len(ttsSentCh) == 0 {
 				atomic.StoreInt32(&isSpeaking, 0)
+				atomic.StoreInt32(&stopPlayback, 0) // ensure clean state for next response
 			}
 		}
 		atomic.StoreInt32(&isSpeaking, 0)
+		atomic.StoreInt32(&stopPlayback, 0)
 	}()
 	// Test TTS on startup
 	go func() {
