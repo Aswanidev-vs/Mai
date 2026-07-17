@@ -61,7 +61,7 @@ tts:
 
   # Select active model: "supertonic" | "pocket" | "zipvoice"
   active_model: "supertonic"
-  voice_style: ""  # Optional: "calm", "warm", "energetic", "serious", "soft". Auto-detected from system prompt if empty.
+  voice_style: "soft"  # Matches gothic lolita anime character: gentle, quiet, intimate
   base_speed: 1.05  # Baseline speech rate. Lower = warmer/calmer. Tune to taste (supertonic honors speed only).
 
   supertonic:
