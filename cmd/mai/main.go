@@ -304,6 +304,16 @@ func main() {
 		ttsConfig.Model.Supertonic.TtsJson = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.TTSJson)
 		ttsConfig.Model.Supertonic.UnicodeIndexer = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.UnicodeIndexer)
 		ttsConfig.Model.Supertonic.VoiceStyle = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.VoiceStyle)
+	case "kokoro":
+		ttsConfig.Model.Kokoro.Model = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Model)
+		ttsConfig.Model.Kokoro.Voices = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Voices)
+		ttsConfig.Model.Kokoro.Tokens = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Tokens)
+		ttsConfig.Model.Kokoro.DataDir = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.DataDir)
+		if cfg.TTS.Kokoro.Lexicon != "" {
+			ttsConfig.Model.Kokoro.Lexicon = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Lexicon)
+		}
+		ttsConfig.Model.Kokoro.Lang = cfg.TTS.Kokoro.Lang
+		ttsConfig.Model.Kokoro.LengthScale = cfg.TTS.Kokoro.LengthScale
 	case "pocket":
 		ttsConfig.Model.Pocket.LmFlow = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.LmFlow)
 		ttsConfig.Model.Pocket.LmMain = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.LmMain)
@@ -380,6 +390,7 @@ func main() {
 	// synthesize picks the right TTS method based on active model and voice cloning config.
 	// For supertonic or when cloning is off: uses GenerateWithCallback (fast, default voice).
 	// For pocket/zipvoice with cloning on: uses GenerateWithConfig with reference audio.
+	// For kokoro: uses GenerateWithConfig with speaker ID and language.
 	synthesize := func(text string, speed float32, cb func([]float32) bool) {
 		if voiceCloneEnabled && refAudio != nil {
 			ttsMu.Lock()
@@ -393,17 +404,23 @@ func main() {
 			})
 			ttsMu.Unlock()
 		} else {
-			// Build the per-request config so supertonic gets NumSteps and the
-			// Extra JSON (e.g. {"lang": "en"}). GenerateWithCallback would drop
-			// these, leaving NumSteps=0 and no language hint — which makes
-			// supertonic synthesize silence.
+			// Build the per-request config.
+			// Supertonic needs NumSteps + Extra (lang). Kokoro needs Sid + Extra (lang).
+			// Pocket/ZipVoice need Speed + Sid.
 			genCfg := &sherpa.GenerationConfig{
-				Speed:    speed,
-				Sid:      cfg.TTS.Supertonic.Sid,
-				NumSteps: cfg.TTS.Supertonic.NumSteps,
+				Speed: speed,
+				Sid:   cfg.TTS.Supertonic.Sid, // Reused for Kokoro/Pocket speaker ID
 			}
-			if cfg.TTS.Supertonic.Extra != "" {
-				genCfg.Extra = json.RawMessage(cfg.TTS.Supertonic.Extra)
+			if cfg.TTS.ActiveModel == "supertonic" {
+				genCfg.NumSteps = cfg.TTS.Supertonic.NumSteps
+				if cfg.TTS.Supertonic.Extra != "" {
+					genCfg.Extra = json.RawMessage(cfg.TTS.Supertonic.Extra)
+				}
+			} else if cfg.TTS.ActiveModel == "kokoro" {
+				// Kokoro uses Extra for language (e.g., {"lang": "en-us"})
+				if cfg.TTS.Kokoro.Lang != "" {
+					genCfg.Extra = json.RawMessage(fmt.Sprintf(`{"lang": "%s"}`, cfg.TTS.Kokoro.Lang))
+				}
 			}
 			ttsMu.Lock()
 			tts.GenerateWithConfig(text, genCfg, func(samples []float32, _ float32) bool {
