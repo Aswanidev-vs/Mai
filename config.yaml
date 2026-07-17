@@ -59,7 +59,7 @@ tts:
   debug: 0
   output_sample_rate: 44100  # Supertonic outputs 44.1kHz, Pocket/ZipVoice may differ
 
-  # Select active model: "supertonic" | "pocket" | "zipvoice"
+  # Select active model: "supertonic" | "pocket" | "zipvoice" | "kokoro"
   active_model: "supertonic"
   voice_style: "soft"  # Matches gothic lolita anime character: gentle, quiet, intimate
   base_speed: 1.05  # Baseline speech rate. Lower = warmer/calmer. Tune to taste (supertonic honors speed only).
@@ -77,6 +77,16 @@ tts:
     num_steps: 5
     speed: 1.25
     extra: '{"lang": "en"}'
+
+  kokoro:
+    model_dir: "kokoro-int8-multi-lang-v1_1"
+    model: "model.int8.onnx"
+    voices: "voices.bin"
+    tokens: "tokens.txt"
+    data_dir: "espeak-ng-data"
+    lexicon: ""
+    lang: "en-us"
+    length_scale: 1.15
 
   pocket:
     model_dir: "sherpa-onnx-pocket-tts-2026-01-26"
