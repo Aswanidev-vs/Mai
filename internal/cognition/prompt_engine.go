@@ -309,14 +309,27 @@ func (pe *PromptEngine) getToneDirective(emotion personality.EmotionState) strin
 
 func (pe *PromptEngine) ClassifyTask(text string, hasCommandTriggers bool) TaskType {
 	lower := strings.ToLower(text)
+	words := strings.Fields(text)
 
+	// Short greetings -> TaskGreeting
+	if len(words) <= 3 {
+		greetingKeywords := []string{"hello", "hi", "hey", "good morning", "good evening", "good afternoon", "what's up", "howdy"}
+		for _, kw := range greetingKeywords {
+			if strings.HasPrefix(lower, kw) || lower == kw {
+				return TaskGreeting
+			}
+		}
+	}
+
+	// Explicit command triggers (from DirectAction regex parser) -> TaskCommand
 	if hasCommandTriggers {
 		return TaskCommand
 	}
 
+	// Genuine reasoning requests - must have analytical structure, not just question words
 	reasoningKeywords := []string{
-		"analyze", "why", "how does", "compare", "evaluate",
-		"think", "reason", "consider", "what if", "implications",
+		"analyze", "compare and contrast", "evaluate the pros and cons", "critically examine",
+		"what are the implications", "reason through", "step by step reasoning",
 	}
 	for _, kw := range reasoningKeywords {
 		if strings.Contains(lower, kw) {
@@ -324,9 +337,10 @@ func (pe *PromptEngine) ClassifyTask(text string, hasCommandTriggers bool) TaskT
 		}
 	}
 
+	// Creative tasks - explicit creative verbs
 	creativeKeywords := []string{
-		"write", "create", "compose", "story", "poem", "brainstorm",
-		"imagine", "design", "invent", "creative",
+		"write a story", "write a poem", "compose", "brainstorm ideas", "imagine if",
+		"create a", "design a", "invent a",
 	}
 	for _, kw := range creativeKeywords {
 		if strings.Contains(lower, kw) {
@@ -334,9 +348,9 @@ func (pe *PromptEngine) ClassifyTask(text string, hasCommandTriggers bool) TaskT
 		}
 	}
 
+	// Analysis tasks - explicit analysis verbs with objects
 	analysisKeywords := []string{
-		"summarize", "review", "assess", "report", "status",
-		"what happened", "tell me about",
+		"summarize the", "review the", "assess the", "report on", "status of",
 	}
 	for _, kw := range analysisKeywords {
 		if strings.Contains(lower, kw) {
@@ -344,15 +358,7 @@ func (pe *PromptEngine) ClassifyTask(text string, hasCommandTriggers bool) TaskT
 		}
 	}
 
-	greetingKeywords := []string{"hello", "hi", "hey", "good morning", "good evening", "good afternoon", "what's up"}
-	for _, kw := range greetingKeywords {
-		if strings.HasPrefix(lower, kw) || strings.Contains(lower, kw) {
-			if len(strings.Fields(text)) <= 5 {
-				return TaskGreeting
-			}
-		}
-	}
-
+	// Default to conversation for everything else
 	return TaskConversation
 }
 
