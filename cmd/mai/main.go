@@ -125,9 +125,6 @@ func main() {
 	echoCanceller := NewEchoCanceller(1024)
 	var bargeCount int
 	var ttsStartedAt time.Time
-	// Resampler so browser-path TTS audio (44.1k) can be fed to the 16k echo
-	// reference ring, matching what audio.go does for the local speaker.
-	ttsRefResampler := newResampler(44100, 16000)
 
 	// waitForMicSilence blocks until the mic stays quiet (RMS < 0.0015 for 3 consecutive checks)
 	// or a 500ms deadline is reached. Returns true if silence was detected, false if timed out.
@@ -330,6 +327,13 @@ func main() {
 	}
 	defer sherpa.DeleteOfflineTts(tts)
 
+	// Get TTS output sample rate and create resamplers for browser (44.1k)
+	// and echo reference (16k).
+	ttsSampleRate := tts.SampleRate()
+	log.Printf("[TTS] Engine sample rate: %d Hz", ttsSampleRate)
+	ttsToBrowserResampler := newResampler(ttsSampleRate, 44100)
+	ttsToEchoResampler := newResampler(ttsSampleRate, 16000)
+
 	// Voice cloning: load reference audio if enabled and active model supports it.
 	var refAudio []float32
 	var refSampleRate int
@@ -449,7 +453,6 @@ func main() {
 
 		if bus != nil && cfg.Server.Enabled && companionHasClient() {
 			// ── Browser companion: stream chunks, stop on barge-in ──
-			const outSR = 44100
 			synthesize(text, speed, func(samples []float32) bool {
 				if atomic.LoadInt32(&stopPlayback) != 0 {
 					return false
@@ -459,12 +462,15 @@ func main() {
 				// mic) — otherwise barge-in detection would misread her echo as
 				// a user interruption and cut her off.
 				if len(samples) > 0 {
-					refBuffer.Push(ttsRefResampler.resample(samples))
+					resampledForEcho := ttsToEchoResampler.resample(samples)
+					refBuffer.Push(resampledForEcho)
+					// Resample to 44.1k for browser playback.
+					resampledForBrowser := ttsToBrowserResampler.resample(samples)
+					publishTTSAudioChunk(bus, resampledForBrowser, 44100, false)
 				}
-				publishTTSAudioChunk(bus, samples, outSR, false)
 				return true
 			})
-			publishTTSAudioChunk(bus, nil, outSR, true)
+			publishTTSAudioChunk(bus, nil, 44100, true)
 		} else {
 			// ── Local-only path: streaming playback ──
 			atomic.StoreInt32(&ttsPlaying, 1)
@@ -474,7 +480,9 @@ func main() {
 					if atomic.LoadInt32(&stopPlayback) != 0 {
 						return false
 					}
-					ch <- samples
+					// Resample TTS native rate to 44.1k for local playback.
+					resampled := ttsToBrowserResampler.resample(samples)
+					ch <- resampled
 					return true
 				})
 			})
@@ -663,9 +671,11 @@ func main() {
 			})
 		}
 
-		// Thinking chime — plays when speech transcription is received (LLM processing begins)
+		// Thinking chime — plays when LLM processing begins for reasoning tasks
+		// (not for simple conversational responses).
 		bus.Subscribe("perception.audio.transcription", func(event interfaces.Event) {
-			playThinkingChime()
+			// Transcription received - LLM will process, but don't chime yet.
+			// The worker goroutine will chime when it actually starts thinking.
 		})
 
 		// Bridge for TTS — with emotion-adaptive parameters
@@ -710,7 +720,8 @@ func main() {
 
 	// 6. Pipeline Worker (LLM + TTS + Actions)
 	type Task struct {
-		Text string
+		Text          string
+		IsReasoning   bool // true if task requires actual reasoning (not just chat)
 	}
 	workerChan := make(chan Task, 10)
 	var wg sync.WaitGroup
@@ -721,8 +732,11 @@ func main() {
 			atomic.StoreInt32(&isSpeaking, 1) // Pause ASR while thinking and talking
 			log.Printf("[LLM] Thinking about: %s", task.Text)
 
-			// Play thinking chime to indicate LLM processing
-			playThinkingChime()
+			// Play thinking chime only for reasoning tasks (not simple chat)
+			// and only if enabled in config.
+			if task.IsReasoning && cfg.Audio.ThinkingChime {
+				playThinkingChime()
+			}
 
 			// Try to parse and execute automation action
 			executed, feedback, actionErr := executor.ParseAndExecute(task.Text)
@@ -868,7 +882,10 @@ func main() {
 					go agentBridge.PublishTranscription(sessionText)
 				} else {
 					log.Println("[PIPELINE] Routing to legacy pipeline...")
-					workerChan <- Task{Text: sessionText}
+					// Heuristic: longer inputs (>15 words) are more likely to be
+					// reasoning tasks vs. simple conversational turns.
+					isReasoning := len(strings.Fields(sessionText)) > 15
+					workerChan <- Task{Text: sessionText, IsReasoning: isReasoning}
 				}
 				state = StateWakeWord
 				sessionText = ""

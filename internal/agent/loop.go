@@ -328,7 +328,8 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 
 	searchPlatforms := []string{"google", "bing", "yahoo", "duckduckgo", "wikipedia", "youtube"}
 	isSearchWithoutPlatform := false
-	if strings.HasPrefix(lowerText, "search ") || strings.HasPrefix(lowerText, "find ") || strings.HasPrefix(lowerText, "look up ") || strings.HasPrefix(lowerText, "look ") {
+	// Only match explicit search/find commands at the start, not casual "I'll search" etc.
+	if strings.HasPrefix(lowerText, "search ") || strings.HasPrefix(lowerText, "find ") {
 		hasPlatform := false
 		for _, p := range searchPlatforms {
 			if strings.Contains(lowerText, " on "+p) || strings.Contains(lowerText, " using "+p) {
@@ -363,7 +364,16 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	}
 
 	isLikelyCommand := false
-	commandTriggers := []string{"send", "message", "play", "open", "close", "launch", "type", "press", "search", "find", "whatsapp", "youtube", "spotify", "set a", "remind", "schedule"}
+	// Only treat as a command if it starts with an imperative verb or contains
+	// an explicit action pattern. Avoid matching casual conversational uses
+	// like "I'll search for that" or "Can you find...".
+	commandTriggers := []string{
+		"send message", "send a message", "send the message",
+		"play ", "open ", "close ", "launch ",
+		"type ", "press ",
+		"whatsapp", "youtube", "spotify",
+		"set a reminder", "set reminder", "schedule ", "remind me to",
+	}
 	for _, cmd := range commandTriggers {
 		if strings.Contains(lowerText, cmd) {
 			isLikelyCommand = true
@@ -371,7 +381,11 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		}
 	}
 
-	knowledgeTriggers := []string{"list me", "list the", "top ", "best ", "recommend", "compare ", "pros and cons", "alternatives to", "how do i choose"}
+	knowledgeTriggers := []string{
+		"list me the", "list the", "top 10", "top 5", "top three",
+		"best way to", "best approach to", "recommend a", "recommend an",
+		"compare the", "pros and cons of", "alternatives to", "how do i choose",
+	}
 	isKnowledgeRequest := false
 	for _, kw := range knowledgeTriggers {
 		if strings.Contains(lowerText, kw) {
@@ -388,7 +402,10 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return &interfaces.AgentResponse{Text: response, Success: true}, nil
 	}
 
-	multiStepIndicators := []string{"and then", "after that", "first", "also", "as well as", "do all", "prep ", "prepare", "set up"}
+	multiStepIndicators := []string{
+		"and then", "after that,", "first,", "then ", "next ",
+		"do all of these", "prep ", "prepare ", "set up ",
+	}
 	isMultiStep := false
 	for _, ind := range multiStepIndicators {
 		if strings.Contains(lowerText, ind) {
@@ -408,24 +425,10 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return o.handleFunctionCall(ctx, text, emotionState)
 	}
 
-	reasoningKeywords := []string{
-		"invent", "create", "solve", "design", "think", "analyze", "plan",
-		"research", "investigate", "calculate", "compare", "evaluate",
-		"why is", "how does", "what if", "summarize",
-	}
-
-	requiresReasoning := false
-	if !isLikelyCommand {
-		for _, kw := range reasoningKeywords {
-			if strings.Contains(lowerText, kw) {
-				requiresReasoning = true
-				break
-			}
-		}
-	}
-
-	if requiresReasoning {
-		log.Printf("[Agent] Engaging Reasoning Engine: %s", text)
+	// Use PromptEngine's classification for reasoning - it's much more restrictive
+	// and only triggers on explicit analytical requests, not casual questions.
+	if taskType == cognition.TaskReasoning {
+		log.Printf("[Agent] Engaging Reasoning Engine (PromptEngine classified as reasoning): %s", text)
 		response, err := o.react.Execute(ctx, text)
 		if err != nil {
 			return nil, err
@@ -433,7 +436,7 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return &interfaces.AgentResponse{Text: o.adaptResponse(response, emotionState), Success: true}, nil
 	}
 
-	log.Printf("[Agent] Conversational input: %s", text)
+	log.Printf("[Agent] Conversational input (taskType=%s): %s", taskType, text)
 	return o.handleConversation(ctx, text, emotionState, taskType)
 }
 
