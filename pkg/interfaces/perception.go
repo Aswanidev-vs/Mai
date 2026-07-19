@@ -6,9 +6,9 @@ import (
 
 // PerceptionEvent represents a sensory input event
 type PerceptionEvent struct {
-	Type     string                 `json:"type"` // "audio", "vision", "sensor"
-	Source   string                 `json:"source"`
-	Payload  map[string]interface{} `json:"payload"`
+	Type    string                 `json:"type"` // "audio", "vision", "sensor"
+	Source  string                 `json:"source"`
+	Payload map[string]interface{} `json:"payload"`
 }
 
 // PerceptionProvider defines the interface for all sensory inputs
