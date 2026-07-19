@@ -28,6 +28,12 @@ const HEAD_SPRING_DAMPING = 16;
 const HEAD_SPRING_MASS = 1;
 const HEAD_SNAP_THRESHOLD = 0.01;   // Snap to target when close enough (Airi)
 
+// ── Gaze Avoidance (Embarrassment/Uncertainty) ──
+const GAZE_AVOID_DURATION = 1.5;      // How long she looks away (seconds)
+const GAZE_AVOID_COOLDOWN = 8.0;      // Min time between avoidance episodes
+const GAZE_AVOID_CHANCE = 1.0;        // 100% trigger when uncertainty detected
+const GAZE_AVOID_SIDE_BIAS = 0.6;     // Tend to look down+side (not straight down)
+
 // CPT-distributed eye saccade intervals (Airi: EYE_SACCADE_INT_STEP=400, EYE_SACCADE_INT_P)
 const SACCADE_STEP = 400;
 const SACCADE_CPT = [
@@ -188,6 +194,20 @@ class CharacterRenderer {
         this.cameraOffsetZ = 0;
         this.baseCameraPosition = new THREE.Vector3();
         this.baseLookAt = new THREE.Vector3();
+
+        // ── Gaze Avoidance State (Embarrassment/Uncertainty) ──
+        this.gazeAvoidActive = false;
+        this.gazeAvoidTimer = 0;
+        this.gazeAvoidDuration = 0;
+        this.gazeAvoidCooldown = 0;
+        this.gazeAvoidTarget = new THREE.Vector3();
+
+        // ── Cloth/Ribbon Physics State ──
+        this.clothBones = [];           // Array of { boneName, restPos, restRot, velocity, type }
+        this.clothWindTime = 0;
+        this.clothGustTimer = 0;
+        this.clothGustActive = false;
+        this.clothGustDirection = new THREE.Vector3();
 
         this._init();
         this._loadModel();
@@ -1037,7 +1057,7 @@ class CharacterRenderer {
 
         // Compute target head angles from mouse position
         const targetYaw = this.mouseX * 0.08;
-        const targetPitch = this.mouseY * 0.04;
+        const targetPitch = -this.mouseY * 0.04; // Negate: mouseY is flipped (top=+1), Three.js rot.x positive = down
         const targetRoll = this.mouseX * 0.02;
 
         const s = this.headSpring;
@@ -1392,6 +1412,23 @@ class CharacterRenderer {
         this.lastInteraction = performance.now();
     }
 
+    // ── Dance Mode ──
+    dance() {
+        if (!this.motionClips || this.motionClips.length === 0) return false;
+        const danceClip = this.motionClips.find(c => c.name === 'dance_show' || c.name.includes('dance'));
+        if (!danceClip) {
+            console.warn('[VRM] Dance clip not found');
+            return false;
+        }
+        this.currentMotion = danceClip;
+        this.motionTime = 0;
+        this.motionPlaying = true;
+        this._setEmotion('excited', 0.8);
+        this.lastInteraction = performance.now();
+        console.log('[VRM] Playing dance motion');
+        return true;
+    }
+
     // ── Enhanced Organic Idle Animation (Airi-style natural movement) ──
     _updateIdle(elapsed, delta) {
         if (!this.vrm?.humanoid) return;
@@ -1586,6 +1623,179 @@ class CharacterRenderer {
         }
     }
 
+    // ── Gaze Avoidance (Embarrassment/Uncertainty) ──
+    // Triggers when AI response contains uncertainty markers ("I'm not sure", "I might be wrong", etc.)
+    // Character looks down and to the side briefly, like a person feeling sheepish
+    _updateGazeAvoidance(delta) {
+        if (!this.vrm?.lookAt) return;
+
+        // Cooldown countdown
+        if (this.gazeAvoidCooldown > 0) {
+            this.gazeAvoidCooldown -= delta;
+        }
+
+        if (this.gazeAvoidActive) {
+            this.gazeAvoidTimer += delta;
+            const progress = Math.min(1, this.gazeAvoidTimer / this.gazeAvoidDuration);
+
+            // Smooth in-out curve
+            const ease = progress < 0.5
+                ? 2 * progress * progress
+                : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+
+            // Interpolate gaze point toward avoidance target
+            if (this.vrm.lookAt.target) {
+                this.vrm.lookAt.target.position.lerp(this.gazeAvoidTarget, ease * 0.15);
+                this.vrm.lookAt.update(delta);
+            }
+
+            // End avoidance
+            if (progress >= 1) {
+                this.gazeAvoidActive = false;
+                this.gazeAvoidTimer = 0;
+                this.gazeAvoidCooldown = GAZE_AVOID_COOLDOWN;
+            }
+        }
+    }
+
+    // Public API: call when streaming response contains uncertainty markers
+    // (app.js already verified the marker exists, so just trigger)
+    setGazeAvoidTrigger() {
+        if (!this.vrm?.lookAt || this.gazeAvoidActive || this.gazeAvoidCooldown > 0) return;
+
+        this.gazeAvoidActive = true;
+        this.gazeAvoidTimer = 0;
+        this.gazeAvoidDuration = GAZE_AVOID_DURATION * (0.7 + secureRand() * 0.6); // 1.05-1.95s
+
+        const side = secureRand() < 0.5 ? -1 : 1;
+        const sideBias = GAZE_AVOID_SIDE_BIAS;
+        this.gazeAvoidTarget.set(
+            this.defaultLookAt.x + side * this._rand(0.3, 0.6) * sideBias,
+            this.defaultLookAt.y - this._rand(0.15, 0.35), // look down
+            this.defaultLookAt.z
+        );
+
+        // Also trigger a subtle embarrassed expression if available
+        if (this.vrm.expressionManager) {
+            const hasBlush = this.vrm.expressionManager.expressionMap?.has('blush') ?? false;
+            if (hasBlush) {
+                this.vrm.expressionManager.setValue('blush', 0.3 + secureRand() * 0.2);
+            }
+        }
+    }
+
+    // ── Cloth/Ribbon Procedural Physics ──
+    // Adds wind-affected micro-movement to accessory bones (ribbons, collars, skirts, etc.)
+    _updateClothPhysics(delta, elapsed) {
+        if (!this.vrm?.humanoid || this.clothBones.length === 0) return;
+
+        const h = this.vrm.humanoid;
+
+        // Initialize cloth bones on first run (find common accessory bone names)
+        if (!this._clothInitialized) {
+            this._clothInitialized = true;
+            const accessoryBoneNames = [
+                'ribbon', 'collar', 'necktie', 'bow', 'scarf',
+                'skirt', 'skirtFront', 'skirtBack', 'skirtLeft', 'skirtRight',
+                'coat', 'coatTail', 'jacket', 'cape', 'cloak',
+                'hairRibbon', 'hairBand', 'hairTail', 'sideTail',
+                'apron', 'frill', 'lace', 'ribbonBack', 'ribbonFront',
+            ];
+
+            for (const boneName of accessoryBoneNames) {
+                const node = h.getNormalizedBoneNode(boneName);
+                if (node) {
+                    this.clothBones.push({
+                        node,
+                        boneName,
+                        restRot: node.rotation.clone(),
+                        restPos: node.position.clone(),
+                        velocity: new THREE.Vector3(),
+                        angularVelocity: new THREE.Euler(),
+                        stiffness: CLOTH_SPRING_STIFFNESS * (0.8 + secureRand() * 0.4), // variance per bone
+                        drag: CLOTH_DRAG_COEFF,
+                        mass: 0.5 + secureRand() * 0.5, // 0.5-1.0
+                    });
+                }
+            }
+            console.log(`[VRM] Cloth physics initialized on ${this.clothBones.length} bones`);
+        }
+
+        // Wind simulation
+        this.clothWindTime += delta;
+
+        // Base wind (slow, continuous)
+        const windX = Math.sin(this.clothWindTime * CLOTH_WIND_BASE_SPEED) * 0.008;
+        const windZ = Math.sin(this.clothWindTime * CLOTH_WIND_BASE_SPEED * 1.3 + 0.7) * 0.005;
+
+        // Random gusts
+        if (!this.clothGustActive && secureRand() < CLOTH_WIND_GUST_CHANCE) {
+            this.clothGustActive = true;
+            this.clothGustTimer = CLOTH_WIND_GUST_DURATION;
+            this.clothGustDirection.set(
+                (secureRand() - 0.5) * 2,
+                secureRand() * 0.5,
+                (secureRand() - 0.5) * 2
+            ).normalize();
+        }
+
+        let gustX = 0, gustZ = 0;
+        if (this.clothGustActive) {
+            this.clothGustTimer -= delta;
+            const gustStrength = Math.sin((1 - this.clothGustTimer / CLOTH_WIND_GUST_DURATION) * Math.PI) * 0.02;
+            gustX = this.clothGustDirection.x * gustStrength;
+            gustZ = this.clothGustDirection.z * gustStrength;
+            if (this.clothGustTimer <= 0) {
+                this.clothGustActive = false;
+            }
+        }
+
+        // Head movement influence (cloth follows head with delay)
+        const headNode = h.getNormalizedBoneNode('head');
+        const headVelX = headNode ? headNode.rotation.y * 0.05 : 0;
+        const headVelZ = headNode ? headNode.rotation.x * 0.03 : 0;
+
+        // Apply physics to each cloth bone
+        for (const cloth of this.clothBones) {
+            const totalWindX = windX + gustX + headVelX;
+            const totalWindZ = windZ + gustZ + headVelZ;
+
+            // Spring force toward rest position
+            const springForceX = (cloth.restRot.x - cloth.node.rotation.x) * cloth.stiffness;
+            const springForceZ = (cloth.restRot.z - cloth.node.rotation.z) * cloth.stiffness;
+            const springForceY = (cloth.restRot.y - cloth.node.rotation.y) * cloth.stiffness * 0.5;
+
+            // Wind force (scaled by bone mass)
+            const windForceX = totalWindX / cloth.mass;
+            const windForceZ = totalWindZ / cloth.mass;
+
+            // Integrate velocity (semi-implicit Euler)
+            cloth.angularVelocity.x += (springForceX + windForceX) * delta;
+            cloth.angularVelocity.z += (springForceZ + windForceZ) * delta;
+            cloth.angularVelocity.y += springForceY * delta;
+
+            // Drag
+            cloth.angularVelocity.x *= cloth.drag;
+            cloth.angularVelocity.y *= cloth.drag;
+            cloth.angularVelocity.z *= cloth.drag;
+
+            // Apply rotation
+            cloth.node.rotation.x += cloth.angularVelocity.x * delta;
+            cloth.node.rotation.y += cloth.angularVelocity.y * delta;
+            cloth.node.rotation.z += cloth.angularVelocity.z * delta;
+
+            // Also apply subtle position sway for hanging items (ribbons, skirt hems)
+            if (cloth.boneName.includes('ribbon') || cloth.boneName.includes('skirt') || cloth.boneName.includes('tail')) {
+                cloth.velocity.x += (windForceX - cloth.node.position.x) * delta * 2;
+                cloth.velocity.z += (windForceZ - cloth.node.position.z) * delta * 2;
+                cloth.velocity.x *= 0.95;
+                cloth.velocity.z *= 0.95;
+                cloth.node.position.x += cloth.velocity.x * delta;
+                cloth.node.position.z += cloth.velocity.z * delta;
+            }
+        }
+    }
+
     _animate() {
         requestAnimationFrame(() => this._animate());
         if (!this.renderer) return; // Wait for async _init to complete
@@ -1597,6 +1807,7 @@ class CharacterRenderer {
             this._updateIdle(elapsed, delta);
             this._updateLife(delta, elapsed);     // emotion posture + idle + rest (after idle)
             this._updateGaze(delta);              // gaze last so it owns the lookAt target
+            this._updateGazeAvoidance(delta);     // gaze avoidance (embarrassment)
 
             this.vrm.humanoid?.update();
             // Update spring bones every frame for smooth hair physics
@@ -1604,6 +1815,9 @@ class CharacterRenderer {
 
             // Procedural hair sway — adds ambient wind/drift on top of spring physics
             this._updateHairSway(elapsed, delta);
+
+            // Cloth/ribbon physics
+            this._updateClothPhysics(delta, elapsed);
 
             this._updateBlink(delta);
             this._updateExpressions(delta);

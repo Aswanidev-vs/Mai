@@ -33,6 +33,11 @@ const emotionLabel = document.getElementById('emotionLabel');
 // Wire chat input to WS
 chat.onSend = (text) => {
     ws.send('chat.input', { text });
+    // Check for dance command
+    const lower = text.toLowerCase();
+    if (/(can you |please |go ahead and |)\b(dance|perform a dance|do a dance|show me a dance|dance show|dance for me)\b/i.test(lower)) {
+        setTimeout(() => character.dance(), 200);
+    }
 };
 
 // WS event handlers
@@ -50,6 +55,29 @@ ws.onDisconnect = () => {
 // Chat response streaming
 let streamingActive = false;
 let ttsTextBuffer = '';
+let gazeAvoidBuffer = '';
+
+// Uncertainty markers that trigger gaze avoidance (embarrassment/shyness)
+const UNCERTAINTY_MARKERS = [
+    "i'm not sure",
+    "i might be wrong",
+    "i don't know",
+    "i'm not certain",
+    "i could be wrong",
+    "not sure",
+    "maybe i'm wrong",
+    "i think",
+    "probably",
+    "perhaps",
+    "i guess",
+    "i suppose",
+    "it depends",
+    "hard to say",
+    "unclear",
+    "uncertain",
+    "i'm unsure",
+    "i'm uncertain",
+];
 
 ws.on('chat.response', (params) => {
     if (params.text) {
@@ -57,10 +85,13 @@ ws.on('chat.response', (params) => {
             chat.startAgentMessage();
             streamingActive = true;
             ttsTextBuffer = '';
+            gazeAvoidBuffer = '';
         }
         chat.streamToken(params.text);
         // Accumulate the spoken text to drive word-accurate lip sync
         ttsTextBuffer += params.text;
+        // Also accumulate for uncertainty detection
+        gazeAvoidBuffer += params.text;
     }
     if (params.done) {
         chat.finalizeMessage();
@@ -69,7 +100,16 @@ ws.on('chat.response', (params) => {
         if (ttsTextBuffer.trim().length > 0) {
             character.prepareVisemes(ttsTextBuffer);
         }
+        // Check for uncertainty markers and trigger gaze avoidance
+        const lower = gazeAvoidBuffer.toLowerCase();
+        for (const marker of UNCERTAINTY_MARKERS) {
+            if (lower.includes(marker)) {
+                character.setGazeAvoidTrigger();
+                break;
+            }
+        }
         ttsTextBuffer = '';
+        gazeAvoidBuffer = '';
     }
 });
 
