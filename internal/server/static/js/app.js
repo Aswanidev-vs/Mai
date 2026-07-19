@@ -33,6 +33,11 @@ const emotionLabel = document.getElementById('emotionLabel');
 // Wire chat input to WS
 chat.onSend = (text) => {
     ws.send('chat.input', { text });
+    // Check for dance command
+    const lower = text.toLowerCase();
+    if (/(can you |please |go ahead and |)\b(dance|perform a dance|do a dance|show me a dance|dance show|dance for me)\b/i.test(lower)) {
+        setTimeout(() => character.dance(), 200);
+    }
 };
 
 // WS event handlers

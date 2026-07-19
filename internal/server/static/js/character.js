@@ -1057,7 +1057,7 @@ class CharacterRenderer {
 
         // Compute target head angles from mouse position
         const targetYaw = this.mouseX * 0.08;
-        const targetPitch = this.mouseY * 0.04;
+        const targetPitch = -this.mouseY * 0.04; // Negate: mouseY is flipped (top=+1), Three.js rot.x positive = down
         const targetRoll = this.mouseX * 0.02;
 
         const s = this.headSpring;
@@ -1410,6 +1410,23 @@ class CharacterRenderer {
     notifyUserPresent() {
         this.userPresent = true;
         this.lastInteraction = performance.now();
+    }
+
+    // ── Dance Mode ──
+    dance() {
+        if (!this.motionClips || this.motionClips.length === 0) return false;
+        const danceClip = this.motionClips.find(c => c.name === 'dance_show' || c.name.includes('dance'));
+        if (!danceClip) {
+            console.warn('[VRM] Dance clip not found');
+            return false;
+        }
+        this.currentMotion = danceClip;
+        this.motionTime = 0;
+        this.motionPlaying = true;
+        this._setEmotion('excited', 0.8);
+        this.lastInteraction = performance.now();
+        console.log('[VRM] Playing dance motion');
+        return true;
     }
 
     // ── Enhanced Organic Idle Animation (Airi-style natural movement) ──
