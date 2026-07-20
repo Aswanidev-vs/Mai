@@ -359,12 +359,12 @@ a {
   border-radius: 50%;
   background: radial-gradient(circle, rgba(155, 109, 255, 0.12) 0%, rgba(232, 140, 165, 0.04) 40%, transparent 70%);
   filter: blur(50px);
-  animation: glow-breathe 6s var(--ease-smooth) infinite alternate;
+  animation: glow-breathe 10s var(--ease-smooth) infinite alternate;
 }
 
 @keyframes glow-breathe {
   0% { opacity: 0.5; transform: scale(1); }
-  100% { opacity: 0.9; transform: scale(1.08); }
+  100% { opacity: 0.85; transform: scale(1.05); }
 }
 
 .character-wrapper {
@@ -378,12 +378,12 @@ a {
     0 0 0 1px rgba(155, 109, 255, 0.04),
     0 24px 80px -24px rgba(0, 0, 0, 0.6),
     0 0 120px -40px rgba(155, 109, 255, 0.12);
-  animation: character-float 8s var(--ease-smooth) infinite alternate;
+  animation: character-float 14s var(--ease-smooth) infinite alternate;
 }
 
 @keyframes character-float {
   0% { transform: translateY(0); }
-  100% { transform: translateY(-8px); }
+  100% { transform: translateY(-4px); }
 }
 
 .character-img {
@@ -834,16 +834,14 @@ a {
   transform: translateY(0);
 }
 
-/* Hero entrance animation — staggered on load */
+/* Hero entrance animation — staggered on load (opacity only, no transform conflict with float) */
 .hero-label,
 .hero-title,
 .hero-sub,
 .hero-actions,
-.hero-stats,
-.hero-character {
+.hero-stats {
   opacity: 0;
-  transform: translateY(20px);
-  animation: hero-enter 0.9s var(--ease-out) forwards;
+  animation: hero-fade-in 1s var(--ease-out) forwards;
 }
 
 .hero-label   { animation-delay: 0.1s; }
@@ -851,13 +849,14 @@ a {
 .hero-sub     { animation-delay: 0.35s; }
 .hero-actions { animation-delay: 0.5s; }
 .hero-stats   { animation-delay: 0.65s; }
-.hero-character { animation-delay: 0.3s; }
 
-@keyframes hero-enter {
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+.hero-character {
+  opacity: 0;
+  animation: hero-fade-in 1.2s var(--ease-out) 0.2s forwards;
+}
+
+@keyframes hero-fade-in {
+  to { opacity: 1; }
 }
 
 /* Feature card icon subtle pulse on hover */
