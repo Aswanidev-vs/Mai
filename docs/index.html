@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mai — Your Offline AI Companion</title>
+  <meta name="description" content="A JARVIS-class autonomous AI assistant. Fully offline. Real-time 3D companion. Voice-driven. Privacy-first.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;1,9..40,300;1,9..40,400&family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,500;0,9..144,700;1,9..144,300&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <!-- Grain overlay -->
+  <div class="grain" aria-hidden="true"></div>
+
+  <!-- Navigation -->
+  <nav class="nav" id="nav">
+    <div class="nav-inner">
+      <a href="#" class="nav-logo">
+        <span>Mai</span>
+      </a>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#how-it-works">How it works</a>
+        <a href="#compare">Compare</a>
+        <a href="https://github.com/Aswanidev-vs/mai" class="nav-github" target="_blank" rel="noopener">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/>
+          </svg>
+          <span>GitHub</span>
+        </a>
+      </div>
+      <button class="nav-mobile-toggle" id="mobileToggle" aria-label="Toggle menu">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+          <line x1="3" y1="6" x2="21" y2="6"/>
+          <line x1="3" y1="12" x2="21" y2="12"/>
+          <line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </button>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="hero">
+    <div class="hero-content">
+      <div class="hero-text">
+        <p class="hero-label">Open-source, offline-first</p>
+        <h1 class="hero-title">
+          Not a chatbot.<br>
+          A <em>companion</em> that<br>
+          thinks with you.
+        </h1>
+        <p class="hero-sub">
+          Mai is a JARVIS-class autonomous assistant that runs entirely on your machine.
+          Voice-driven. Privacy-first. She perceives, reasons, and acts — all without
+          your data ever leaving your device.
+        </p>
+        <div class="hero-actions">
+          <a href="#get-started" class="btn btn-primary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            Get started
+          </a>
+          <a href="#features" class="btn btn-ghost">
+            See what she can do
+          </a>
+        </div>
+        <div class="hero-stats">
+          <div class="stat">
+            <span class="stat-value">100%</span>
+            <span class="stat-label">offline</span>
+          </div>
+          <div class="stat-divider"></div>
+          <div class="stat">
+            <span class="stat-value">&lt;1s</span>
+            <span class="stat-label">latency</span>
+          </div>
+          <div class="stat-divider"></div>
+          <div class="stat">
+            <span class="stat-value">$0</span>
+            <span class="stat-label">cost</span>
+          </div>
+        </div>
+      </div>
+      <div class="hero-character">
+        <div class="character-glow" aria-hidden="true"></div>
+        <div class="character-wrapper">
+          <img src="mai-pfp-github.png" alt="Mai, an anime-style AI assistant with black hair and purple eyes" class="character-img" loading="eager">
+        </div>
+
+      </div>
+    </div>
+    <div class="hero-scroll-hint" aria-hidden="true">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+        <path d="M12 5v14M5 12l7 7 7-7"/>
+      </svg>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section class="features" id="features">
+    <div class="container">
+      <div class="section-header">
+        <p class="section-label">What she does</p>
+        <h2 class="section-title">Everything a voice assistant should be.<br>Nothing it shouldn't.</h2>
+      </div>
+
+      <div class="features-grid">
+        <!-- Card 1 -->
+        <div class="feature-card feature-card--large">
+          <div class="feature-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" y1="19" x2="12" y2="23"/>
+              <line x1="8" y1="23" x2="16" y2="23"/>
+            </svg>
+          </div>
+          <h3>Voice interaction that feels real</h3>
+          <p>Streaming ASR, emotion-aware TTS, and lip-synced 3D character. Speak naturally — she adapts her tone to how you're feeling. Stressed? She slows down. Excited? She matches your energy.</p>
+          <div class="feature-tags">
+            <span class="tag">Sherpa-ONNX</span>
+            <span class="tag">Silero VAD</span>
+            <span class="tag">Supertonic TTS</span>
+          </div>
+        </div>
+
+        <!-- Card 2 -->
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--accent-pink)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+              <circle cx="12" cy="12" r="3"/>
+            </svg>
+          </div>
+          <h3>3D companion with a pulse</h3>
+          <p>Real-time VRM character with breathing, eye saccades, micro-expressions, and mouse-tracking gaze. She blinks, fidgets, and reacts — not a static avatar, a living presence.</p>
+        </div>
+
+        <!-- Card 3 -->
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+          </div>
+          <h3>Zero data leaves your machine</h3>
+          <p>No cloud. No telemetry. No API keys required. Your voice, your conversations, your data — all processed locally with ONNX Runtime. The only person listening is you.</p>
+        </div>
+
+        <!-- Card 4 -->
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--accent-pink)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="16 18 22 12 16 6"/>
+              <polyline points="8 6 2 12 8 18"/>
+            </svg>
+          </div>
+          <h3>She acts, not just answers</h3>
+          <p>Function calling, app automation, UI control, web search, file management. Mai doesn't just tell you how — she does it. Open Chrome, send a WhatsApp, pull up that file.</p>
+        </div>
+
+        <!-- Card 5 -->
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
+              <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
+            </svg>
+          </div>
+          <h3>Memory that actually works</h3>
+          <p>Hierarchical memory: working buffer for context, episodic SQLite for history, semantic vectors for recall, procedural patterns for skills. She remembers what matters.</p>
+        </div>
+
+        <!-- Card 6 -->
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--accent-pink)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="8" x2="12" y2="12"/>
+              <line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+          </div>
+          <h3>Anticipates, doesn't wait</h3>
+          <p>Pattern learning from your habits. Time-of-day routines, frequent apps, conversation topics. After a while, she knows what you need before you ask.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- How it works -->
+  <section class="how" id="how-it-works">
+    <div class="container">
+      <div class="section-header">
+        <p class="section-label">Under the hood</p>
+        <h2 class="section-title">From voice to action in under a second.</h2>
+      </div>
+
+      <div class="pipeline">
+        <div class="pipeline-step" data-step="1">
+          <div class="pipeline-num">01</div>
+          <div class="pipeline-content">
+            <h3>You speak</h3>
+            <p>"Mai, open Chrome and search for Go concurrency patterns"</p>
+          </div>
+          <div class="pipeline-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            </svg>
+          </div>
+        </div>
+
+        <div class="pipeline-connector" aria-hidden="true">
+          <svg width="2" height="40" viewBox="0 0 2 40">
+            <line x1="1" y1="0" x2="1" y2="40" stroke="var(--n-700)" stroke-width="1" stroke-dasharray="4 4"/>
+          </svg>
+        </div>
+
+        <div class="pipeline-step" data-step="2">
+          <div class="pipeline-num">02</div>
+          <div class="pipeline-content">
+            <h3>VAD detects speech</h3>
+            <p>Silero VAD segments your voice from silence. Wake word "Mai" triggers the pipeline.</p>
+          </div>
+          <div class="pipeline-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent-pink)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+              <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+            </svg>
+          </div>
+        </div>
+
+        <div class="pipeline-connector" aria-hidden="true">
+          <svg width="2" height="40" viewBox="0 0 2 40">
+            <line x1="1" y1="0" x2="1" y2="40" stroke="var(--n-700)" stroke-width="1" stroke-dasharray="4 4"/>
+          </svg>
+        </div>
+
+        <div class="pipeline-step" data-step="3">
+          <div class="pipeline-num">03</div>
+          <div class="pipeline-content">
+            <h3>LLM reasons & plans</h3>
+            <p>ReAct loop breaks it into steps: open Chrome, focus window, type query, press Enter.</p>
+          </div>
+          <div class="pipeline-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+              <line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+          </div>
+        </div>
+
+        <div class="pipeline-connector" aria-hidden="true">
+          <svg width="2" height="40" viewBox="0 0 2 40">
+            <line x1="1" y1="0" x2="1" y2="40" stroke="var(--n-700)" stroke-width="1" stroke-dasharray="4 4"/>
+          </svg>
+        </div>
+
+        <div class="pipeline-step" data-step="4">
+          <div class="pipeline-num">04</div>
+          <div class="pipeline-content">
+            <h3>Tools execute</h3>
+            <p>RobotGo automation launches Chrome, types the query, presses Enter. Done.</p>
+          </div>
+          <div class="pipeline-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent-pink)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
+          </div>
+        </div>
+
+        <div class="pipeline-connector" aria-hidden="true">
+          <svg width="2" height="40" viewBox="0 0 2 40">
+            <line x1="1" y1="0" x2="1" y2="40" stroke="var(--n-700)" stroke-width="1" stroke-dasharray="4 4"/>
+          </svg>
+        </div>
+
+        <div class="pipeline-step" data-step="5">
+          <div class="pipeline-num">05</div>
+          <div class="pipeline-content">
+            <h3>Mai responds</h3>
+            <p>"Done." — with emotion-adaptive TTS. Short, warm, done.</p>
+          </div>
+          <div class="pipeline-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Code snippet -->
+  <section class="code-section">
+    <div class="container">
+      <div class="code-block">
+        <div class="code-header">
+          <div class="code-dots">
+            <span></span><span></span><span></span>
+          </div>
+          <span class="code-filename">terminal</span>
+        </div>
+        <pre class="code-body"><code><span class="code-comment"># Clone and build</span>
+<span class="code-prompt">$</span> git clone https://github.com/user/mai.git && cd mai
+<span class="code-prompt">$</span> go build -o mai.exe ./cmd/mai
+
+<span class="code-comment"># Run with companion UI</span>
+<span class="code-prompt">$</span> ./mai.exe --companion
+
+<span class="code-comment"># Open http://localhost:8080</span>
+<span class="code-comment"># Say "Mai" to wake her up</span></code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- Compare -->
+  <section class="compare" id="compare">
+    <div class="container">
+      <div class="section-header">
+        <p class="section-label">The difference</p>
+        <h2 class="section-title">Why Mai, not the usual suspects.</h2>
+      </div>
+
+      <div class="compare-table">
+        <div class="compare-row compare-row--header">
+          <div class="compare-cell"></div>
+          <div class="compare-cell compare-cell--mai">Mai</div>
+          <div class="compare-cell">Cloud assistants</div>
+        </div>
+        <div class="compare-row">
+          <div class="compare-cell">Privacy</div>
+          <div class="compare-cell compare-cell--mai">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            100% offline
+          </div>
+          <div class="compare-cell compare-cell--no">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--error)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            Audio sent to servers
+          </div>
+        </div>
+        <div class="compare-row">
+          <div class="compare-cell">Latency</div>
+          <div class="compare-cell compare-cell--mai">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            Sub-second
+          </div>
+          <div class="compare-cell compare-cell--no">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--error)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            1-3s+ network dependent
+          </div>
+        </div>
+        <div class="compare-row">
+          <div class="compare-cell">Cost</div>
+          <div class="compare-cell compare-cell--mai">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            Zero ongoing fees
+          </div>
+          <div class="compare-cell compare-cell--no">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--error)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            Subscription / metering
+          </div>
+        </div>
+        <div class="compare-row">
+          <div class="compare-cell">Voice cloning</div>
+          <div class="compare-cell compare-cell--mai">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            Built-in, 3-10s samples
+          </div>
+          <div class="compare-cell compare-cell--no">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--error)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            Expensive or unavailable
+          </div>
+        </div>
+        <div class="compare-row">
+          <div class="compare-cell">Customizability</div>
+          <div class="compare-cell compare-cell--mai">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            Swap LLMs, voices, wake words
+          </div>
+          <div class="compare-cell compare-cell--no">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--error)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            Locked to vendor
+          </div>
+        </div>
+        <div class="compare-row">
+          <div class="compare-cell">3D companion</div>
+          <div class="compare-cell compare-cell--mai">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            Live VRM with alive-ness
+          </div>
+          <div class="compare-cell compare-cell--no">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--error)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            Static text UI
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="cta" id="get-started">
+    <div class="container">
+      <div class="cta-inner">
+        <div class="cta-content">
+          <h2 class="cta-title">Ready to meet Mai?</h2>
+          <p class="cta-sub">Open source. MIT licensed. Runs on your existing hardware.</p>
+          <div class="cta-actions">
+            <a href="https://github.com/user/mai" class="btn btn-primary btn-lg" target="_blank" rel="noopener">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/>
+              </svg>
+              View on GitHub
+            </a>
+            <a href="#features" class="btn btn-ghost">Read the docs</a>
+          </div>
+        </div>
+        <div class="cta-character">
+          <img src="mai-pfp-github.png" alt="Mai" class="cta-img" loading="lazy">
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-inner">
+        <div class="footer-brand">
+          <span class="footer-name">Mai</span>
+          <span class="footer-sep">&middot;</span>
+          <span class="footer-license">MIT License</span>
+        </div>
+        <div class="footer-links">
+          <a href="https://github.com/user/mai" target="_blank" rel="noopener">GitHub</a>
+          <a href="#features">Features</a>
+          <a href="#how-it-works">How it works</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <script src="js/main.js"></script>
+</body>
+</html>
