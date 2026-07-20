@@ -33,9 +33,9 @@ const emotionLabel = document.getElementById('emotionLabel');
 // Wire chat input to WS
 chat.onSend = (text) => {
     ws.send('chat.input', { text });
-    // Check for dance command
+    // Check for dance command — simple contains check, covers all phrasings
     const lower = text.toLowerCase();
-    if (/(can you |please |go ahead and |)\b(dance|perform a dance|do a dance|show me a dance|dance show|dance for me)\b/i.test(lower)) {
+    if (lower.includes('dance')) {
         setTimeout(() => character.dance(), 200);
     }
 };
@@ -56,6 +56,7 @@ ws.onDisconnect = () => {
 let streamingActive = false;
 let ttsTextBuffer = '';
 let gazeAvoidBuffer = '';
+let danceTriggered = false;
 
 // Uncertainty markers that trigger gaze avoidance (embarrassment/shyness)
 const UNCERTAINTY_MARKERS = [
@@ -86,12 +87,16 @@ ws.on('chat.response', (params) => {
             streamingActive = true;
             ttsTextBuffer = '';
             gazeAvoidBuffer = '';
+            danceTriggered = false;
         }
         chat.streamToken(params.text);
-        // Accumulate the spoken text to drive word-accurate lip sync
         ttsTextBuffer += params.text;
-        // Also accumulate for uncertainty detection
         gazeAvoidBuffer += params.text;
+        // Trigger dance if AI response mentions dancing and user asked for it
+        if (!danceTriggered && /dance/i.test(params.text)) {
+            danceTriggered = true;
+            character.dance();
+        }
     }
     if (params.done) {
         chat.finalizeMessage();

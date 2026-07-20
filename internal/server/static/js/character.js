@@ -1414,10 +1414,13 @@ class CharacterRenderer {
 
     // ── Dance Mode ──
     dance() {
-        if (!this.motionClips || this.motionClips.length === 0) return false;
+        if (!this.motionClips || this.motionClips.length === 0) {
+            console.warn('[VRM] No motion clips loaded');
+            return false;
+        }
         const danceClip = this.motionClips.find(c => c.name === 'dance_show' || c.name.includes('dance'));
         if (!danceClip) {
-            console.warn('[VRM] Dance clip not found');
+            console.warn('[VRM] Dance clip not found. Available clips:', this.motionClips.map(c => c.name));
             return false;
         }
         this.currentMotion = danceClip;
@@ -1425,7 +1428,7 @@ class CharacterRenderer {
         this.motionPlaying = true;
         this._setEmotion('excited', 0.8);
         this.lastInteraction = performance.now();
-        console.log('[VRM] Playing dance motion');
+        console.log('[VRM] Playing dance motion:', danceClip.name, 'duration:', danceClip.duration);
         return true;
     }
 
