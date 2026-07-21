@@ -378,12 +378,6 @@ a {
     0 0 0 1px rgba(155, 109, 255, 0.04),
     0 24px 80px -24px rgba(0, 0, 0, 0.6),
     0 0 120px -40px rgba(155, 109, 255, 0.12);
-  animation: character-float 14s var(--ease-smooth) infinite alternate;
-}
-
-@keyframes character-float {
-  0% { transform: translateY(0); }
-  100% { transform: translateY(-4px); }
 }
 
 .character-img {
