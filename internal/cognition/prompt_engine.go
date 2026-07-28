@@ -39,22 +39,11 @@ type PromptContext struct {
 
 type PromptEngine struct {
 	personalityName string
-	jarvisTraits    []string
 }
 
 func NewPromptEngine() *PromptEngine {
 	return &PromptEngine{
 		personalityName: "Mai",
-		jarvisTraits: []string{
-			"precise and efficient",
-			"anticipates needs before they're stated",
-			"uses dry wit appropriately",
-			"maintains professional composure",
-			"adapts communication style to the user's emotional state",
-			"provides concise, actionable information",
-			"remembers context from previous interactions",
-			"takes initiative when appropriate",
-		},
 	}
 }
 
@@ -84,17 +73,11 @@ func (pe *PromptEngine) BuildPrompt(ctx PromptContext) string {
 func (pe *PromptEngine) buildConversationPrompt(ctx PromptContext) string {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf(`You are %s — a personal AI assistant modeled after JARVIS from Iron Man.
+	b.WriteString(fmt.Sprintf(`You are %s. Speak and act exactly as the companion persona defined in your system instructions — do not adopt a different identity.
 
-CORE TRAITS:
-- %s
-- You speak naturally, like a trusted advisor
-- You remember past conversations and reference them naturally
-- You adapt your tone to the user's emotional state
-- You are proactive — offering relevant information without being asked
-- You never say "As an AI language model" or similar disclaimers
+Here is the current interaction context:
 
-`, pe.personalityName, strings.Join(pe.jarvisTraits, "\n- ")))
+`, pe.personalityName))
 
 	pe.appendTimeContext(&b, ctx)
 	pe.appendEmotionContext(&b, ctx)
@@ -223,7 +206,7 @@ Be brief, relevant, and helpful. Don't be intrusive.
 func (pe *PromptEngine) buildGreetingPrompt(ctx PromptContext) string {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf(`You are %s greeting your user. Be warm but efficient — like JARVIS.
+	b.WriteString(fmt.Sprintf(`You are %s greeting your user. Be warm and natural, as the companion defined in your system instructions.
 
 Vary your greetings. Reference time of day. If you have pending items, briefly mention them.
 Never use the same greeting twice in a row.
@@ -326,14 +309,27 @@ func (pe *PromptEngine) getToneDirective(emotion personality.EmotionState) strin
 
 func (pe *PromptEngine) ClassifyTask(text string, hasCommandTriggers bool) TaskType {
 	lower := strings.ToLower(text)
+	words := strings.Fields(text)
 
+	// Short greetings -> TaskGreeting
+	if len(words) <= 3 {
+		greetingKeywords := []string{"hello", "hi", "hey", "good morning", "good evening", "good afternoon", "what's up", "howdy"}
+		for _, kw := range greetingKeywords {
+			if strings.HasPrefix(lower, kw) || lower == kw {
+				return TaskGreeting
+			}
+		}
+	}
+
+	// Explicit command triggers (from DirectAction regex parser) -> TaskCommand
 	if hasCommandTriggers {
 		return TaskCommand
 	}
 
+	// Genuine reasoning requests - must have analytical structure, not just question words
 	reasoningKeywords := []string{
-		"analyze", "explain", "why", "how does", "compare", "evaluate",
-		"think", "reason", "consider", "what if", "implications",
+		"analyze", "compare and contrast", "evaluate the pros and cons", "critically examine",
+		"what are the implications", "reason through", "step by step reasoning",
 	}
 	for _, kw := range reasoningKeywords {
 		if strings.Contains(lower, kw) {
@@ -341,9 +337,10 @@ func (pe *PromptEngine) ClassifyTask(text string, hasCommandTriggers bool) TaskT
 		}
 	}
 
+	// Creative tasks - explicit creative verbs
 	creativeKeywords := []string{
-		"write", "create", "compose", "story", "poem", "brainstorm",
-		"imagine", "design", "invent", "creative",
+		"write a story", "write a poem", "compose", "brainstorm ideas", "imagine if",
+		"create a", "design a", "invent a",
 	}
 	for _, kw := range creativeKeywords {
 		if strings.Contains(lower, kw) {
@@ -351,9 +348,9 @@ func (pe *PromptEngine) ClassifyTask(text string, hasCommandTriggers bool) TaskT
 		}
 	}
 
+	// Analysis tasks - explicit analysis verbs with objects
 	analysisKeywords := []string{
-		"summarize", "review", "assess", "report", "status",
-		"what happened", "tell me about",
+		"summarize the", "review the", "assess the", "report on", "status of",
 	}
 	for _, kw := range analysisKeywords {
 		if strings.Contains(lower, kw) {
@@ -361,15 +358,7 @@ func (pe *PromptEngine) ClassifyTask(text string, hasCommandTriggers bool) TaskT
 		}
 	}
 
-	greetingKeywords := []string{"hello", "hi", "hey", "good morning", "good evening", "good afternoon", "what's up"}
-	for _, kw := range greetingKeywords {
-		if strings.HasPrefix(lower, kw) || strings.Contains(lower, kw) {
-			if len(strings.Fields(text)) <= 5 {
-				return TaskGreeting
-			}
-		}
-	}
-
+	// Default to conversation for everything else
 	return TaskConversation
 }
 

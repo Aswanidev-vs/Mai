@@ -2,10 +2,10 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/user/mai/internal/cognition"
@@ -34,11 +34,21 @@ type Orchestrator struct {
 	prosody        *personality.ProsodyAnalyzer
 	ttsAdapter     *personality.TTSAdapter
 
+	genOpts interfaces.GenerationOptions
+
+	turnMu       sync.Mutex
+	currentCancel context.CancelFunc // cancels the in-flight LLM stream (barge-in)
+
 	status       interfaces.AgentStatus
 	cancel       context.CancelFunc
 	lastUserTime time.Time
 	lastSpoken   string
 	lastSpokenAt time.Time
+
+	// recentUserInputs guards against the TTS→STT loop: if the mic picks up
+	// Mai's own voice (or the user's own words echoed back) and it reaches ASR
+	// a second time, we drop it instead of speaking it back.
+	recentUserInputs []string
 
 	DirectAction func(text string) (bool, string, error)
 	TTSFunc      func(text string, speed float32)
@@ -52,6 +62,7 @@ func NewOrchestrator(
 	llm interfaces.LLMProvider,
 	registry interfaces.ToolRegistry,
 	reactLoop *cognition.ReActLoop,
+	genOpts interfaces.GenerationOptions,
 ) *Orchestrator {
 	userModel := NewUserModel("data")
 	proactive := NewProactiveEngine(userModel)
@@ -78,6 +89,7 @@ func NewOrchestrator(
 		ttsAdapter:     personality.NewTTSAdapter(1.25, 1.0, 1.0),
 		status:         interfaces.StatusIdle,
 		skillsRunner:   skillsRunner,
+		genOpts:        genOpts,
 	}
 }
 
@@ -226,12 +238,28 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return nil, fmt.Errorf("input must contain 'text' field")
 	}
 
-	if time.Since(o.lastSpokenAt) < 5*time.Second && o.lastSpoken != "" {
-		inputLower := strings.ToLower(text)
-		if isEcho(inputLower, o.lastSpoken) {
-			log.Printf("[Agent] Echo detected — ignoring: %q", text)
+	// Echo guard: drop inputs that are just Mai's own previous speech echoed
+	// back through the mic, or the user's own words repeated (the TTS→STT loop).
+	// Window measured from when she FINISHED speaking would be ideal, but
+	// lastSpokenAt is set when speech starts; widen it so long replies still
+	// covered, and also reject near-duplicate recent user inputs.
+	inputLower := strings.ToLower(text)
+	if o.lastSpoken != "" && isEcho(inputLower, o.lastSpoken) {
+		log.Printf("[Agent] Echo of Mai's speech detected — ignoring: %q", text)
+		return &interfaces.AgentResponse{Text: "", Success: true}, nil
+	}
+	for _, prev := range o.recentUserInputs {
+		if isEcho(inputLower, prev) {
+			log.Printf("[Agent] Repeat of recent user input detected — ignoring: %q", text)
 			return &interfaces.AgentResponse{Text: "", Success: true}, nil
 		}
+	}
+
+	// Record this as a genuine user turn (bounded ring) so we can reject it if
+	// the mic echoes it back within the loop window.
+	o.recentUserInputs = append(o.recentUserInputs, inputLower)
+	if len(o.recentUserInputs) > 5 {
+		o.recentUserInputs = o.recentUserInputs[1:]
 	}
 
 	o.status = interfaces.StatusThinking
@@ -300,7 +328,8 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 
 	searchPlatforms := []string{"google", "bing", "yahoo", "duckduckgo", "wikipedia", "youtube"}
 	isSearchWithoutPlatform := false
-	if strings.HasPrefix(lowerText, "search ") || strings.HasPrefix(lowerText, "find ") || strings.HasPrefix(lowerText, "look up ") || strings.HasPrefix(lowerText, "look ") {
+	// Only match explicit search/find commands at the start, not casual "I'll search" etc.
+	if strings.HasPrefix(lowerText, "search ") || strings.HasPrefix(lowerText, "find ") {
 		hasPlatform := false
 		for _, p := range searchPlatforms {
 			if strings.Contains(lowerText, " on "+p) || strings.Contains(lowerText, " using "+p) {
@@ -335,7 +364,16 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	}
 
 	isLikelyCommand := false
-	commandTriggers := []string{"send", "message", "play", "open", "close", "launch", "type", "press", "search", "find", "whatsapp", "youtube", "spotify", "set a", "remind", "schedule"}
+	// Only treat as a command if it starts with an imperative verb or contains
+	// an explicit action pattern. Avoid matching casual conversational uses
+	// like "I'll search for that" or "Can you find...".
+	commandTriggers := []string{
+		"send message", "send a message", "send the message",
+		"play ", "open ", "close ", "launch ",
+		"type ", "press ",
+		"whatsapp", "youtube", "spotify",
+		"set a reminder", "set reminder", "schedule ", "remind me to",
+	}
 	for _, cmd := range commandTriggers {
 		if strings.Contains(lowerText, cmd) {
 			isLikelyCommand = true
@@ -343,7 +381,11 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		}
 	}
 
-	knowledgeTriggers := []string{"list me", "list the", "top ", "best ", "show me", "recommend", "what are the", "what is the best", "what are some"}
+	knowledgeTriggers := []string{
+		"list me the", "list the", "top 10", "top 5", "top three",
+		"best way to", "best approach to", "recommend a", "recommend an",
+		"compare the", "pros and cons of", "alternatives to", "how do i choose",
+	}
 	isKnowledgeRequest := false
 	for _, kw := range knowledgeTriggers {
 		if strings.Contains(lowerText, kw) {
@@ -360,7 +402,10 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return &interfaces.AgentResponse{Text: response, Success: true}, nil
 	}
 
-	multiStepIndicators := []string{"and then", "after that", "first", "also", "as well as", "do all", "prep ", "prepare", "set up"}
+	multiStepIndicators := []string{
+		"and then", "after that,", "first,", "then ", "next ",
+		"do all of these", "prep ", "prepare ", "set up ",
+	}
 	isMultiStep := false
 	for _, ind := range multiStepIndicators {
 		if strings.Contains(lowerText, ind) {
@@ -380,25 +425,10 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return o.handleFunctionCall(ctx, text, emotionState)
 	}
 
-	reasoningKeywords := []string{
-		"invent", "create", "solve", "design", "think", "analyze", "plan",
-		"research", "investigate", "calculate", "compare", "evaluate",
-		"why is", "how does", "explain", "what if", "summarize", "write",
-		"what time", "what date", "what day", "tell me the time", "current time", "what is the date",
-	}
-
-	requiresReasoning := false
-	if !isLikelyCommand {
-		for _, kw := range reasoningKeywords {
-			if strings.Contains(lowerText, kw) {
-				requiresReasoning = true
-				break
-			}
-		}
-	}
-
-	if requiresReasoning {
-		log.Printf("[Agent] Engaging Reasoning Engine: %s", text)
+	// Use PromptEngine's classification for reasoning - it's much more restrictive
+	// and only triggers on explicit analytical requests, not casual questions.
+	if taskType == cognition.TaskReasoning {
+		log.Printf("[Agent] Engaging Reasoning Engine (PromptEngine classified as reasoning): %s", text)
 		response, err := o.react.Execute(ctx, text)
 		if err != nil {
 			return nil, err
@@ -406,7 +436,7 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return &interfaces.AgentResponse{Text: o.adaptResponse(response, emotionState), Success: true}, nil
 	}
 
-	log.Printf("[Agent] Conversational input: %s", text)
+	log.Printf("[Agent] Conversational input (taskType=%s): %s", taskType, text)
 	return o.handleConversation(ctx, text, emotionState, taskType)
 }
 
@@ -451,31 +481,40 @@ func (o *Orchestrator) handleFunctionCall(ctx context.Context, text string, emot
 }
 
 func (o *Orchestrator) handleConversation(ctx context.Context, text string, emotion personality.EmotionState, taskType cognition.TaskType) (*interfaces.AgentResponse, error) {
+	lowerText := strings.ToLower(text)
 	var contextParts []string
 
 	if wm := o.memory.Working().GetContext(); wm != "" {
 		contextParts = append(contextParts, "Recent conversation:\n"+wm)
 	}
 
-	if o.memory.RAG() != nil {
-		ragResult, err := o.memory.RAG().Query(ctx, text)
-		if err == nil && ragResult != nil && ragResult.Answer != "" && ragResult.Confidence > 0.3 {
-			contextParts = append(contextParts, "Relevant memory:\n"+ragResult.Answer)
+	// Skip RAG and procedural lookups for short/trivial inputs (greetings, short questions).
+	// These are expensive vector queries that rarely help with simple conversational turns.
+	// Also skip for short self-contained questions that don't need historical context.
+	wordCount := len(strings.Fields(text))
+	simpleQuestionPrefixes := []string{"what ", "how ", "when ", "where ", "who ", "is ", "are ", "can ", "do ", "does ", "have "}
+	isSimpleQuestion := wordCount < 15
+	if isSimpleQuestion {
+		for _, p := range simpleQuestionPrefixes {
+			if strings.HasPrefix(lowerText, p) {
+				isSimpleQuestion = true
+				break
+			}
 		}
 	}
-
-	if procStore, ok := o.memory.Procedural().(*memory.ProceduralStore); ok {
-		if pattern, score := procStore.GetBestPattern(text); pattern != "" && score > 0.7 {
-			contextParts = append(contextParts, "Learned pattern:\n"+pattern)
+	needsContext := wordCount >= 5 && !isSimpleQuestion
+	if needsContext {
+		if o.memory.RAG() != nil {
+			ragResult, err := o.memory.RAG().Query(ctx, text)
+			if err == nil && ragResult != nil && ragResult.Answer != "" && ragResult.Confidence > 0.3 {
+				contextParts = append(contextParts, "Relevant memory:\n"+ragResult.Answer)
+			}
 		}
-	}
 
-	toolsJSON := ""
-	if o.registry != nil {
-		tools := o.registry.List()
-		if len(tools) > 0 {
-			toolsData, _ := json.Marshal(tools)
-			toolsJSON = string(toolsData)
+		if procStore, ok := o.memory.Procedural().(*memory.ProceduralStore); ok {
+			if pattern, score := procStore.GetBestPattern(text); pattern != "" && score > 0.7 {
+				contextParts = append(contextParts, "Learned pattern:\n"+pattern)
+			}
 		}
 	}
 
@@ -485,19 +524,84 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		Emotion:        emotion,
 		WorkingMemory:  o.memory.Working().GetContext(),
 		RAGContext:     "",
-		UserProfile:    o.userModel.GetContextString(),
-		AvailableTools: toolsJSON,
+		UserProfile:    "",
+		AvailableTools: "",
 	}
 
 	if len(contextParts) > 0 {
 		promptCtx.RAGContext = strings.Join(contextParts, "\n---\n")
 	}
 
+	// Only include user profile and tools for substantive conversations, not short turns.
+	if wordCount >= 8 {
+		promptCtx.UserProfile = o.userModel.GetContextString()
+	}
+
 	fullPrompt := o.promptEngine.BuildPrompt(promptCtx)
 
-	response, err := o.llm.Generate(ctx, fullPrompt, interfaces.GenerationOptions{Temperature: 0.4})
-	if err != nil {
+	// Stream the reply token-by-token and speak each completed sentence as it
+	// is produced, so the first audio starts long before the full answer exists.
+	ctx, cancel := context.WithCancel(ctx)
+	o.setTurnCancel(cancel)
+	defer func() {
+		cancel()
+		o.setTurnCancel(nil)
+	}()
+
+	var full strings.Builder
+	var pending strings.Builder
+
+	onChunk := func(chunk string) {
+		full.WriteString(chunk)
+		pending.WriteString(chunk)
+		// Publish the raw token to the event bus so the bridge can
+		// forward it to the browser for low-latency text streaming.
+		if o.bus != nil {
+			o.bus.Publish(interfaces.Event{
+				Type:   "chat.response",
+				Source: "agent.orchestrator",
+				Payload: map[string]interface{}{
+					"text": chunk,
+					"done": false,
+				},
+			})
+		}
+		for {
+			seg, ok := takeSentence(&pending)
+			if !ok {
+				break
+			}
+			sentence := cleanResponse(seg)
+			if strings.TrimSpace(sentence) != "" {
+				o.publishTTS(sentence)
+			}
+		}
+	}
+
+	if err := o.llm.Stream(ctx, fullPrompt, o.genOpts, onChunk); err != nil && ctx.Err() == nil {
 		return nil, err
+	}
+	// Flush any trailing text that didn't end on a sentence boundary (unless interrupted).
+	if ctx.Err() == nil {
+		if rem := cleanResponse(pending.String()); strings.TrimSpace(rem) != "" {
+			o.publishTTS(rem)
+		}
+		// Signal stream completion so the browser companion finalizes the transcript.
+		if o.bus != nil {
+			o.bus.Publish(interfaces.Event{
+				Type:   "chat.response",
+				Source: "agent.orchestrator",
+				Payload: map[string]interface{}{
+					"text": "",
+					"done": true,
+				},
+			})
+		}
+	}
+
+	response := full.String()
+	if strings.TrimSpace(response) == "" {
+		response = "..."
 	}
 
 	if strings.Contains(response, "[ACTION]") {
@@ -511,15 +615,15 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 			executed, feedback, err := o.DirectAction(actionCmd)
 			if err == nil && executed {
 				o.meta.RecordActionResult(true)
-				return &interfaces.AgentResponse{Text: feedback, Success: true}, nil
+				return &interfaces.AgentResponse{Text: feedback, Success: true, Spoken: true}, nil
 			}
 		}
 
 		log.Printf("[Agent] DirectAction failed for [ACTION] %q, routing to ReAct", actionCmd)
-		response, err := o.react.Execute(ctx, actionCmd)
+		reactResp, err := o.react.Execute(ctx, actionCmd)
 		if err == nil {
 			o.meta.RecordActionResult(true)
-			return &interfaces.AgentResponse{Text: response, Success: true}, nil
+			return &interfaces.AgentResponse{Text: reactResp, Success: true, Spoken: true}, nil
 		}
 	}
 
@@ -537,8 +641,66 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	})
 
 	adapted := o.adaptResponse(response, emotion)
-	return &interfaces.AgentResponse{Text: adapted, Success: true}, nil
+	return &interfaces.AgentResponse{Text: adapted, Success: true, Spoken: true}, nil
 }
+
+// takeSentence extracts the next complete sentence from buf, mutating buf to
+// remove what it took. A sentence ends at .!? or a newline; if the buffer grows
+// past maxLen without a boundary it cuts at the last clause break. Returns
+// ("", false) when no sentence is ready yet.
+func takeSentence(buf *strings.Builder) (string, bool) {
+	s := buf.String()
+	const maxLen = 100
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '!' || c == '?' || c == '\n' {
+			return consumeSentence(buf, s, i+1)
+		}
+		if c == '.' {
+			// Don't split on common abbreviations like "Dr." or "e.g.".
+			if i > 0 && i+1 < len(s) && isLowerByte(s[i-1]) && s[i+1] == ' ' {
+				continue
+			}
+			return consumeSentence(buf, s, i+1)
+		}
+	}
+
+	if len(s) >= maxLen {
+		cut := strings.LastIndex(s[:maxLen], ",")
+		if cut < 0 {
+			cut = strings.LastIndex(s[:maxLen], ";")
+		}
+		if cut < 0 {
+			cut = strings.LastIndex(s[:maxLen], " ")
+		}
+		if cut < 0 {
+			cut = maxLen
+		}
+		return consumeSentence(buf, s, cut+1)
+	}
+
+	// Early flush at 60 chars on clause breaks (comma/semicolon + space) to
+	// reduce first-audio latency without waiting for the full maxLen.
+	if len(s) >= 60 {
+		for i := len(s) - 1; i >= 50; i-- {
+			if (s[i] == ',' || s[i] == ';') && i+1 < len(s) && s[i+1] == ' ' {
+				return consumeSentence(buf, s, i+2)
+			}
+		}
+	}
+
+	return "", false
+}
+
+func consumeSentence(buf *strings.Builder, s string, end int) (string, bool) {
+	rem := strings.TrimLeft(s[end:], " \n\t")
+	buf.Reset()
+	buf.WriteString(rem)
+	return strings.TrimRight(s[:end], " \n\t"), true
+}
+
+func isLowerByte(b byte) bool { return b >= 'a' && b <= 'z' }
 
 func (o *Orchestrator) handleMultiStep(ctx context.Context, text string) (*interfaces.AgentResponse, error) {
 	log.Printf("[Agent] Multi-step task detected, engaging planner...")
@@ -572,7 +734,7 @@ func (o *Orchestrator) handleMultiStep(ctx context.Context, text string) (*inter
 				o.meta.RecordActionResult(true)
 			}
 		} else {
-			response, err := o.llm.Generate(ctx, task.Description, interfaces.GenerationOptions{Temperature: 0.4})
+			response, err := o.llm.Generate(ctx, task.Description, o.genOpts)
 			if err == nil {
 				results = append(results, fmt.Sprintf("DONE (%s): %s", task.Description, response))
 				o.planner.MarkCompleted(plan, task.ID)
@@ -581,7 +743,7 @@ func (o *Orchestrator) handleMultiStep(ctx context.Context, text string) (*inter
 	}
 
 	summaryPrompt := fmt.Sprintf("Summarize these task results concisely:\n%s", strings.Join(results, "\n"))
-	summary, err := o.llm.Generate(ctx, summaryPrompt, interfaces.GenerationOptions{Temperature: 0.3})
+	summary, err := o.llm.Generate(ctx, summaryPrompt, o.genOpts)
 	if err != nil {
 		summary = fmt.Sprintf("Completed %d/%d steps.", len(results), len(plan.Root))
 	}
@@ -670,6 +832,29 @@ func (o *Orchestrator) SetTTSVoiceStyle(style string) {
 	o.ttsAdapter.SetVoiceStyle(style)
 }
 
+// SetTTSBaseSpeed overrides the baseline speech rate (warmth), applied after voice style.
+func (o *Orchestrator) SetTTSBaseSpeed(speed float32) {
+	o.ttsAdapter.SetBaseSpeed(speed)
+}
+
+// setTurnCancel stores the cancel func for the current generation turn so a
+// barge-in can abort the in-flight LLM stream.
+func (o *Orchestrator) setTurnCancel(c context.CancelFunc) {
+	o.turnMu.Lock()
+	defer o.turnMu.Unlock()
+	o.currentCancel = c
+}
+
+// InterruptCurrent cancels the in-flight LLM stream (called on barge-in).
+func (o *Orchestrator) InterruptCurrent() {
+	o.turnMu.Lock()
+	c := o.currentCancel
+	o.turnMu.Unlock()
+	if c != nil {
+		c()
+	}
+}
+
 func (o *Orchestrator) AnalyzeProsody(samples []float32, sampleRate int) personality.EmotionState {
 	features := o.prosody.Analyze(samples, sampleRate)
 	return o.prosody.DetectEmotion(features)
@@ -691,8 +876,33 @@ func (o *Orchestrator) publishTTS(text string) {
 	o.lastSpoken = strings.ToLower(text)
 	o.lastSpokenAt = time.Now()
 
+	// Terminal transcript of everything Mai says (streamed sentences,
+	// greetings, proactive messages). The live path otherwise produces no
+	// console output for the response.
+	log.Printf("[Mai] %s", text)
+
 	emotion := o.emotion.GetCurrent()
 	ttsParams := o.GetTTSParams(emotion, text)
+
+	// Always publish a transcript event so the browser companion gets
+	// progressive text even when TTSFunc is wired (bypassing the bus for audio).
+	if o.bus != nil {
+		o.bus.Publish(interfaces.Event{
+			Type:   "chat.response",
+			Source: "agent.orchestrator",
+			Payload: map[string]interface{}{
+				"text": text,
+				"done": false,
+			},
+		})
+	}
+
+	// If a direct TTS sink is wired (streaming sentence queue), use it so the
+	// bus subscribers don't double-play. Otherwise fall back to the event bus.
+	if o.TTSFunc != nil {
+		o.TTSFunc(text, ttsParams.Speed)
+		return
+	}
 
 	o.bus.Publish(interfaces.Event{
 		Type:   "action.tts.request",
@@ -732,18 +942,21 @@ func (o *Orchestrator) handleTranscription(event interfaces.Event) {
 		return
 	}
 
-	emotion := o.emotion.GetCurrent()
-	ttsParams := o.GetTTSParams(emotion, resp.Text)
+	// If the handler already streamed the reply to TTS (Spoken), don't repeat it.
+	if !resp.Spoken {
+		emotion := o.emotion.GetCurrent()
+		ttsParams := o.GetTTSParams(emotion, resp.Text)
 
-	o.bus.Publish(interfaces.Event{
-		Type:   "action.tts.request",
-		Source: "agent.orchestrator",
-		Payload: map[string]interface{}{
-			"text":  resp.Text,
-			"speed": ttsParams.Speed,
-			"pitch": ttsParams.Pitch,
-		},
-	})
+		o.bus.Publish(interfaces.Event{
+			Type:   "action.tts.request",
+			Source: "agent.orchestrator",
+			Payload: map[string]interface{}{
+				"text":  resp.Text,
+				"speed": ttsParams.Speed,
+				"pitch": ttsParams.Pitch,
+			},
+		})
+	}
 }
 
 func (o *Orchestrator) handleVision(event interfaces.Event) {

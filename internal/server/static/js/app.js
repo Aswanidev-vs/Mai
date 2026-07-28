@@ -33,6 +33,11 @@ const emotionLabel = document.getElementById('emotionLabel');
 // Wire chat input to WS
 chat.onSend = (text) => {
     ws.send('chat.input', { text });
+    // Check for dance command — simple contains check, covers all phrasings
+    const lower = text.toLowerCase();
+    if (lower.includes('dance')) {
+        setTimeout(() => character.dance(), 200);
+    }
 };
 
 // WS event handlers
@@ -50,6 +55,30 @@ ws.onDisconnect = () => {
 // Chat response streaming
 let streamingActive = false;
 let ttsTextBuffer = '';
+let gazeAvoidBuffer = '';
+let danceTriggered = false;
+
+// Uncertainty markers that trigger gaze avoidance (embarrassment/shyness)
+const UNCERTAINTY_MARKERS = [
+    "i'm not sure",
+    "i might be wrong",
+    "i don't know",
+    "i'm not certain",
+    "i could be wrong",
+    "not sure",
+    "maybe i'm wrong",
+    "i think",
+    "probably",
+    "perhaps",
+    "i guess",
+    "i suppose",
+    "it depends",
+    "hard to say",
+    "unclear",
+    "uncertain",
+    "i'm unsure",
+    "i'm uncertain",
+];
 
 ws.on('chat.response', (params) => {
     if (params.text) {
@@ -57,10 +86,17 @@ ws.on('chat.response', (params) => {
             chat.startAgentMessage();
             streamingActive = true;
             ttsTextBuffer = '';
+            gazeAvoidBuffer = '';
+            danceTriggered = false;
         }
         chat.streamToken(params.text);
-        // Accumulate the spoken text to drive word-accurate lip sync
         ttsTextBuffer += params.text;
+        gazeAvoidBuffer += params.text;
+        // Trigger dance if AI response mentions dancing and user asked for it
+        if (!danceTriggered && /dance/i.test(params.text)) {
+            danceTriggered = true;
+            character.dance();
+        }
     }
     if (params.done) {
         chat.finalizeMessage();
@@ -69,7 +105,16 @@ ws.on('chat.response', (params) => {
         if (ttsTextBuffer.trim().length > 0) {
             character.prepareVisemes(ttsTextBuffer);
         }
+        // Check for uncertainty markers and trigger gaze avoidance
+        const lower = gazeAvoidBuffer.toLowerCase();
+        for (const marker of UNCERTAINTY_MARKERS) {
+            if (lower.includes(marker)) {
+                character.setGazeAvoidTrigger();
+                break;
+            }
+        }
         ttsTextBuffer = '';
+        gazeAvoidBuffer = '';
     }
 });
 
@@ -90,13 +135,16 @@ ws.on('status.changed', (params) => {
 
 // TTS audio chunks — queue for sequential playback with lip sync
 ws.on('tts.chunk', (params) => {
+    // Always queue: even done-only chunks (empty audio, done=true) must be
+    // enqueued so the drain loop knows when synthesis has ended.
+    if (!params.audio && !params.done) return; // skip truly empty chunks
+    // Ensure analyser is connected before first chunk
+    if (audio.analyser && !character.analyser) {
+        character.setAnalyser(audio.analyser);
+    }
+    audio.queueChunk(params.audio || '', params.sample_rate, !!params.done);
+    // Feed the running audio duration so the viseme schedule stays scaled to reality
     if (params.audio) {
-        // Ensure analyser is connected before first chunk
-        if (audio.analyser && !character.analyser) {
-            character.setAnalyser(audio.analyser);
-        }
-        audio.queueChunk(params.audio, params.sample_rate, !!params.done);
-        // Feed the running audio duration so the viseme schedule stays scaled to reality
         character.setVisemeDuration(audio.getKnownDuration());
     }
 });

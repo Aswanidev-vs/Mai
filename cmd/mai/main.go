@@ -73,6 +73,17 @@ func main() {
 	// Resolve environment variable references in config
 	resolveConfigEnv(&cfg)
 
+	// Apply LLM sampling defaults if not configured (reduces hallucination / yapping).
+	if cfg.LLM.Sampling.Temperature == 0 {
+		cfg.LLM.Sampling.Temperature = 0.55
+	}
+	if cfg.LLM.Sampling.TopP == 0 {
+		cfg.LLM.Sampling.TopP = 0.85
+	}
+	if cfg.LLM.Sampling.MaxTokens == 0 {
+		cfg.LLM.Sampling.MaxTokens = 400
+	}
+
 	// Test cloud provider if requested
 	if testCloud {
 		log.Println("[TEST] Testing cloud LLM provider...")
@@ -95,7 +106,7 @@ func main() {
 	var ttsMu sync.Mutex // Mutex for thread-safe TTS
 
 	// atomic: 1=speaking/assistant-audio-muting, 0=idle
-	var ttsPlaying int32 // atomic: 1=playing TTS, 0=not
+	var ttsPlaying int32   // atomic: 1=playing TTS, 0=not
 	var stopPlayback int32 // atomic: 1=stop current TTS playback (barge-in), 0=normal
 	var lastMicRMS float64
 	var lastMicMu sync.Mutex
@@ -106,8 +117,14 @@ func main() {
 	var companionServer *server.Server
 	var browserMicActive int32
 	companionHasClient := func() bool { return companionServer != nil && companionServer.ClientCount() > 0 }
-	var capture *audioCapture           // forward-declared; assigned later
+	var capture *audioCapture                  // forward-declared; assigned later
 	var handleAudioFrame func([]float32, bool) // forward-declared; assigned later
+
+	// Echo cancellation for genuine barge-in: subtracts Mai's own TTS (echoed
+	// through the mic) so only a real second speaker survives in the residual.
+	echoCanceller := NewEchoCanceller(1024)
+	var bargeCount int
+	var ttsStartedAt time.Time
 
 	// waitForMicSilence blocks until the mic stays quiet (RMS < 0.0015 for 3 consecutive checks)
 	// or a 500ms deadline is reached. Returns true if silence was detected, false if timed out.
@@ -211,10 +228,6 @@ func main() {
 	vadBuffer := sherpa.NewCircularBuffer(10 * 16000)
 	defer sherpa.DeleteCircularBuffer(vadBuffer)
 
-	// Separate VAD buffer for barge-in detection (smaller — just enough for VAD window)
-	bargeVadBuffer := sherpa.NewCircularBuffer(2 * 16000)
-	defer sherpa.DeleteCircularBuffer(bargeVadBuffer)
-
 	log.Println("[VAD] Voice activity detector ready")
 
 	// 3. Initialize ASR
@@ -291,6 +304,16 @@ func main() {
 		ttsConfig.Model.Supertonic.TtsJson = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.TTSJson)
 		ttsConfig.Model.Supertonic.UnicodeIndexer = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.UnicodeIndexer)
 		ttsConfig.Model.Supertonic.VoiceStyle = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.VoiceStyle)
+	case "kokoro":
+		ttsConfig.Model.Kokoro.Model = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Model)
+		ttsConfig.Model.Kokoro.Voices = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Voices)
+		ttsConfig.Model.Kokoro.Tokens = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Tokens)
+		ttsConfig.Model.Kokoro.DataDir = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.DataDir)
+		if cfg.TTS.Kokoro.Lexicon != "" {
+			ttsConfig.Model.Kokoro.Lexicon = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Lexicon)
+		}
+		ttsConfig.Model.Kokoro.Lang = cfg.TTS.Kokoro.Lang
+		ttsConfig.Model.Kokoro.LengthScale = cfg.TTS.Kokoro.LengthScale
 	case "pocket":
 		ttsConfig.Model.Pocket.LmFlow = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.LmFlow)
 		ttsConfig.Model.Pocket.LmMain = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.LmMain)
@@ -314,62 +337,218 @@ func main() {
 	}
 	defer sherpa.DeleteOfflineTts(tts)
 
+	// Get TTS output sample rate and create resamplers for browser (44.1k)
+	// and echo reference (16k).
+	ttsSampleRate := tts.SampleRate()
+	log.Printf("[TTS] Engine sample rate: %d Hz", ttsSampleRate)
+	ttsToBrowserResampler := newResampler(ttsSampleRate, 44100)
+	ttsToEchoResampler := newResampler(ttsSampleRate, 16000)
+
+	// Voice cloning: load reference audio if enabled and active model supports it.
+	var refAudio []float32
+	var refSampleRate int
+	voiceCloneEnabled := cfg.TTS.VoiceCloning.Enabled &&
+		(cfg.TTS.ActiveModel == "pocket" || cfg.TTS.ActiveModel == "zipvoice")
+	if voiceCloneEnabled && cfg.TTS.VoiceCloning.ReferenceAudio != "" {
+		wav := sherpa.ReadWaveMultiChannel(cfg.TTS.VoiceCloning.ReferenceAudio)
+		if wav != nil && wav.SamplesPerChannel > 0 && wav.SampleRate > 0 {
+			// Mix down to mono if stereo
+			if wav.ChannelCount > 1 {
+				mono := make([]float32, wav.SamplesPerChannel)
+				for i := 0; i < wav.SamplesPerChannel; i++ {
+					sum := float32(0)
+					for ch := 0; ch < wav.ChannelCount; ch++ {
+						sum += wav.Samples[ch*wav.SamplesPerChannel+i]
+					}
+					mono[i] = sum / float32(wav.ChannelCount)
+				}
+				refAudio = mono
+			} else {
+				refAudio = make([]float32, wav.SamplesPerChannel)
+				copy(refAudio, wav.Samples[:wav.SamplesPerChannel])
+			}
+			refSampleRate = wav.SampleRate
+			wav.Release()
+			log.Printf("[TTS] Voice cloning loaded: %s (%d samples, %d Hz, %d ch)",
+				cfg.TTS.VoiceCloning.ReferenceAudio, len(refAudio), refSampleRate, wav.ChannelCount)
+		} else {
+			sr := 0
+			ns := 0
+			if wav != nil {
+				sr = wav.SampleRate
+				ns = wav.SamplesPerChannel
+			}
+			log.Printf("[TTS] WARNING: Failed to load reference audio %s (sample_rate=%d, samples=%d), falling back to default voice",
+				cfg.TTS.VoiceCloning.ReferenceAudio, sr, ns)
+			if wav != nil {
+				wav.Release()
+			}
+			voiceCloneEnabled = false
+		}
+	}
+
+	// synthesize picks the right TTS method based on active model and voice cloning config.
+	// For supertonic or when cloning is off: uses GenerateWithCallback (fast, default voice).
+	// For pocket/zipvoice with cloning on: uses GenerateWithConfig with reference audio.
+	// For kokoro: uses GenerateWithConfig with speaker ID and language.
+	synthesize := func(text string, speed float32, cb func([]float32) bool) {
+		if voiceCloneEnabled && refAudio != nil {
+			ttsMu.Lock()
+			tts.GenerateWithConfig(text, &sherpa.GenerationConfig{
+				Speed:               speed,
+				ReferenceAudio:      refAudio,
+				ReferenceSampleRate: refSampleRate,
+				ReferenceText:       cfg.TTS.VoiceCloning.ReferenceText,
+			}, func(samples []float32, _ float32) bool {
+				return cb(samples)
+			})
+			ttsMu.Unlock()
+		} else {
+			// Build the per-request config.
+			// Supertonic needs NumSteps + Extra (lang). Kokoro needs Sid + Extra (lang).
+			// Pocket/ZipVoice need Speed + Sid.
+			genCfg := &sherpa.GenerationConfig{
+				Speed: speed,
+				Sid:   cfg.TTS.Supertonic.Sid, // Reused for Kokoro/Pocket speaker ID
+			}
+			if cfg.TTS.ActiveModel == "supertonic" {
+				genCfg.NumSteps = cfg.TTS.Supertonic.NumSteps
+				if cfg.TTS.Supertonic.Extra != "" {
+					genCfg.Extra = json.RawMessage(cfg.TTS.Supertonic.Extra)
+				}
+			} else if cfg.TTS.ActiveModel == "kokoro" {
+				// Kokoro uses Extra for language (e.g., {"lang": "en-us"})
+				if cfg.TTS.Kokoro.Lang != "" {
+					genCfg.Extra = json.RawMessage(fmt.Sprintf(`{"lang": "%s"}`, cfg.TTS.Kokoro.Lang))
+				}
+			}
+			ttsMu.Lock()
+			tts.GenerateWithConfig(text, genCfg, func(samples []float32, _ float32) bool {
+				return cb(samples)
+			})
+			ttsMu.Unlock()
+		}
+	}
+
+	// Realtime TTS: streamed sentences are enqueued here and played one at a
+	// time by a single player goroutine, so the first audio starts as soon as
+	// the first sentence is ready and playback never overlaps.
+	type ttsItem struct {
+		text  string
+		speed float32
+	}
+	ttsSentCh := make(chan ttsItem, 64)
+
 	log.Printf("[TTS] Synthesizer ready (%s)", cfg.TTS.ActiveModel)
 
-	// speak generates audio and plays it where the user can hear it.
-	// When a browser companion is connected, it streams chunks as they're
-	// synthesised (true streaming) so the first audio arrives almost immediately.
+	// speak enqueues a sentence for the streaming player (see playSentence +
+	// the player goroutine below). Keeping a single consumer serializes all
+	// TTS so sentences never overlap, and lets barge-in drain the queue.
 	speak := func(text string, speed float32) {
 		if speed == 0 {
 			speed = cfg.TTS.Supertonic.Speed
 		}
+		ttsSentCh <- ttsItem{text: text, speed: speed}
+	}
+
+	// playSentence synthesizes and plays ONE sentence, halting immediately if
+	// a barge-in sets stopPlayback mid-utterance.
+	playSentence := func(text string, speed float32) {
+		if speed == 0 {
+			speed = cfg.TTS.Supertonic.Speed
+		}
 		atomic.StoreInt32(&isSpeaking, 1)
+		// Mark TTS as playing so handleAudioFrame's echo-cancel/drop guard runs
+		// for the browser mic too. Without this, the companion path never sets
+		// ttsPlaying and Mai's own voice (echoed through the browser mic) reaches
+		// ASR and gets transcribed as a user turn — the classic feedback loop.
+		atomic.StoreInt32(&ttsPlaying, 1)
+		ttsStartedAt = time.Now()
+		atomic.StoreInt32(&stopPlayback, 0)
+		defer atomic.StoreInt32(&ttsPlaying, 0)
+		log.Printf("[TTS-PLAY] Starting synthesis: speed=%.2f, text=%.80s...", speed, text)
 
 		if bus != nil && cfg.Server.Enabled && companionHasClient() {
-			// ── Streaming path: publish each callback chunk in real time ──
-			const outSR = 44100 // Supertonic output rate
-			ttsMu.Lock()
-			tts.GenerateWithCallback(text, cfg.TTS.Supertonic.Sid, speed,
-				func(samples []float32) bool {
-					publishTTSAudioChunk(bus, samples, outSR, false)
-					return true // keep generating
-				},
-			)
-			ttsMu.Unlock()
-			// Signal "end of utterance" so the browser knows playback is done.
-			publishTTSAudioChunk(bus, nil, outSR, true)
-
+			// ── Browser companion: stream chunks, stop on barge-in ──
+			synthesize(text, speed, func(samples []float32) bool {
+				if atomic.LoadInt32(&stopPlayback) != 0 {
+					return false
+				}
+				// Feed the synthesized samples into the echo reference so the
+				// AEC can subtract Mai's own voice (echoed through the browser
+				// mic) — otherwise barge-in detection would misread her echo as
+				// a user interruption and cut her off.
+				if len(samples) > 0 {
+					resampledForEcho := ttsToEchoResampler.resample(samples)
+					refBuffer.Push(resampledForEcho)
+					// Resample to 44.1k for browser playback.
+					resampledForBrowser := ttsToBrowserResampler.resample(samples)
+					publishTTSAudioChunk(bus, resampledForBrowser, 44100, false)
+				}
+				return true
+			})
+			publishTTSAudioChunk(bus, nil, 44100, true)
 		} else {
 			// ── Local-only path: streaming playback ──
 			atomic.StoreInt32(&ttsPlaying, 1)
 			atomic.StoreInt32(&stopPlayback, 0)
 			_ = playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
-				ttsMu.Lock()
-				tts.GenerateWithCallback(text, cfg.TTS.Supertonic.Sid, speed,
-					func(samples []float32) bool {
-						ch <- samples
-						return true
-					},
-				)
-				ttsMu.Unlock()
+				synthesize(text, speed, func(samples []float32) bool {
+					if atomic.LoadInt32(&stopPlayback) != 0 {
+						return false
+					}
+					// Resample TTS native rate to 44.1k for local playback.
+					resampled := ttsToBrowserResampler.resample(samples)
+					ch <- resampled
+					return true
+				})
 			})
 			atomic.StoreInt32(&ttsPlaying, 0)
-			if atomic.LoadInt32(&stopPlayback) == 0 {
-				waitForMicSilence()
-			}
 		}
 
-		atomic.StoreInt32(&isSpeaking, 0)
 		lastResponseMu.Lock()
 		lastResponseTime = time.Now()
 		lastResponseMu.Unlock()
 	}
+
+	// Player goroutine: consumes the sentence queue sequentially. Skips any
+	// sentence left queued after a barge-in (stopPlayback). isSpeaking stays
+	// set across sentences and is only cleared once the queue drains.
+	go func() {
+		for item := range ttsSentCh {
+			if atomic.LoadInt32(&stopPlayback) != 0 {
+				log.Printf("[TTS-PLAYER] Skipping sentence due to barge-in: %.60s...", item.text)
+				// If we've skipped the last item in the queue, clear stopPlayback
+				// so a fresh TTS response can start playing.
+				if len(ttsSentCh) == 0 {
+					atomic.StoreInt32(&stopPlayback, 0)
+				}
+				continue // dropped due to an interruption
+			}
+			log.Printf("[TTS-PLAYER] Playing sentence (len=%d): %.80s...", len(item.text), item.text)
+			playSentence(item.text, item.speed)
+			log.Printf("[TTS-PLAYER] Finished playing sentence, queue_depth=%d", len(ttsSentCh))
+			if len(ttsSentCh) == 0 {
+				atomic.StoreInt32(&isSpeaking, 0)
+				atomic.StoreInt32(&stopPlayback, 0) // ensure clean state for next response
+			}
+		}
+		atomic.StoreInt32(&isSpeaking, 0)
+		atomic.StoreInt32(&stopPlayback, 0)
+	}()
 	// Test TTS on startup
 	go func() {
-		testAudio := tts.Generate("System ready.", cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed)
-		if testAudio != nil {
-			playAudio(ctx, testAudio.Samples, testAudio.SampleRate, nil)
+		if voiceCloneEnabled {
+			log.Printf("[TTS] Voice cloning active (model: %s)", cfg.TTS.ActiveModel)
 		}
+		sr := cfg.TTS.OutputSampleRate
+		if sr == 0 {
+			sr = 44100
+		}
+		synthesize("System ready.", cfg.TTS.Supertonic.Speed, func(samples []float32) bool {
+			playAudio(ctx, samples, sr, nil)
+			return true
+		})
 	}()
 
 	// Initialize automation system
@@ -378,6 +557,8 @@ func main() {
 
 	// 0. Initialize Agentic Architecture if enabled
 	var agentBridge *perception.Bridge
+	// Cancels the in-flight LLM stream when a genuine barge-in occurs.
+	var interruptCurrent func()
 	if cfg.Agentic.Enabled {
 		log.Println("[BOOT] Initializing Agentic Architecture...")
 		bus = events.NewBus()
@@ -441,7 +622,24 @@ func main() {
 		react := cognition.NewReActLoop(llmProvider, registry, workingMem)
 
 		// Orchestrator
-		orch := agent.NewOrchestrator(bus, memManager, llmProvider, registry, react)
+		orch := agent.NewOrchestrator(bus, memManager, llmProvider, registry, react,
+			interfaces.GenerationOptions{
+				Temperature: cfg.LLM.Sampling.Temperature,
+				TopP:        cfg.LLM.Sampling.TopP,
+				MaxTokens:   cfg.LLM.Sampling.MaxTokens,
+			})
+
+		// Stream generated sentences into the serialized TTS queue.
+		// The playSentence function handles routing: when a browser client
+		// is connected it publishes audio chunks via the event bus (bridge
+		// forwards them to the browser); when no client is connected it
+		// falls back to local audio playback.  The bus subscription added
+		// below covers the local-only fallback path as well.
+		orch.TTSFunc = func(text string, speed float32) {
+			log.Printf("[TTS-FUNC] Enqueuing sentence (len=%d, speed=%.2f): %.80s...", len(text), speed, text)
+			ttsSentCh <- ttsItem{text: text, speed: speed}
+		}
+		interruptCurrent = orch.InterruptCurrent
 		orch.DirectAction = executor.ParseAndExecute // Wire up the legacy highly-reliable regex parser
 
 		// Apply TTS voice style from system prompt
@@ -452,18 +650,20 @@ func main() {
 		if ttsStyle != "" && ttsStyle != "neutral" {
 			orch.SetTTSVoiceStyle(ttsStyle)
 		}
+		// Baseline speech rate (warmth) — applied after style so it wins.
+		orch.SetTTSBaseSpeed(cfg.TTS.BaseSpeed)
 
 		go orch.Start(ctx)
 
 		// Bridge for Perception
 		agentBridge = perception.NewBridge(bus)
 
-	// WebSocket companion server
-	if companionMode {
-		cfg.Server.Enabled = true
-		log.Println("[BOOT] Companion mode enabled via --companion flag")
-	}
-	if cfg.Server.Enabled {
+		// WebSocket companion server
+		if companionMode {
+			cfg.Server.Enabled = true
+			log.Println("[BOOT] Companion mode enabled via --companion flag")
+		}
+		if cfg.Server.Enabled {
 			srv := server.New(server.ServerConfig{
 				Enabled: cfg.Server.Enabled,
 				Port:    cfg.Server.Port,
@@ -488,9 +688,11 @@ func main() {
 			})
 		}
 
-		// Thinking chime — plays when speech transcription is received (LLM processing begins)
+		// Thinking chime — plays when LLM processing begins for reasoning tasks
+		// (not for simple conversational responses).
 		bus.Subscribe("perception.audio.transcription", func(event interfaces.Event) {
-			playThinkingChime()
+			// Transcription received - LLM will process, but don't chime yet.
+			// The worker goroutine will chime when it actually starts thinking.
 		})
 
 		// Bridge for TTS — with emotion-adaptive parameters
@@ -535,21 +737,25 @@ func main() {
 
 	// 6. Pipeline Worker (LLM + TTS + Actions)
 	type Task struct {
-		Text string
+		Text          string
+		IsReasoning   bool // true if task requires actual reasoning (not just chat)
 	}
 	workerChan := make(chan Task, 10)
 	var wg sync.WaitGroup
 	wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for task := range workerChan {
-				atomic.StoreInt32(&isSpeaking, 1) // Pause ASR while thinking and talking
-				log.Printf("[LLM] Thinking about: %s", task.Text)
+	go func() {
+		defer wg.Done()
+		for task := range workerChan {
+			atomic.StoreInt32(&isSpeaking, 1) // Pause ASR while thinking and talking
+			log.Printf("[LLM] Thinking about: %s", task.Text)
 
-				// Play thinking chime to indicate LLM processing
+			// Play thinking chime only for reasoning tasks (not simple chat)
+			// and only if enabled in config.
+			if task.IsReasoning && cfg.Audio.ThinkingChime {
 				playThinkingChime()
+			}
 
-				// Try to parse and execute automation action
+			// Try to parse and execute automation action
 			executed, feedback, actionErr := executor.ParseAndExecute(task.Text)
 			if actionErr != nil {
 				log.Printf("[ACTION] Error executing action: %v", actionErr)
@@ -579,18 +785,28 @@ func main() {
 
 			log.Printf("[LLM] Response received. Starting TTS...")
 
+			// Send transcript to browser companion (legacy path).
+			if bus != nil && cfg.Server.Enabled && companionHasClient() {
+				bus.Publish(interfaces.Event{
+					Type:   "chat.response",
+					Source: "main",
+					Payload: map[string]interface{}{
+						"text": response,
+						"done": true,
+					},
+				})
+			}
+
 			// Streaming TTS: generate chunks and play them as they arrive.
 			atomic.StoreInt32(&ttsPlaying, 1)
+			ttsStartedAt = time.Now()
+			bargeCount = 0
 			atomic.StoreInt32(&stopPlayback, 0)
 			playErr := playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
-				ttsMu.Lock()
-				tts.GenerateWithCallback(response, cfg.TTS.Supertonic.Sid, cfg.TTS.Supertonic.Speed,
-					func(samples []float32) bool {
-						ch <- samples
-						return true
-					},
-				)
-				ttsMu.Unlock()
+				synthesize(response, cfg.TTS.Supertonic.Speed, func(samples []float32) bool {
+					ch <- samples
+					return true
+				})
 			})
 			if playErr != nil {
 				log.Printf("[TTS] Play error: %v", playErr)
@@ -683,7 +899,10 @@ func main() {
 					go agentBridge.PublishTranscription(sessionText)
 				} else {
 					log.Println("[PIPELINE] Routing to legacy pipeline...")
-					workerChan <- Task{Text: sessionText}
+					// Heuristic: longer inputs (>15 words) are more likely to be
+					// reasoning tasks vs. simple conversational turns.
+					isReasoning := len(strings.Fields(sessionText)) > 15
+					workerChan <- Task{Text: sessionText, IsReasoning: isReasoning}
 				}
 				state = StateWakeWord
 				sessionText = ""
@@ -718,23 +937,63 @@ func main() {
 		lastMicRMS = rms
 		lastMicMu.Unlock()
 
+		// While Mai is speaking, echo-cancel her own voice against the speaker
+		// reference so it does not reach ASR. If a real (different) speaker shows
+		// up in the residual, that's a genuine barge-in — stop playback and hand
+		// the user's echo-free words to ASR.
 		if atomic.LoadInt32(&ttsPlaying) != 0 {
-			if cfg.Audio.BargeInEnabled && rms > cfg.Audio.BargeInThreshold {
-				bargeVadBuffer.Push(samples)
-				for bargeVadBuffer.Size() >= cfg.VAD.WindowSize {
-					head := bargeVadBuffer.Head()
-					chunk := bargeVadBuffer.Get(head, cfg.VAD.WindowSize)
-					bargeVadBuffer.Pop(cfg.VAD.WindowSize)
-					vadDetector.AcceptWaveform(chunk)
+			if cfg.Audio.BargeInEnabled && echoCanceller != nil && time.Since(ttsStartedAt) > 400*time.Millisecond {
+				clean := echoCanceller.Process(samples)
+				var csum float32
+				for _, s := range clean {
+					csum += s * s
 				}
-				if !vadDetector.IsEmpty() {
-					log.Printf("[BARGE-IN] VAD confirmed speech during TTS (RMS=%.4f). Stopping playback.", rms)
-					atomic.StoreInt32(&stopPlayback, 1)
-					for !vadDetector.IsEmpty() {
-						vadDetector.Pop()
+				crms := math.Sqrt(float64(csum / float32(len(clean))))
+				lastMicMu.Lock()
+				lastMicRMS = crms
+				lastMicMu.Unlock()
+
+				if crms > cfg.Audio.BargeInThreshold {
+					bargeCount++
+					// Require sustained residual (not a single-frame echo leak)
+					// and a margin above threshold, so Mai's own voice echoing
+					// through the mic doesn't get misread as a user interruption
+					// and fed back to ASR (which makes her "say back" what was said).
+					if bargeCount >= 4 && crms > cfg.Audio.BargeInThreshold*2 {
+						log.Printf("[BARGE-IN] Real speech over TTS detected (residual RMS=%.4f). Stopping playback.", crms)
+						atomic.StoreInt32(&stopPlayback, 1)
+						if interruptCurrent != nil {
+							interruptCurrent()
+						}
+						state = StateListening
+						sessionText = ""
+						lastText = ""
+						sessionSamples = nil
+						if recognizer != nil {
+							recognizer.Reset(asrStream)
+						}
+						// Feed the user's (echo-free) words to VAD + ASR and keep listening.
+						vadBuffer.Push(clean)
+						for vadBuffer.Size() >= cfg.VAD.WindowSize {
+							head := vadBuffer.Head()
+							c := vadBuffer.Get(head, cfg.VAD.WindowSize)
+							vadBuffer.Pop(cfg.VAD.WindowSize)
+							vadDetector.AcceptWaveform(c)
+						}
+						if asrStream != nil {
+							asrStream.AcceptWaveform(16000, clean)
+							for recognizer.IsReady(asrStream) {
+								recognizer.Decode(asrStream)
+							}
+						}
+						bargeCount = 0
+						return
 					}
+				} else {
+					bargeCount = 0
 				}
 			}
+			// No genuine interruption: her echo is not user input, so drop the frame.
 			return
 		}
 
@@ -905,17 +1164,21 @@ func startOllama() func() {
 func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt string) (string, error) {
 	client := &http.Client{}
 
-	requestBody, _ := json.Marshal(map[string]interface{}{
+	body := map[string]interface{}{
 		"model":  cfg.LLM.Model,
 		"prompt": prompt,
 		"system": cfg.LLM.SystemPrompt,
 		"stream": false,
 		"options": map[string]interface{}{
-			"temperature": 0.4,
-			"top_p":       0.9,
-			"num_predict": 256,
+			"temperature": cfg.LLM.Sampling.Temperature,
+			"top_p":       cfg.LLM.Sampling.TopP,
+			"num_predict": cfg.LLM.Sampling.MaxTokens,
 		},
-	})
+	}
+	if cfg.LLM.Think != nil {
+		body["think"] = *cfg.LLM.Think
+	}
+	requestBody, _ := json.Marshal(body)
 
 	log.Printf("[OLLAMA] Requesting response from %s...", cfg.LLM.Model)
 	req, _ := http.NewRequestWithContext(ctx, "POST", cfg.LLM.URL, bytes.NewBuffer(requestBody))
@@ -930,11 +1193,11 @@ func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt strin
 		return "", fmt.Errorf("ollama error status: %d", resp.StatusCode)
 	}
 
-	body, _ := io.ReadAll(resp.Body)
+	respBody, _ := io.ReadAll(resp.Body)
 	var result struct {
 		Response string `json:"response"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
+	if err := json.Unmarshal(respBody, &result); err != nil {
 		return "", err
 	}
 
@@ -1049,7 +1312,7 @@ func publishTTSAudio(bus interfaces.EventBus, samples []float32, sampleRate int,
 
 	const chunkSize = 8192
 	totalSamples := len(samples)
-	
+
 	for i := 0; i < totalSamples; i += chunkSize {
 		end := i + chunkSize
 		isLastChunk := false
@@ -1057,7 +1320,7 @@ func publishTTSAudio(bus interfaces.EventBus, samples []float32, sampleRate int,
 			end = totalSamples
 			isLastChunk = true
 		}
-		
+
 		chunk := samples[i:end]
 		buf := make([]byte, len(chunk)*2)
 		for j, s := range chunk {
@@ -1070,7 +1333,7 @@ func publishTTSAudio(bus interfaces.EventBus, samples []float32, sampleRate int,
 			buf[j*2] = byte(s16 & 0xFF)
 			buf[j*2+1] = byte(s16 >> 8)
 		}
-		
+
 		encoded := base64.StdEncoding.EncodeToString(buf)
 		bus.Publish(interfaces.Event{
 			Type:   "tts.audio.chunk",

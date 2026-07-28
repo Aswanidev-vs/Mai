@@ -63,5 +63,18 @@
       "timestamp": 1783005569
     },
     "vector": null
+  },
+  {
+    "fact": {
+      "id": "meta_1783752320",
+      "type": "meta_analysis",
+      "content": "Insufficient data for analysis. Continue current approach.",
+      "metadata": {
+        "success_rate": 1,
+        "total_actions": 1
+      },
+      "timestamp": 1783752320
+    },
+    "vector": null
   }
 ]

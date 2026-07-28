@@ -59,6 +59,7 @@ const MOTION_FILES = [
     '/assets/hiyori_m06.motion3.json',
     '/assets/hiyori_m07.motion3.json',
     '/assets/hiyori_m08.motion3.json',
+    '/dance/dance_show.motion3.json',
 ];
 
 const PARAM_MAP = {

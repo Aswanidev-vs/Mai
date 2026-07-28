@@ -128,11 +128,13 @@ func playAudioStreaming(ctx context.Context, sampleRate int, stop *int32, genera
 	var readIdx int
 	var streamDone bool
 
+	rs := newResampler(44100, 16000) // TTS is played at 44.1k; reference must match the 16k mic.
 	onSamples := func(pOutputSample, _ []byte, frameCount uint32) {
 		if stop != nil && atomic.LoadInt32(stop) != 0 {
 			return
 		}
 		mu.Lock()
+		start := readIdx
 		n := int(frameCount)
 		written := 0
 		for written < n {
@@ -151,6 +153,10 @@ func playAudioStreaming(ctx context.Context, sampleRate int, stop *int32, genera
 			pOutputSample[written*2] = byte(s16 & 0xFF)
 			pOutputSample[written*2+1] = byte(s16 >> 8)
 			written++
+		}
+		// Feed exactly the samples sent to the speaker into the echo reference.
+		if written > 0 {
+			refBuffer.Push(rs.resample(buf[start:readIdx]))
 		}
 		// Trim consumed data periodically to avoid unbounded growth.
 		if readIdx > 8192 && readIdx > len(buf)/2 {
@@ -232,6 +238,7 @@ func playAudio(ctx context.Context, samples []float32, sampleRate int, stop *int
 			return // Stop playback immediately on barge-in
 		}
 		n := int(frameCount)
+		start := playbackIndex
 		for i := 0; i < n; i++ {
 			if playbackIndex >= len(samples) {
 				return
@@ -240,6 +247,10 @@ func playAudio(ctx context.Context, samples []float32, sampleRate int, stop *int
 			pOutputSample[i*2] = byte(s16 & 0xFF)
 			pOutputSample[i*2+1] = byte(s16 >> 8)
 			playbackIndex++
+		}
+		// Chime also leaves the speaker, so include it in the echo reference.
+		if playbackIndex > start {
+			refBuffer.Push(samples[start:playbackIndex])
 		}
 	}
 
@@ -283,4 +294,3 @@ func generateThinkingChime(sampleRate int) []float32 {
 	}
 	return samples
 }
-

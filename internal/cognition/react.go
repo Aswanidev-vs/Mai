@@ -164,26 +164,20 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 
 		// RULE 2: If only a final_answer is provided:
 		if step.FinalAnswer != "" {
-			// Block it if no tool has ever been called — the LLM is hallucinating.
-			if !toolCalled {
-				log.Printf("[ReAct] BLOCKED hallucinated final_answer (no tool was called). Forcing retry.")
-				// Inject a fake "observation" to steer the LLM toward using a tool.
-				step.Action = "none"
-				step.Observation = "ERROR: You must use a tool before providing a final_answer. Review the available tools and pick one."
-				step.FinalAnswer = ""
-				steps = append(steps, step)
-				continue
-			}
-			// A tool WAS called previously — verify before accepting.
-			lastStep := steps[len(steps)-1]
-			verification, vErr := r.verifier.VerifyClaim(ctx, step.FinalAnswer, lastStep.Observation)
-			if vErr == nil && verification != nil && !verification.IsValid && verification.Confidence > 0.6 {
-				log.Printf("[ReAct] FINAL ANSWER FAILED VERIFICATION: %v. Forcing retry.", verification.Issues)
-				step.Action = "none"
-				step.Observation = fmt.Sprintf("Your proposed answer appears incorrect: %v. Review the observation and try again.", strings.Join(verification.Issues, "; "))
-				step.FinalAnswer = ""
-				steps = append(steps, step)
-				continue
+			// If no tool was called, accept the answer directly — the LLM
+			// determined no tool was needed (per updated prompt rules).
+			// If a tool WAS called previously, verify before accepting.
+			if toolCalled {
+				lastStep := steps[len(steps)-1]
+				verification, vErr := r.verifier.VerifyClaim(ctx, step.FinalAnswer, lastStep.Observation)
+				if vErr == nil && verification != nil && !verification.IsValid && verification.Confidence > 0.6 {
+					log.Printf("[ReAct] FINAL ANSWER FAILED VERIFICATION: %v. Forcing retry.", verification.Issues)
+					step.Action = "none"
+					step.Observation = fmt.Sprintf("Your proposed answer appears incorrect: %v. Review the observation and try again.", strings.Join(verification.Issues, "; "))
+					step.FinalAnswer = ""
+					steps = append(steps, step)
+					continue
+				}
 			}
 			return step.FinalAnswer, nil
 		}
@@ -209,13 +203,14 @@ Available tools:
 %s
 
 RULES:
-1. Pick the correct tool. Call it. Wait for the Observation. Then provide final_answer.
-2. NEVER call the same tool twice with the same parameters.
-3. action_input must be a JSON object: {"key":"value"}.
-4. Leave final_answer empty ("") until you have an Observation.
-5. After one tool call + observation, provide final_answer immediately.
+1. If the goal can be answered from your general knowledge (facts, explanations, casual conversation, opinions), provide final_answer directly WITHOUT calling any tool.
+2. Only use tools when the goal requires: real-time data (weather, time, current events), performing actions (open app, send message, play media), or specific lookups (web search for recent info).
+3. NEVER call the same tool twice with the same parameters.
+4. action_input must be a JSON object: {"key":"value"}.
+5. Leave final_answer empty ("") only if you NEED to call a tool first.
+6. After one tool call + observation, provide final_answer immediately.
 
-Tool selection:
+Tool selection (use ONLY when truly needed):
 - "play X on Y" → youtube_play {"query":"X","browser":"Y"}
 - "open X" → open_application {"app_name":"X"}
 - "what time" → get_system_time {}
@@ -225,6 +220,7 @@ Tool selection:
 
 Respond: {"thought":"...","action":"tool_name","action_input":{...},"final_answer":""}
 OR after observation: {"thought":"...","action":"","action_input":{},"final_answer":"your answer"}
+OR if no tool needed: {"thought":"...","action":"","action_input":{},"final_answer":"your direct answer"}
 
 Previous steps:
 `, goal, string(toolsStr))
