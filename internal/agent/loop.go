@@ -796,6 +796,9 @@ func (o *Orchestrator) selectRelevantTools(text string) []interfaces.ToolMetadat
 func (o *Orchestrator) adaptResponse(response string, emotion personality.EmotionState) string {
 	response = cleanResponse(response)
 
+	// Strip common hallucination hedging that adds no value
+	response = stripHallucinationHedging(response)
+
 	if emotion.Type == personality.EmotionNeutral || emotion.Confidence < 0.4 {
 		return response
 	}
@@ -819,6 +822,30 @@ func (o *Orchestrator) adaptResponse(response string, emotion personality.Emotio
 	}
 
 	return response
+}
+
+// stripHallucinationHedging removes low-confidence hedging phrases that
+// make responses sound uncertain and unhelpful.
+func stripHallucinationHedging(s string) string {
+	hedges := []struct {
+		old string
+		new string
+	}{
+		{"I'm not sure, but ", ""},
+		{"I think maybe ", ""},
+		{"I believe perhaps ", ""},
+		{"It's possible that ", ""},
+		{"It seems like ", ""},
+		{"I'm not certain, but ", ""},
+		{"I don't have confirmed information, but ", ""},
+		{"According to my training data, ", ""},
+		{"As far as I know, ", ""},
+		{"If I recall correctly, ", ""},
+	}
+	for _, h := range hedges {
+		s = strings.Replace(s, h.old, h.new, 1)
+	}
+	return s
 }
 
 func (o *Orchestrator) GetTTSParams(emotion personality.EmotionState, text string) personality.TTSParams {
@@ -977,6 +1004,12 @@ func isEcho(input, spoken string) bool {
 		return false
 	}
 
+	// Very short inputs (1-2 words) should NOT be treated as echoes —
+	// they're more likely genuine short commands like "yes", "no", "stop".
+	if len(inputWords) <= 2 {
+		return false
+	}
+
 	spokenSet := make(map[string]bool)
 	for _, w := range spokenWords {
 		spokenSet[w] = true
@@ -990,10 +1023,13 @@ func isEcho(input, spoken string) bool {
 	}
 
 	matchRatio := float64(matchCount) / float64(len(inputWords))
-	return matchRatio > 0.5
+	// Require 80%+ word overlap AND the input must be shorter or equal
+	// to the spoken text (an echo can't be longer than the original).
+	return matchRatio > 0.8 && len(inputWords) <= len(spokenWords)
 }
 
 func cleanResponse(s string) string {
+	// Strip XML-like tags (thought tags, etc.)
 	for {
 		start := strings.Index(s, "<")
 		end := strings.Index(s, ">")
@@ -1008,13 +1044,37 @@ func cleanResponse(s string) string {
 		}
 	}
 
+	// Strip markdown code fences
 	s = strings.ReplaceAll(s, "```json", "")
 	s = strings.ReplaceAll(s, "```", "")
 
+	// Strip [ACTION] markers and everything after
 	if idx := strings.Index(s, "[ACTION]"); idx != -1 {
 		s = s[:idx]
 	}
 
+	// Strip common LLM artifacts
+	s = strings.ReplaceAll(s, "Here is the JSON:", "")
+	s = strings.ReplaceAll(s, "Here is the response:", "")
+	s = strings.ReplaceAll(s, "Here's the response:", "")
+	s = strings.ReplaceAll(s, "Here's my answer:", "")
+	s = strings.ReplaceAll(s, "Here is my answer:", "")
+	s = strings.ReplaceAll(s, "Here's what I found:", "")
+	s = strings.ReplaceAll(s, "Here is what I found:", "")
+
+	// Strip JSON preamble if the response starts with { but has leading text
+	s = strings.TrimSpace(s)
+	if idx := strings.IndexByte(s, '{'); idx > 0 {
+		preamble := strings.TrimSpace(s[:idx])
+		// Only strip if preamble looks like "Here is..." or similar
+		if strings.HasPrefix(strings.ToLower(preamble), "here") ||
+			strings.HasPrefix(strings.ToLower(preamble), "the ") ||
+			strings.HasPrefix(strings.ToLower(preamble), "this ") {
+			s = s[idx:]
+		}
+	}
+
+	// Collapse excessive newlines
 	for strings.Contains(s, "\n\n\n") {
 		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
 	}

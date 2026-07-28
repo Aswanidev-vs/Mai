@@ -11,6 +11,85 @@ import (
 	"github.com/user/mai/pkg/interfaces"
 )
 
+// sanitizeJSON strips trailing garbage after the last valid closing brace and
+// removes any leading non-JSON preamble (e.g. markdown fences, "Here is the JSON:").
+func sanitizeJSON(raw string) string {
+	// Strip markdown code fences
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	s = strings.TrimSpace(s)
+
+	// Find the first opening brace — everything before it is preamble
+	startIdx := strings.IndexAny(s, "{[")
+	if startIdx == -1 {
+		return s
+	}
+	s = s[startIdx:]
+
+	// Find the last closing brace — everything after it is trailing garbage
+	endIdx := strings.LastIndexAny(s, "}]")
+	if endIdx != -1 {
+		s = s[:endIdx+1]
+	}
+	return s
+}
+
+// validateToolCall checks that the tool name exists in the registry and that
+// action_input is a valid JSON object. Returns a cleaned-up version.
+func validateToolCall(registry interfaces.ToolRegistry, action string, params json.RawMessage) (json.RawMessage, error) {
+	// Check tool exists
+	tools := registry.List()
+	found := false
+	for _, t := range tools {
+		if strings.EqualFold(t.Name, action) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("tool %q not found in registry", action)
+	}
+
+	// Normalize params
+	if len(params) == 0 || string(params) == "null" {
+		params = json.RawMessage(`{}`)
+	} else if params[0] != '{' && params[0] != '[' {
+		// LLM sent a bare string — wrap it
+		params = json.RawMessage(fmt.Sprintf(`{"query": %q}`, string(params)))
+	}
+
+	// Validate it's valid JSON
+	var obj interface{}
+	if err := json.Unmarshal(params, &obj); err != nil {
+		return nil, fmt.Errorf("invalid action_input JSON: %w", err)
+	}
+
+	return params, nil
+}
+
+// containsHallucinationMarker checks if the response contains common
+// hallucination markers that should be stripped or flagged.
+func containsHallucinationMarker(s string) bool {
+	lower := strings.ToLower(s)
+	markers := []string{
+		"i'm not sure but",
+		"i think maybe",
+		"i believe perhaps",
+		"according to my knowledge",
+		"as far as i know",
+		"i don't have access to",
+		"i cannot verify",
+	}
+	for _, m := range markers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // ReActStep represents a single iteration in the ReAct loop
 type ReActStep struct {
 	Thought     string          `json:"thought"`
@@ -86,15 +165,23 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 			return "", fmt.Errorf("llm error: %w", err)
 		}
 
-		// JSON Sanitizer: Strip trailing garbage after the last valid closing brace.
-		cleanResponse := string(response)
-		if idx := strings.LastIndex(cleanResponse, "}"); idx != -1 {
-			cleanResponse = cleanResponse[:idx+1]
-		}
+		// Robust JSON sanitizer: strip markdown fences, preamble, trailing garbage
+		cleanResponse := sanitizeJSON(string(response))
 
 		var step ReActStep
 		if err := json.Unmarshal([]byte(cleanResponse), &step); err != nil {
-			return "", fmt.Errorf("failed to parse ReAct step: %w. Original: %s", err, string(response))
+			// Second attempt: try to extract just the final_answer or thought from raw text
+			log.Printf("[ReAct] JSON parse failed (%v), attempting text extraction from: %.200s", err, string(response))
+			rawText := strings.TrimSpace(string(response))
+			// Strip any remaining markdown
+			rawText = strings.TrimPrefix(rawText, "```json")
+			rawText = strings.TrimPrefix(rawText, "```")
+			rawText = strings.TrimSuffix(rawText, "```")
+			rawText = strings.TrimSpace(rawText)
+			if rawText != "" {
+				return rawText, nil
+			}
+			return "", fmt.Errorf("failed to parse ReAct step: %w. Original: %.200s", err, string(response))
 		}
 
 		log.Printf("[ReAct] Thought: %s", step.Thought)
@@ -104,6 +191,18 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 		// RULE 1: If the LLM provided an action, ALWAYS execute it first,
 		//         even if it also provided a final_answer. The action takes priority.
 		if step.Action != "" {
+			// Validate tool exists in registry before proceeding
+			params, err := validateToolCall(r.registry, step.Action, step.ActionInput)
+			if err != nil {
+				log.Printf("[ReAct] Tool validation failed: %v. Treating as conversation.", err)
+				step.Observation = fmt.Sprintf("Tool %q is not available. Error: %v", step.Action, err)
+				step.Action = ""
+				steps = append(steps, step)
+				// Force the LLM to provide a final_answer instead
+				continue
+			}
+			step.ActionInput = params
+
 			// LOOP DETECTION: Check if this exact tool+params was already called
 			paramsStr := string(step.ActionInput)
 			currentCall := toolCall{action: step.Action, params: paramsStr}
@@ -123,19 +222,22 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 				return step.Thought, nil
 			}
 
+			// Also detect semantic loops: same tool with different params but
+			// producing no new information (3+ calls to any tool = likely stuck)
+			totalToolCalls := len(callHistory) + 1
+			if totalToolCalls >= 3 {
+				log.Printf("[ReAct] TOO MANY TOOL CALLS (%d). Breaking loop.", totalToolCalls)
+				if toolCalled && len(steps) > 0 {
+					return steps[len(steps)-1].Observation, nil
+				}
+				return step.Thought, nil
+			}
+
 			callHistory = append(callHistory, currentCall)
 
 			log.Printf("[ReAct] Action: %s(%s)", step.Action, step.ActionInput)
 
-			// Handle "naked" strings (LLM sending a bare string instead of a JSON object)
-			params := step.ActionInput
-			if len(params) == 0 || string(params) == "null" {
-				params = json.RawMessage(`{}`)
-			} else if params[0] != '{' && params[0] != '[' {
-				params = json.RawMessage(fmt.Sprintf(`{"query": %q}`, string(params)))
-			}
-
-			result, err := r.registry.Execute(ctx, step.Action, params)
+			result, err := r.registry.Execute(ctx, step.Action, step.ActionInput)
 			if err != nil {
 				step.Observation = fmt.Sprintf("Error executing tool: %v", err)
 				r.reflectOnFailure(ctx, step.Action, err)
@@ -199,7 +301,7 @@ func (r *ReActLoop) buildPrompt(goal string, steps []ReActStep) string {
 
 	system := fmt.Sprintf(`You are Mai's reasoning engine. Goal: %s
 
-Available tools:
+Available tools (use ONLY these exact names):
 %s
 
 RULES:
@@ -209,6 +311,9 @@ RULES:
 4. action_input must be a JSON object: {"key":"value"}.
 5. Leave final_answer empty ("") only if you NEED to call a tool first.
 6. After one tool call + observation, provide final_answer immediately.
+7. NEVER invent tool names — use ONLY the tools listed above.
+8. NEVER make up facts or data — base your final_answer ONLY on tool observations or your training knowledge.
+9. If a tool returns an error, acknowledge it honestly rather than guessing what the result "should" be.
 
 Tool selection (use ONLY when truly needed):
 - "play X on Y" → youtube_play {"query":"X","browser":"Y"}
