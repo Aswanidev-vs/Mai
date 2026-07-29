@@ -8,7 +8,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/user/mai/pkg/interfaces"
+	"go.uber.org/goleak"
 )
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 func TestBus_PublishSubscribe(t *testing.T) {
 	bus := NewBus()

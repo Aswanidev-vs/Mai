@@ -112,6 +112,15 @@ func main() {
 	var lastMicMu sync.Mutex
 	var sherpaMu sync.Mutex // Mutex for all other Sherpa-ONNX calls
 
+	// Post-TTS cooldown: suppress mic input for 300ms after TTS finishes to
+	// prevent room reverberation from reaching ASR as false user input.
+	var lastTTSEndTime time.Time
+	const ttsCooldown = 300 * time.Millisecond
+
+	// Post-TTS AEC window: continue echo cancellation for this long after
+	// TTS finishes, so room reverberation doesn't pass through to ASR.
+	const postTTSAECWindow = 800 * time.Millisecond
+
 	// Shared across main scope so greeting / TTS / browser-mic paths can reach the bus.
 	var bus interfaces.EventBus
 	var companionServer *server.Server
@@ -543,10 +552,12 @@ func main() {
 			if len(ttsSentCh) == 0 {
 				atomic.StoreInt32(&isSpeaking, 0)
 				atomic.StoreInt32(&stopPlayback, 0) // ensure clean state for next response
+				lastTTSEndTime = time.Now()
 			}
 		}
 		atomic.StoreInt32(&isSpeaking, 0)
 		atomic.StoreInt32(&stopPlayback, 0)
+		lastTTSEndTime = time.Now()
 	}()
 	// Test TTS on startup
 	go func() {
@@ -1048,6 +1059,32 @@ func main() {
 
 		if atomic.LoadInt32(&isSpeaking) != 0 {
 			return
+		}
+
+		// Post-TTS AEC: after TTS finishes, continue echo cancellation for
+		// postTTSAECWindow so room reverberation doesn't reach ASR. If the
+		// residual is low (just echo), drop the frame. If high (real speech),
+		// let it through for normal processing.
+		if !lastTTSEndTime.IsZero() && time.Since(lastTTSEndTime) < postTTSAECWindow {
+			if echoCanceller != nil {
+				clean := echoCanceller.Process(samples)
+				var csum float32
+				for _, s := range clean {
+					csum += s * s
+				}
+				crms := math.Sqrt(float64(csum / float32(len(clean))))
+				if crms < cfg.Audio.BargeInThreshold {
+					return // just echo, drop it
+				}
+				// Residual above threshold — genuine speech, fall through
+			} else {
+				return
+			}
+		}
+
+		// Clear the lastTTSEndTime after the AEC window expires
+		if !lastTTSEndTime.IsZero() && time.Since(lastTTSEndTime) >= postTTSAECWindow {
+			lastTTSEndTime = time.Time{}
 		}
 
 		if fromBrowser {

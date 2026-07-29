@@ -127,6 +127,7 @@ func playAudioStreaming(ctx context.Context, sampleRate int, stop *int32, genera
 	var buf []float32
 	var readIdx int
 	var streamDone bool
+	cond := sync.NewCond(&mu)
 
 	rs := newResampler(44100, 16000) // TTS is played at 44.1k; reference must match the 16k mic.
 	onSamples := func(pOutputSample, _ []byte, frameCount uint32) {
@@ -142,9 +143,8 @@ func playAudioStreaming(ctx context.Context, sampleRate int, stop *int32, genera
 				if streamDone {
 					break
 				}
-				mu.Unlock()
-				time.Sleep(time.Millisecond)
-				mu.Lock()
+				// Wait for new data instead of busy-spinning
+				cond.Wait()
 				continue
 			}
 			s := buf[readIdx]
@@ -186,10 +186,12 @@ func playAudioStreaming(ctx context.Context, sampleRate int, stop *int32, genera
 			}
 			mu.Lock()
 			buf = append(buf, chunk...)
+			cond.Signal() // Wake up the playback callback
 			mu.Unlock()
 		}
 		mu.Lock()
 		streamDone = true
+		cond.Broadcast() // Wake up all waiters so they can see streamDone
 		mu.Unlock()
 	}()
 

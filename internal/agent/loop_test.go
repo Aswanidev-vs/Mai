@@ -4,7 +4,12 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/goleak"
 )
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 func TestIsEcho(t *testing.T) {
 	tests := []struct {
@@ -111,6 +116,60 @@ func TestIsEcho(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := isEcho(tt.input, tt.spoken)
+			assert.Equal(t, tt.isEcho, result)
+		})
+	}
+}
+
+func TestIsEchoStrict(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		spoken  string
+		isEcho  bool
+	}{
+		// Strict mode catches partial echoes (40% threshold)
+		{
+			name:   "exact match",
+			input:  "the weather is nice",
+			spoken: "the weather is nice today",
+			isEcho: true,
+		},
+		{
+			name:   "partial echo 50 percent",
+			input:  "weather is nice",
+			spoken: "the weather is nice today and tomorrow",
+			isEcho: true,
+		},
+		{
+			name:   "partial echo 40 percent",
+			input:   "open notepad",
+			spoken:  "please open notepad for me right now",
+			isEcho:  true,
+		},
+		{
+			name:   "low overlap not echo",
+			input:  "hello world",
+			spoken: "the weather is nice today",
+			isEcho: false,
+		},
+		{
+			name:   "empty input",
+			input:  "",
+			spoken: "something",
+			isEcho: false,
+		},
+		{
+			name:   "empty spoken",
+			input:  "something",
+			spoken: "",
+			isEcho: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isEchoStrict(tt.input, tt.spoken)
 			assert.Equal(t, tt.isEcho, result)
 		})
 	}
@@ -285,5 +344,136 @@ func TestStripHallucinationHedging(t *testing.T) {
 			result := stripHallucinationHedging(tt.input)
 			assert.Equal(t, tt.expected, result)
 		})
+	}
+}
+
+func TestIsEcho_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		spoken string
+		isEcho bool
+	}{
+		{
+			name:   "single char input",
+			input:  "a",
+			spoken: "a b c d e",
+			isEcho: false, // 1 word, excluded
+		},
+		{
+			name:   "two words high overlap",
+			input:  "hello world",
+			spoken: "hello world foo bar",
+			isEcho: true, // 2 words, 100% overlap > 60%
+		},
+		{
+			name:   "input same length as spoken",
+			input:  "the cat sat on the mat",
+			spoken: "the cat sat on the mat",
+			isEcho: true,
+		},
+		{
+			name:   "input longer than spoken",
+			input:  "the cat sat on the mat and the dog",
+			spoken: "the cat sat on the mat",
+			isEcho: false,
+		},
+		{
+			name:   "partial overlap 65 percent",
+			input:  "the cat sat on the floor",
+			spoken: "the cat sat on the mat and the dog",
+			isEcho: true, // 5/6 = 83% > 60%
+		},
+		{
+			name:   "partial overlap 50 percent",
+			input:  "the cat and dog",
+			spoken: "the cat sat on the mat",
+			isEcho: false, // 2/5 = 40% < 60%
+		},
+		{
+			name:   "spoken is subset of input",
+			input:  "the cat sat on the mat and more",
+			spoken: "the cat sat on the mat",
+			isEcho: false, // input longer than spoken
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isEcho(tt.input, tt.spoken)
+			assert.Equal(t, tt.isEcho, result)
+		})
+	}
+}
+
+func TestIsEchoStrict_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		spoken string
+		isEcho bool
+	}{
+		{
+			name:   "very low overlap",
+			input:  "foo bar baz",
+			spoken: "the quick brown fox jumps",
+			isEcho: false, // 0% overlap < 40%
+		},
+		{
+			name:   "40 percent overlap",
+			input:  "the cat",
+			spoken: "the cat sat on the mat",
+			isEcho: true, // 2/2 = 100% > 40%
+		},
+		{
+			name:   "single word match",
+			input:  "cat",
+			spoken: "the cat sat on the mat",
+			isEcho: true, // 1/1 = 100% > 40%
+		},
+		{
+			name:   "empty both",
+			input:  "",
+			spoken: "",
+			isEcho: false,
+		},
+		{
+			name:   "long input partial match",
+			input:  "the weather is nice today and tomorrow",
+			spoken: "the weather is nice",
+			isEcho: true, // 4/8 = 50% > 40%
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isEchoStrict(tt.input, tt.spoken)
+			assert.Equal(t, tt.isEcho, result)
+		})
+	}
+}
+
+func TestIsEcho_Performance(t *testing.T) {
+	// Verify isEcho handles large inputs without excessive time
+	spoken := "the quick brown fox jumps over the lazy dog "
+	for i := 0; i < 10; i++ {
+		spoken += spoken
+	}
+	input := "the quick brown fox"
+
+	for i := 0; i < 1000; i++ {
+		_ = isEcho(input, spoken)
+	}
+}
+
+func TestIsEchoStrict_Performance(t *testing.T) {
+	spoken := "the quick brown fox jumps over the lazy dog "
+	for i := 0; i < 10; i++ {
+		spoken += spoken
+	}
+	input := "the quick brown fox"
+
+	for i := 0; i < 1000; i++ {
+		_ = isEchoStrict(input, spoken)
 	}
 }
