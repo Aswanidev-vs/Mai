@@ -244,9 +244,23 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	// lastSpokenAt is set when speech starts; widen it so long replies still
 	// covered, and also reject near-duplicate recent user inputs.
 	inputLower := strings.ToLower(text)
-	if o.lastSpoken != "" && isEcho(inputLower, o.lastSpoken) {
-		log.Printf("[Agent] Echo of Mai's speech detected — ignoring: %q", text)
-		return &interfaces.AgentResponse{Text: "", Success: true}, nil
+
+	// Time-based echo detection: shortly after TTS finishes, use stricter
+	// matching to catch partial echoes from room reverberation.
+	timeSinceTTS := time.Since(o.lastSpokenAt)
+	nearTTS := timeSinceTTS < 2*time.Second
+
+	if o.lastSpoken != "" {
+		isEchoResult := false
+		if nearTTS {
+			isEchoResult = isEchoStrict(inputLower, o.lastSpoken)
+		} else {
+			isEchoResult = isEcho(inputLower, o.lastSpoken)
+		}
+		if isEchoResult {
+			log.Printf("[Agent] Echo of Mai's speech detected (nearTTS=%v, sinceTTS=%v) — ignoring: %q", nearTTS, timeSinceTTS, text)
+			return &interfaces.AgentResponse{Text: "", Success: true}, nil
+		}
 	}
 	for _, prev := range o.recentUserInputs {
 		if isEcho(inputLower, prev) {
@@ -1004,9 +1018,10 @@ func isEcho(input, spoken string) bool {
 		return false
 	}
 
-	// Very short inputs (1-2 words) should NOT be treated as echoes —
+	// Very short inputs (1 word) should NOT be treated as echoes —
 	// they're more likely genuine short commands like "yes", "no", "stop".
-	if len(inputWords) <= 2 {
+	// But 2+ word inputs that overlap heavily with Mai's speech are likely echoes.
+	if len(inputWords) <= 1 {
 		return false
 	}
 
@@ -1023,9 +1038,36 @@ func isEcho(input, spoken string) bool {
 	}
 
 	matchRatio := float64(matchCount) / float64(len(inputWords))
-	// Require 80%+ word overlap AND the input must be shorter or equal
+	// Require 60%+ word overlap AND the input must be shorter or equal
 	// to the spoken text (an echo can't be longer than the original).
-	return matchRatio > 0.8 && len(inputWords) <= len(spokenWords)
+	return matchRatio > 0.6 && len(inputWords) <= len(spokenWords)
+}
+
+// isEchoStrict is a more aggressive echo check used shortly after TTS finishes,
+// when room reverberation is most likely to cause partial transcriptions.
+func isEchoStrict(input, spoken string) bool {
+	inputWords := strings.Fields(input)
+	spokenWords := strings.Fields(spoken)
+
+	if len(inputWords) == 0 || len(spokenWords) == 0 {
+		return false
+	}
+
+	spokenSet := make(map[string]bool)
+	for _, w := range spokenWords {
+		spokenSet[w] = true
+	}
+
+	matchCount := 0
+	for _, w := range inputWords {
+		if spokenSet[w] {
+			matchCount++
+		}
+	}
+
+	matchRatio := float64(matchCount) / float64(len(inputWords))
+	// Within 2s of TTS ending: lower threshold to 40% and allow any length
+	return matchRatio > 0.4
 }
 
 func cleanResponse(s string) string {
