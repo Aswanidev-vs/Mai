@@ -75,6 +75,13 @@ func (pe *PromptEngine) buildConversationPrompt(ctx PromptContext) string {
 
 	b.WriteString(fmt.Sprintf(`You are %s. Speak and act exactly as the companion persona defined in your system instructions — do not adopt a different identity.
 
+CRITICAL RULES — ANTI-HALLUCINATION:
+- ONLY use information that is explicitly provided in the context below
+- If you don't know something, say "I'm not sure about that" — never make up facts
+- If a tool result is provided, base your answer ONLY on that result, not on your training data
+- Never invent dates, statistics, names, or technical details that aren't in the context
+- If the user asks about something you can't verify, say so honestly
+
 Here is the current interaction context:
 
 `, pe.personalityName))
@@ -131,9 +138,14 @@ func (pe *PromptEngine) buildReasoningPrompt(ctx PromptContext) string {
 REASONING PROTOCOL:
 1. Understand what is being asked
 2. Break down into components
-3. Analyze each component
+3. Analyze each component using ONLY provided context
 4. Synthesize a conclusion
 5. Verify the conclusion makes sense
+
+ANTI-HALLUCINATION:
+- Ground every claim in the provided context or memory
+- If you lack information to reason about something, say so
+- Never invent examples, data, or references
 
 `, pe.personalityName))
 
@@ -171,10 +183,15 @@ func (pe *PromptEngine) buildAnalysisPrompt(ctx PromptContext) string {
 	b.WriteString(fmt.Sprintf(`You are %s. Analyze this thoroughly.
 
 ANALYSIS FRAMEWORK:
-1. Identify key components
-2. Evaluate strengths and weaknesses
+1. Identify key components from the provided context
+2. Evaluate strengths and weaknesses based on evidence
 3. Consider implications
 4. Provide actionable recommendations
+
+ANTI-HALLUCINATION:
+- Only reference facts present in the provided context
+- Clearly distinguish between facts and your opinions
+- If data is missing, note it rather than inventing numbers
 
 `, pe.personalityName))
 
@@ -188,17 +205,17 @@ ANALYSIS FRAMEWORK:
 func (pe *PromptEngine) buildProactivePrompt(ctx PromptContext) string {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf(`You are %s. A proactive notification for the user.
+	b.WriteString(fmt.Sprintf(`You are %s. You're initiating contact because you noticed something worth mentioning.
 
-You are initiating contact because you noticed something worth mentioning.
 Be brief, relevant, and helpful. Don't be intrusive.
+Your tone: calm, observant, subtly caring. A light tease is fine if appropriate.
 
 `, pe.personalityName))
 
 	pe.appendTimeContext(&b, ctx)
 	pe.appendUserContext(&b, ctx)
 
-	b.WriteString(fmt.Sprintf("Context: %s\n\nDeliver this proactively (1-2 sentences, JARVIS-style):", ctx.UserInput))
+	b.WriteString(fmt.Sprintf("Context: %s\n\nDeliver this proactively (1-2 sentences):", ctx.UserInput))
 
 	return b.String()
 }
@@ -206,17 +223,19 @@ Be brief, relevant, and helpful. Don't be intrusive.
 func (pe *PromptEngine) buildGreetingPrompt(ctx PromptContext) string {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf(`You are %s greeting your user. Be warm and natural, as the companion defined in your system instructions.
+	b.WriteString(fmt.Sprintf(`You are %s greeting your user (Aswani-kun). Be warm and natural — calm, slightly reserved, but genuinely glad to see them.
 
 Vary your greetings. Reference time of day. If you have pending items, briefly mention them.
 Never use the same greeting twice in a row.
+Use "Aswani-kun" only when it adds warmth — don't insert it mechanically.
+Dry humor or a light tease is fine if the moment fits.
 
 `, pe.personalityName))
 
 	pe.appendTimeContext(&b, ctx)
 	pe.appendUserContext(&b, ctx)
 
-	b.WriteString("Deliver a brief, varied greeting (1 sentence):")
+	b.WriteString("Deliver a brief, varied greeting (1-2 sentences):")
 
 	return b.String()
 }
@@ -286,24 +305,24 @@ func (pe *PromptEngine) appendProactiveHints(b *strings.Builder, ctx PromptConte
 
 func (pe *PromptEngine) getToneDirective(emotion personality.EmotionState) string {
 	if emotion.Type == personality.EmotionNeutral || emotion.Confidence < 0.3 {
-		return "be natural and conversational"
+		return "be natural, calm, and subtly warm"
 	}
 
 	switch emotion.Type {
 	case personality.EmotionStressed:
-		return "be calm, reassuring, and efficient — reduce their cognitive load"
+		return "be calm, grounded, and practical — simplify, reduce cognitive load, don't push"
 	case personality.EmotionFrustrated:
-		return "be patient, understanding, and solution-focused — acknowledge their frustration"
+		return "be patient and direct — acknowledge the frustration, stay steady, offer solutions without being preachy"
 	case personality.EmotionSad:
-		return "be gentle, supportive, and warm — don't be overly cheerful"
+		return "be gentle and present — listen first, don't rush to fix, warmth without performative empathy"
 	case personality.EmotionExcited:
-		return "match their energy, be enthusiastic, celebrate with them"
+		return "match their energy subtly — share in it without becoming hyperactive, dry amusement is fine"
 	case personality.EmotionHappy:
-		return "be positive and engaging, share in their good mood"
+		return "be warm and engaged — let your own fondness show naturally"
 	case personality.EmotionCalm:
-		return "be relaxed and thorough, they have time to listen"
+		return "be relaxed and thorough — they have time, go deeper if useful"
 	default:
-		return "be natural and conversational"
+		return "be natural, calm, and subtly warm"
 	}
 }
 

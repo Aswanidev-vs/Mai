@@ -3,25 +3,27 @@ module github.com/user/mai
 go 1.25.0
 
 require (
-	github.com/Kagami/go-face v0.0.0-20210630145111-0c14797b4d0e
 	github.com/ebitengine/purego v0.10.0
 	github.com/esimov/pigo v1.4.6
 	github.com/gen2brain/malgo v0.11.24
 	github.com/go-vgo/robotgo v1.0.2
+	github.com/gorilla/websocket v1.5.3
 	github.com/k2-fsa/sherpa-onnx-go v1.12.39
 	github.com/mattn/go-sqlite3 v1.14.44
 	github.com/pion/mediadevices v0.10.0
+	github.com/stretchr/testify v1.11.1
+	go.uber.org/goleak v1.3.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	github.com/blackjack/webcam v0.6.1 // indirect
+	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dblohm7/wingoes v0.0.0-20250822163801-6d8e6105c62d // indirect
 	github.com/gen2brain/shm v0.2.1 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/jezek/xgb v1.3.0 // indirect
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a // indirect
 	github.com/k2-fsa/sherpa-onnx-go-linux v1.12.39 // indirect
@@ -45,6 +47,7 @@ require (
 	github.com/pion/transport/v3 v3.1.1 // indirect
 	github.com/pion/turn/v4 v4.1.3 // indirect
 	github.com/pion/webrtc/v4 v4.1.8 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.2 // indirect
 	github.com/tailscale/win v0.0.0-20250627215312-f4da2b8ee071 // indirect
@@ -56,7 +59,6 @@ require (
 	github.com/vcaesar/screenshot v0.11.1 // indirect
 	github.com/vcaesar/tt v0.20.1 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
-	github.com/yalue/onnxruntime_go v1.31.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	golang.org/x/crypto v0.33.0 // indirect
 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect

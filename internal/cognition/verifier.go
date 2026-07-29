@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"strings"
 
 	"github.com/user/mai/pkg/interfaces"
 )
@@ -56,16 +55,16 @@ Respond with JSON:
 		return nil, fmt.Errorf("verifier LLM error: %w", err)
 	}
 
-	clean := string(response)
-	if idx := strings.LastIndex(clean, "}"); idx != -1 {
-		clean = clean[:idx+1]
-	}
+	clean := sanitizeJSON(string(response))
 
 	var result VerificationResult
 	if err := json.Unmarshal([]byte(clean), &result); err != nil {
+		// FAIL CLOSED: if we can't parse the verification, treat it as suspicious
+		log.Printf("[Verifier] Failed to parse claim verification JSON: %v", err)
 		return &VerificationResult{
-			IsValid:    true,
-			Confidence: 0.5,
+			IsValid:    false,
+			Confidence: 0.3,
+			Issues:     []string{"Verification response could not be parsed"},
 		}, nil
 	}
 
@@ -99,17 +98,16 @@ Respond with JSON:
 		"required": ["is_valid", "confidence"]
 	}`))
 	if err != nil {
-		return &VerificationResult{IsValid: true, Confidence: 0.5}, nil
+		// FAIL CLOSED: LLM verification failure = suspicious
+		return &VerificationResult{IsValid: false, Confidence: 0.3, Issues: []string{"Verification LLM call failed"}}, nil
 	}
 
-	clean := string(response)
-	if idx := strings.LastIndex(clean, "}"); idx != -1 {
-		clean = clean[:idx+1]
-	}
+	clean := sanitizeJSON(string(response))
 
 	var result VerificationResult
 	if err := json.Unmarshal([]byte(clean), &result); err != nil {
-		return &VerificationResult{IsValid: true, Confidence: 0.5}, nil
+		// FAIL CLOSED
+		return &VerificationResult{IsValid: false, Confidence: 0.3, Issues: []string{"Verification JSON parse failed"}}, nil
 	}
 
 	return &result, nil

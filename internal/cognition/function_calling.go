@@ -38,9 +38,15 @@ func (fc *FunctionCaller) Execute(ctx context.Context, userText string, emotionH
 	tools := fc.registry.List()
 	toolsJSON, _ := json.MarshalIndent(tools, "", "  ")
 
+	// Build tool name list for the prompt so the LLM knows exactly what's available
+	toolNames := make([]string, len(tools))
+	for i, t := range tools {
+		toolNames[i] = t.Name
+	}
+
 	prompt := fmt.Sprintf(`You are Mai, a personal AI assistant. The user wants you to perform an action.
 
-Available tools:
+Available tools (use ONLY these exact names):
 %s
 
 User request: %s
@@ -51,7 +57,12 @@ IMPORTANT: Respond with ONLY a JSON object in this exact format:
 {"tool": "tool_name", "params": {"key": "value"}, "reasoning": "brief explanation"}
 
 If no tool matches the request, respond with:
-{"tool": "none", "params": {}, "reasoning": "explanation why no tool matches"}`, string(toolsJSON), userText, emotionHint)
+{"tool": "none", "params": {}, "reasoning": "explanation why no tool matches"}
+
+RULES:
+- Use ONLY the tool names listed above — never invent tool names
+- Parameters must match the tool's expected format
+- If unsure which tool to use, ask the user to clarify`, string(toolsJSON), userText, emotionHint)
 
 	response, err := fc.llm.GenerateStructured(ctx, prompt, json.RawMessage(`{
 		"type": "object",
@@ -66,14 +77,27 @@ If no tool matches the request, respond with:
 		return "", nil, fmt.Errorf("LLM function call error: %w", err)
 	}
 
-	cleaned := string(response)
-	if idx := strings.LastIndex(cleaned, "}"); idx != -1 {
-		cleaned = cleaned[:idx+1]
-	}
+	cleaned := sanitizeJSON(string(response))
 
 	var call FunctionCall
 	if err := json.Unmarshal([]byte(cleaned), &call); err != nil {
 		return "", nil, fmt.Errorf("failed to parse function call: %w", err)
+	}
+
+	// Validate tool exists in registry
+	if call.Tool != "none" && call.Tool != "" {
+		found := false
+		for _, t := range tools {
+			if strings.EqualFold(t.Name, call.Tool) {
+				found = true
+				call.Tool = t.Name // normalize case
+				break
+			}
+		}
+		if !found {
+			return fmt.Sprintf("Tool %q is not available. Available tools: %s",
+				call.Tool, strings.Join(toolNames, ", ")), nil, nil
+		}
 	}
 
 	if call.Tool == "none" || call.Tool == "" {
@@ -135,10 +159,7 @@ Otherwise: {"tool": "tool_name", "params": {"key": "value"}, "reasoning": "what 
 			return "", allResults, fmt.Errorf("step %d LLM error: %w", step+1, err)
 		}
 
-		cleaned := string(response)
-		if idx := strings.LastIndex(cleaned, "}"); idx != -1 {
-			cleaned = cleaned[:idx+1]
-		}
+		cleaned := sanitizeJSON(string(response))
 
 		var call FunctionCall
 		if err := json.Unmarshal([]byte(cleaned), &call); err != nil {

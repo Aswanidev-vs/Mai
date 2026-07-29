@@ -171,6 +171,11 @@ func main() {
 	lookbackBuffer := make([]float32, lookbackSize)
 	lookbackIdx := 0
 
+	// Safety cap for offline ASR buffer: 30 seconds at 16kHz = 480000 samples.
+	// If VAD never finalizes, this prevents unbounded memory growth.
+	const offlineASRMaxSamples = 480000
+	const offlineASRMaxDuration = 30 * time.Second
+
 	// Start Ollama if needed
 	if cfg.LLM.AutoStart && cfg.LLM.Provider == "ollama" {
 		stopOllama := startOllama()
@@ -518,12 +523,19 @@ func main() {
 		for item := range ttsSentCh {
 			if atomic.LoadInt32(&stopPlayback) != 0 {
 				log.Printf("[TTS-PLAYER] Skipping sentence due to barge-in: %.60s...", item.text)
-				// If we've skipped the last item in the queue, clear stopPlayback
-				// so a fresh TTS response can start playing.
-				if len(ttsSentCh) == 0 {
-					atomic.StoreInt32(&stopPlayback, 0)
+				// DRAIN: discard all remaining queued sentences so stale
+				// responses don't play after the user interrupts.
+				drained := false
+				for !drained {
+					select {
+					case <-ttsSentCh:
+						// discarded
+					default:
+						drained = true
+					}
 				}
-				continue // dropped due to an interruption
+				atomic.StoreInt32(&stopPlayback, 0)
+				continue
 			}
 			log.Printf("[TTS-PLAYER] Playing sentence (len=%d): %.80s...", len(item.text), item.text)
 			playSentence(item.text, item.speed)
@@ -863,14 +875,51 @@ func main() {
 				fmt.Printf("\r[ASR] Live: %s%s", sessionText, text)
 			}
 		} else {
-			sessionSamples = append(sessionSamples, samples...)
-			fmt.Printf("\r[ASR] Listening... (buffered %d samples)", len(sessionSamples))
+			// Safety cap: force finalization if buffer grows too large
+			if len(sessionSamples) >= offlineASRMaxSamples {
+				log.Printf("[ASR] WARNING: Offline buffer exceeded %d samples (%.0fs). Forcing finalization.",
+					offlineASRMaxSamples, offlineASRMaxDuration.Seconds())
+				// Force a VAD end-of-segment to trigger processing
+				// by adding a synthetic silence chunk won't help — instead
+				// just process what we have
+				if offlineRecognizer != nil && len(sessionSamples) > 0 {
+					log.Println("[ASR] Processing oversized segment with Offline Qwen3...")
+					offlineStream := sherpa.NewOfflineStream(offlineRecognizer)
+					if cfg.ASR.Language != "" {
+						offlineStream.SetOption("language", cfg.ASR.Language)
+					}
+					offlineStream.AcceptWaveform(16000, sessionSamples)
+					offlineRecognizer.Decode(offlineStream)
+					result := offlineStream.GetResult()
+					if result != nil && result.Text != "" {
+						sessionText = result.Text
+						log.Printf("[ASR] Offline result: %s", sessionText)
+						if agentBridge != nil {
+							go agentBridge.PublishTranscription(sessionText)
+						} else {
+							workerChan <- Task{Text: sessionText, IsReasoning: false}
+						}
+					}
+					sherpa.DeleteOfflineStream(offlineStream)
+				}
+				sessionSamples = nil
+				sessionText = ""
+				state = StateWakeWord
+			} else {
+				sessionSamples = append(sessionSamples, samples...)
+				fmt.Printf("\r[ASR] Listening... (buffered %d samples)", len(sessionSamples))
+			}
 		}
 
 		for !vadDetector.IsEmpty() {
 			vadDetector.Pop()
 
 			if asrStream != nil {
+				// DRAIN: Run any remaining decode cycles before GetResult
+				// so trailing words aren't lost when VAD ends slightly early.
+				for recognizer.IsReady(asrStream) {
+					recognizer.Decode(asrStream)
+				}
 				text := recognizer.GetResult(asrStream).Text
 				if text != "" {
 					sessionText += text + " "
