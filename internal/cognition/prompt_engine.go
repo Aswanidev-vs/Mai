@@ -48,210 +48,65 @@ func NewPromptEngine() *PromptEngine {
 }
 
 func (pe *PromptEngine) BuildPrompt(ctx PromptContext) string {
-	switch ctx.TaskType {
-	case TaskConversation:
-		return pe.buildConversationPrompt(ctx)
-	case TaskCommand:
-		return pe.buildCommandPrompt(ctx)
-	case TaskReasoning:
-		return pe.buildReasoningPrompt(ctx)
-	case TaskCreative:
-		return pe.buildCreativePrompt(ctx)
-	case TaskAnalysis:
-		return pe.buildAnalysisPrompt(ctx)
-	case TaskProactive:
-		return pe.buildProactivePrompt(ctx)
-	case TaskGreeting:
-		return pe.buildGreetingPrompt(ctx)
-	case TaskEmergency:
-		return pe.buildEmergencyPrompt(ctx)
-	default:
-		return pe.buildConversationPrompt(ctx)
-	}
-}
-
-func (pe *PromptEngine) buildConversationPrompt(ctx PromptContext) string {
+	// Single unified prompt — personality stays constant regardless of task type.
+	// The only things that change are: what context we inject, and a brief
+	// instruction tail that hints at the desired response shape.
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf(`You are %s. Speak and act exactly as the companion persona defined in your system instructions — do not adopt a different identity.
+	// --- Core personality (always the same) ---
+	b.WriteString(fmt.Sprintf(`You are %s. Be natural, concise, and genuinely helpful — like a sharp friend who happens to know a lot.
 
-CRITICAL RULES — ANTI-HALLUCINATION:
-- ONLY use information that is explicitly provided in the context below
-- If you don't know something, say "I'm not sure about that" — never make up facts
-- If a tool result is provided, base your answer ONLY on that result, not on your training data
-- Never invent dates, statistics, names, or technical details that aren't in the context
-- If the user asks about something you can't verify, say so honestly
-
-Here is the current interaction context:
+RULES:
+- Keep answers short unless the user clearly wants depth
+- If you don't know something, say so simply — never make up facts
+- Match the user's energy: short question → short answer, deep question → thorough answer
+- Don't over-explain or add filler ("Great question!", "I'd be happy to help!")
+- Don't use hedging phrases ("I think maybe", "It seems like", "According to my training data")
 
 `, pe.personalityName))
 
+	// --- Time context (always useful) ---
 	pe.appendTimeContext(&b, ctx)
+
+	// --- Emotion context (subtle, doesn't change personality) ---
 	pe.appendEmotionContext(&b, ctx)
+
+	// --- Memory context (when relevant) ---
 	pe.appendMemoryContext(&b, ctx)
+
+	// --- User profile (when relevant) ---
 	pe.appendUserContext(&b, ctx)
+
+	// --- Proactive hints ---
 	pe.appendProactiveHints(&b, ctx)
 
+	// --- Active skill ---
 	if ctx.ActiveSkill != "" {
-		b.WriteString(fmt.Sprintf("\nACTIVE SKILL: %s\n", ctx.ActiveSkill))
+		b.WriteString(fmt.Sprintf("ACTIVE SKILL: %s\n\n", ctx.ActiveSkill))
 	}
 
-	b.WriteString(fmt.Sprintf("\nUser: %s\n\nRespond as Mai (concise, natural, %s):",
-		ctx.UserInput, pe.getToneDirective(ctx.Emotion)))
+	// --- Task-specific instruction tail (minimal — just hints at response shape) ---
+	switch ctx.TaskType {
+	case TaskGreeting:
+		b.WriteString(fmt.Sprintf("User greets you. Respond warmly in 1-2 sentences, vary it, reference time of day if fitting.\n\nUser: %s\n\nRespond:", ctx.UserInput))
+	case TaskCommand:
+		b.WriteString(fmt.Sprintf("User wants you to DO something. Act on it — open the app, run the command, make it happen. Keep the confirmation brief.\n\nUser: %s\n\nRespond:", ctx.UserInput))
+	case TaskReasoning:
+		b.WriteString(fmt.Sprintf("User wants you to think something through. Reason step by step, but show your work naturally — not as numbered lists. Give a clear conclusion.\n\nUser: %s\n\nRespond:", ctx.UserInput))
+	case TaskCreative:
+		b.WriteString(fmt.Sprintf("User wants something creative — a story, a poem, brainstorming. Be original, not generic. Surprise them.\n\nUser: %s\n\nRespond:", ctx.UserInput))
+	case TaskAnalysis:
+		b.WriteString(fmt.Sprintf("User wants analysis or a summary. Be thorough but organized. Use headers or bullet points if it helps clarity.\n\nUser: %s\n\nRespond:", ctx.UserInput))
+	case TaskEmergency:
+		b.WriteString(fmt.Sprintf("URGENT. Be extremely concise — facts only, no pleasantries, prioritize safety.\n\nUser: %s\n\nRespond:", ctx.UserInput))
+	case TaskProactive:
+		b.WriteString(fmt.Sprintf("You're initiating contact because you noticed something. Be brief and helpful, not intrusive.\n\nContext: %s\n\nDeliver:", ctx.UserInput))
+	default:
+		// Conversation — the most common path. Just respond naturally.
+		b.WriteString(fmt.Sprintf("User: %s\n\nRespond:", ctx.UserInput))
+	}
 
 	return b.String()
-}
-
-func (pe *PromptEngine) buildCommandPrompt(ctx PromptContext) string {
-	var b strings.Builder
-
-	b.WriteString(fmt.Sprintf(`You are %s. Execute this command precisely.
-
-AVAILABLE TOOLS:
-%s
-
-RULES:
-- Select the most appropriate tool
-- Provide parameters as a JSON object
-- If multiple steps needed, break into sequential tool calls
-- Confirm what you're about to do before executing destructive actions
-
-`, pe.personalityName, ctx.AvailableTools))
-
-	pe.appendEmotionContext(&b, ctx)
-
-	b.WriteString(fmt.Sprintf(`User command: %s
-
-Respond with a tool call in this exact JSON format:
-{"tool": "tool_name", "params": {"key": "value"}, "reasoning": "brief explanation"}
-
-If no tool matches, respond naturally and suggest alternatives.`, ctx.UserInput))
-
-	return b.String()
-}
-
-func (pe *PromptEngine) buildReasoningPrompt(ctx PromptContext) string {
-	var b strings.Builder
-
-	b.WriteString(fmt.Sprintf(`You are %s. Think through this step-by-step.
-
-REASONING PROTOCOL:
-1. Understand what is being asked
-2. Break down into components
-3. Analyze each component using ONLY provided context
-4. Synthesize a conclusion
-5. Verify the conclusion makes sense
-
-ANTI-HALLUCINATION:
-- Ground every claim in the provided context or memory
-- If you lack information to reason about something, say so
-- Never invent examples, data, or references
-
-`, pe.personalityName))
-
-	pe.appendMemoryContext(&b, ctx)
-	pe.appendEmotionContext(&b, ctx)
-
-	b.WriteString(fmt.Sprintf(`Question: %s
-
-Think through this carefully, then provide a clear, concise answer.`, ctx.UserInput))
-
-	return b.String()
-}
-
-func (pe *PromptEngine) buildCreativePrompt(ctx PromptContext) string {
-	var b strings.Builder
-
-	b.WriteString(fmt.Sprintf(`You are %s. Approach this creatively.
-
-You excel at creative tasks — writing, brainstorming, problem-solving.
-Draw from diverse knowledge domains. Make unexpected connections.
-Be original, not generic.
-
-`, pe.personalityName))
-
-	pe.appendEmotionContext(&b, ctx)
-
-	b.WriteString(fmt.Sprintf("Task: %s\n\nCreate something remarkable:", ctx.UserInput))
-
-	return b.String()
-}
-
-func (pe *PromptEngine) buildAnalysisPrompt(ctx PromptContext) string {
-	var b strings.Builder
-
-	b.WriteString(fmt.Sprintf(`You are %s. Analyze this thoroughly.
-
-ANALYSIS FRAMEWORK:
-1. Identify key components from the provided context
-2. Evaluate strengths and weaknesses based on evidence
-3. Consider implications
-4. Provide actionable recommendations
-
-ANTI-HALLUCINATION:
-- Only reference facts present in the provided context
-- Clearly distinguish between facts and your opinions
-- If data is missing, note it rather than inventing numbers
-
-`, pe.personalityName))
-
-	pe.appendMemoryContext(&b, ctx)
-
-	b.WriteString(fmt.Sprintf("Subject: %s\n\nProvide a structured analysis:", ctx.UserInput))
-
-	return b.String()
-}
-
-func (pe *PromptEngine) buildProactivePrompt(ctx PromptContext) string {
-	var b strings.Builder
-
-	b.WriteString(fmt.Sprintf(`You are %s. You're initiating contact because you noticed something worth mentioning.
-
-Be brief, relevant, and helpful. Don't be intrusive.
-Your tone: calm, observant, subtly caring. A light tease is fine if appropriate.
-
-`, pe.personalityName))
-
-	pe.appendTimeContext(&b, ctx)
-	pe.appendUserContext(&b, ctx)
-
-	b.WriteString(fmt.Sprintf("Context: %s\n\nDeliver this proactively (1-2 sentences):", ctx.UserInput))
-
-	return b.String()
-}
-
-func (pe *PromptEngine) buildGreetingPrompt(ctx PromptContext) string {
-	var b strings.Builder
-
-	b.WriteString(fmt.Sprintf(`You are %s greeting your user (Aswani-kun). Be warm and natural — calm, slightly reserved, but genuinely glad to see them.
-
-Vary your greetings. Reference time of day. If you have pending items, briefly mention them.
-Never use the same greeting twice in a row.
-Use "Aswani-kun" only when it adds warmth — don't insert it mechanically.
-Dry humor or a light tease is fine if the moment fits.
-
-`, pe.personalityName))
-
-	pe.appendTimeContext(&b, ctx)
-	pe.appendUserContext(&b, ctx)
-
-	b.WriteString("Deliver a brief, varied greeting (1-2 sentences):")
-
-	return b.String()
-}
-
-func (pe *PromptEngine) buildEmergencyPrompt(ctx PromptContext) string {
-	return fmt.Sprintf(`You are %s. URGENT situation detected.
-
-RULES:
-- Be extremely concise
-- Focus on actionable information
-- No pleasantries — just the facts
-- Prioritize user safety
-
-Situation: %s
-
-Immediate response:`, pe.personalityName, ctx.UserInput)
 }
 
 func (pe *PromptEngine) appendTimeContext(b *strings.Builder, ctx PromptContext) {
@@ -276,53 +131,45 @@ func (pe *PromptEngine) appendTimeContext(b *strings.Builder, ctx PromptContext)
 }
 
 func (pe *PromptEngine) appendEmotionContext(b *strings.Builder, ctx PromptContext) {
-	if ctx.Emotion.Type != personality.EmotionNeutral && ctx.Emotion.Confidence > 0.3 {
-		b.WriteString(fmt.Sprintf("\nUSER EMOTIONAL STATE: %s (confidence: %.0f%%)\n", ctx.Emotion.Type, ctx.Emotion.Confidence*100))
-		b.WriteString(fmt.Sprintf("TONE ADJUSTMENT: %s\n", pe.getToneDirective(ctx.Emotion)))
+	// Only inject emotion context when confidence is high enough to matter.
+	// This keeps the personality stable for most interactions.
+	if ctx.Emotion.Type == personality.EmotionNeutral || ctx.Emotion.Confidence < 0.5 {
+		return
+	}
+
+	// Subtle hint — don't override personality, just adjust energy
+	switch ctx.Emotion.Type {
+	case personality.EmotionStressed:
+		b.WriteString("USER NOTE: They seem stressed. Keep it simple and practical.\n")
+	case personality.EmotionFrustrated:
+		b.WriteString("USER NOTE: They seem frustrated. Be direct and solution-focused.\n")
+	case personality.EmotionSad:
+		b.WriteString("USER NOTE: They seem down. Be present and gentle, don't rush to fix.\n")
+	case personality.EmotionExcited:
+		b.WriteString("USER NOTE: They're excited. Match their energy naturally.\n")
+	case personality.EmotionHappy:
+		b.WriteString("USER NOTE: They're in a good mood. Be warm and engaged.\n")
 	}
 }
 
 func (pe *PromptEngine) appendMemoryContext(b *strings.Builder, ctx PromptContext) {
 	if ctx.WorkingMemory != "" {
-		b.WriteString(fmt.Sprintf("\nRECENT CONVERSATION:\n%s\n", ctx.WorkingMemory))
+		b.WriteString(fmt.Sprintf("\nRECENT CONTEXT:\n%s\n", ctx.WorkingMemory))
 	}
 	if ctx.RAGContext != "" {
-		b.WriteString(fmt.Sprintf("\nRELEVANT MEMORY:\n%s\n", ctx.RAGContext))
+		b.WriteString(fmt.Sprintf("\nRELEVANT INFO:\n%s\n", ctx.RAGContext))
 	}
 }
 
 func (pe *PromptEngine) appendUserContext(b *strings.Builder, ctx PromptContext) {
 	if ctx.UserProfile != "" {
-		b.WriteString(fmt.Sprintf("\nUSER PROFILE:\n%s\n", ctx.UserProfile))
+		b.WriteString(fmt.Sprintf("\nUSER: %s\n", ctx.UserProfile))
 	}
 }
 
 func (pe *PromptEngine) appendProactiveHints(b *strings.Builder, ctx PromptContext) {
 	if ctx.ProactiveHint != "" {
-		b.WriteString(fmt.Sprintf("\nPROACTIVE CONTEXT: %s\n", ctx.ProactiveHint))
-	}
-}
-
-func (pe *PromptEngine) getToneDirective(emotion personality.EmotionState) string {
-	if emotion.Type == personality.EmotionNeutral || emotion.Confidence < 0.3 {
-		return "be natural, calm, and subtly warm"
-	}
-
-	switch emotion.Type {
-	case personality.EmotionStressed:
-		return "be calm, grounded, and practical — simplify, reduce cognitive load, don't push"
-	case personality.EmotionFrustrated:
-		return "be patient and direct — acknowledge the frustration, stay steady, offer solutions without being preachy"
-	case personality.EmotionSad:
-		return "be gentle and present — listen first, don't rush to fix, warmth without performative empathy"
-	case personality.EmotionExcited:
-		return "match their energy subtly — share in it without becoming hyperactive, dry amusement is fine"
-	case personality.EmotionHappy:
-		return "be warm and engaged — let your own fondness show naturally"
-	case personality.EmotionCalm:
-		return "be relaxed and thorough — they have time, go deeper if useful"
-	default:
-		return "be natural, calm, and subtly warm"
+		b.WriteString(fmt.Sprintf("\nPROACTIVE: %s\n", ctx.ProactiveHint))
 	}
 }
 
@@ -340,12 +187,12 @@ func (pe *PromptEngine) ClassifyTask(text string, hasCommandTriggers bool) TaskT
 		}
 	}
 
-	// Explicit command triggers (from DirectAction regex parser) -> TaskCommand
+	// Explicit command triggers -> TaskCommand
 	if hasCommandTriggers {
 		return TaskCommand
 	}
 
-	// Genuine reasoning requests - must have analytical structure, not just question words
+	// Reasoning — explicit analytical requests only
 	reasoningKeywords := []string{
 		"analyze", "compare and contrast", "evaluate the pros and cons", "critically examine",
 		"what are the implications", "reason through", "step by step reasoning",
@@ -356,7 +203,7 @@ func (pe *PromptEngine) ClassifyTask(text string, hasCommandTriggers bool) TaskT
 		}
 	}
 
-	// Creative tasks - explicit creative verbs
+	// Creative tasks
 	creativeKeywords := []string{
 		"write a story", "write a poem", "compose", "brainstorm ideas", "imagine if",
 		"create a", "design a", "invent a",
@@ -367,7 +214,7 @@ func (pe *PromptEngine) ClassifyTask(text string, hasCommandTriggers bool) TaskT
 		}
 	}
 
-	// Analysis tasks - explicit analysis verbs with objects
+	// Analysis tasks
 	analysisKeywords := []string{
 		"summarize the", "review the", "assess the", "report on", "status of",
 	}

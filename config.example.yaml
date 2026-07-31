@@ -14,7 +14,7 @@ audio:
   thinking_chime: true  # empty = default
 
 kws:
-  provider: "cpu"
+  provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
   model_dir: "./sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
@@ -27,7 +27,7 @@ kws:
   cooldown_ms: 1500
 
 vad:
-  provider: "cpu"
+  provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
   sample_rate: 16000
@@ -42,7 +42,7 @@ vad:
 
 asr:
   type: "nemo"
-  provider: "cpu"
+  provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
   model_dir: "./sherpa-onnx-nemo-streaming-fast-conformer-ctc-en-480ms"
@@ -56,7 +56,7 @@ asr:
   rule3_min_utterance_length: 20
 
 tts:
-  provider: "cpu"
+  provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
   output_sample_rate: 44100  # Supertonic outputs 44.1kHz, Pocket/ZipVoice may differ

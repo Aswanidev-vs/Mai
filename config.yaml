@@ -14,7 +14,7 @@ audio:
   thinking_chime: true      # Play a subtle tone during LLM processing
 
 kws:
-  provider: "cpu"
+  provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
   model_dir: "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
@@ -27,7 +27,7 @@ kws:
   cooldown_ms: 1500
 
 vad:
-  provider: "cpu"
+  provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
   sample_rate: 16000
@@ -42,7 +42,7 @@ vad:
 
 asr:
   type: "qwen3"
-  provider: "cpu"
+  provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
   model_dir: "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"
@@ -54,7 +54,7 @@ asr:
   decoding_method: "greedy_search"
 
 tts:
-  provider: "cpu"
+  provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
   output_sample_rate: 44100  # Supertonic outputs 44.1kHz, Pocket/ZipVoice may differ

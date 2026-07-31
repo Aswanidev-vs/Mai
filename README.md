@@ -95,20 +95,15 @@ Mai operates in two modes, switchable at runtime via configuration:
 | **Companion Mode** | Web-based 3D character with voice interaction | Real-time conversational companion |
 
 In **Agentic Mode**, Mai features:
-- **Dynamic Prompt Engine**: JARVIS personality with 8 task-tailored prompt templates (conversation, command, reasoning, creative, analysis, proactive, greeting, emergency)
-- **Function Calling**: LLM outputs structured JSON tool calls (`{"tool":"name","params":{}}`) instead of raw text
+- **Unified Prompt Engine**: Single prompt template with JARVIS personality — consistent across all task types
+- **Natural Language ReAct**: Thinks through problems naturally, not in rigid JSON steps
+- **Simplified Routing**: Regex fast path → LLM handles everything else (2 paths, not 5)
 - **Emotion-Aware Pipeline**: Prosody analysis from audio → emotion detection → adapted TTS speed/pitch/volume
 - **Proactive Intelligence**: Pattern learning (time-of-day, frequency), anticipatory suggestions, idle reminders
 - **User Modeling**: Learns preferences, tracks habits, extracts topics, persists to `data/user_profile.json`
 - **Interrupt Hierarchy**: 4-level priority system (critical > high > normal > low) with queue management
-- **Autonomous Proactive Monitoring**: Periodic self-reflection loops analyze context and decide if proactive assistance is needed
-- **Multi-Step Goal Reasoning (ReAct)**: Breaks complex objectives into thought-action-observation cycles
-- **Dual-Path Cognitive Routing**:
-  - **Fast Path**: Sub-millisecond regex matching for direct commands
-  - **Function Calling Path**: Structured JSON tool invocation via LLM
-  - **Reasoning Path**: Deep ReAct cognitive loops for analytical problem-solving
-- **Self-Correction (Reflexion)**: If a tool call fails, analyzes the error and adjusts strategy automatically
-- **Hierarchical Memory**: Working (10-entry ring buffer) + Episodic (SQLite) + Semantic (vector search) + Procedural (skill patterns) + RAG pipeline
+- **Hierarchical Memory**: Working (ring buffer) + Episodic (SQLite) + Semantic (vector search with lazy loading) + Procedural (skill patterns) + RAG pipeline
+- **GPU Offloading**: Configurable CPU/CUDA/CoreML/OpenCL for KWS, VAD, ASR, TTS
 
 Enable Agentic Mode in `config.yaml`:
 ```yaml
@@ -161,6 +156,7 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 | **System Automation** | ✅ Ready | UI automation via RobotGo (WhatsApp, Telegram, YouTube, App Control) |
 | **YAML Configuration** | ✅ Ready | Single config file controls all speech and LLM components |
 | **Audio I/O** | ✅ Ready | Cross-platform microphone capture and speaker playback via miniaudio |
+| **GPU Offloading** | ✅ Ready | CUDA/CoreML/OpenCL support for KWS, VAD, ASR, TTS |
 
 ### Companion UI Features
 
@@ -188,23 +184,21 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 
 | Feature | Status | Description |
 |---------|--------|-------------|
-| **Dynamic Prompt Engine** | ✅ Ready | JARVIS personality with 8 task-tailored prompt templates, emotion-aware tone directives |
-| **Function Calling** | ✅ Ready | Structured JSON tool invocation from LLM — single call and chain execution modes |
-| **ReAct Reasoning Engine** | ✅ Ready | Multi-step thought → action → observation loops with anti-hallucination |
-| **Task Planner** | ✅ Ready | LLM-based task decomposition with dependency tracking |
+| **Unified Prompt Engine** | ✅ Ready | Single prompt template with JARVIS personality — consistent across all task types |
+| **Natural Language ReAct** | ✅ Ready | Thinks through problems naturally, not rigid JSON steps. Max 3 tool calls per request. |
+| **Smart Routing** | ✅ Ready | Regex fast path → LLM handles everything else (2 paths, not 5) |
 | **Fact Verifier** | ✅ Ready | Claim verification and tool call result validation |
-| **Smart Routing** | ✅ Ready | Regex fast path → function calling → ReAct → planner → conversation |
 
 ### Agentic Layer — Memory & Knowledge
 
 | Feature | Status | Description |
 |---------|--------|-------------|
-| **Working Memory** | ✅ Ready | In-memory short-term context buffer (10-entry ring buffer) |
+| **Working Memory** | ✅ Ready | Lock-free ring buffer with O(1) add/get operations |
 | **Episodic Memory** | ✅ Ready | SQLite-backed conversation and event history |
-| **Semantic Memory** | ✅ Ready | JSON vector store with cosine similarity search |
+| **Semantic Memory** | ✅ Ready | Lazy-loaded vector store with JSONL append-only persistence and approximate search for large sets |
 | **Procedural Memory** | ✅ Ready | Skill and tool usage pattern storage with success/failure tracking |
 | **RAG Pipeline** | ✅ Ready | Semantic + episodic retrieval → LLM answer generation with confidence scoring |
-| **Session Continuity** | ✅ Ready | Restores last 20 episodic entries into working memory on startup |
+| **Session Continuity** | ✅ Ready | Non-blocking session restore on startup |
 
 ### Agentic Layer — Emotional Intelligence
 
@@ -214,7 +208,6 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 | **Prosody Analyzer** | ✅ Ready | Audio feature extraction: RMS energy, zero-crossing rate, spectral centroid, pitch, volume variance, pause ratio |
 | **Emotion-Aware TTS** | ✅ Ready | Adapts speed, pitch, volume, emphasis, and pause scale per detected emotion |
 | **Response Adaptation** | ✅ Ready | Shortens responses for stressed users, prefixes empathy for frustrated users |
-| **Tone Directives** | ✅ Ready | Prompt engine injects emotion-specific directives (e.g., "be calm and efficient") |
 | **Character Emotion Display** | ✅ Ready | Real-time VRM expression changes based on detected emotion |
 
 ### Agentic Layer — Proactive Intelligence
@@ -241,7 +234,7 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 
 | Feature | Status | Description |
 |---------|--------|-------------|
-| **Event Bus** | ✅ Ready | Async pub/sub communication between all components |
+| **Event Bus** | ✅ Ready | Snapshot-based pub/sub with zero-allocation dispatch (~18ns/publish) |
 | **Tool Registry** | ✅ Ready | Dynamic tool discovery with categories, semantic search, runtime registration |
 | **Interrupt Hierarchy** | ✅ Ready | 4-level priority system (critical > high > normal > low) with queue management |
 | **Multi-Provider LLM** | ✅ Ready | Ollama, OpenAI, Gemini, Claude, OpenRouter, NVIDIA + Hybrid mode |
@@ -250,6 +243,73 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 | **Meta-Cognition** | ✅ Ready | Performance tracking, strategy analysis, and self-improvement |
 | **MCP Client** | ✅ Ready | Model Context Protocol for external tool discovery |
 | **Companion Skills** | ✅ Ready | Skill routing via `data/skills.json` (trigger phrases → skill execution) |
+
+---
+
+## GPU Offloading
+
+Mai supports GPU acceleration for speech processing components. Configure in `config.yaml`:
+
+```yaml
+kws:
+  provider: "cuda"   # "cpu" | "cuda" (NVIDIA) | "coreml" (macOS) | "opencl"
+
+vad:
+  provider: "cuda"
+
+asr:
+  provider: "cuda"
+
+tts:
+  provider: "cuda"
+```
+
+**Requirements:**
+- NVIDIA GPU with CUDA support for `"cuda"`
+- sherpa-onnx built with the corresponding backend
+
+**Performance impact:**
+- ASR: 2-5x faster transcription
+- TTS: 3-10x faster synthesis
+- VAD/KWS: Marginal improvement (already fast on CPU)
+
+---
+
+## Performance
+
+### Benchmark Results (AMD Ryzen 5 5600H)
+
+| Component | Latency | Allocs | Notes |
+|-----------|---------|--------|-------|
+| Event bus publish | **18 ns** | 0 | Zero allocation |
+| Event bus (10 handlers) | **128 ns** | 0 | Zero allocation |
+| Echo detection | **310 ns** | 2 | Stack-allocated set |
+| Working memory add | **13 ns** | 0 | Ring buffer |
+| Working memory get | **8 ns** | 0 | Direct index |
+| Task classification | **434 ns** | 2 | String matching |
+| Prompt construction | **1.3 μs** | 10 | String builder |
+| Cosine similarity (8-d) | **12 ns** | 0 | Math only |
+| Cosine similarity (384-d) | **323 ns** | 0 | Math only |
+| Semantic search (100 vectors) | **1.9 μs** | 9 | Brute force |
+| Semantic search (1000 vectors) | **18 μs** | 22 | Approximate search |
+
+### End-to-End Latency Breakdown
+
+```
+User stops speaking
+    ↓
+ASR transcription:     50-500ms  (ONNX — hardware-bound)
+    ↓
+Echo detection:        310ns     (stack-allocated)
+Emotion detection:     ~200ns    (keyword match)
+Task classification:   434ns     (string match)
+Memory storage:        13ns      (ring buffer)
+Prompt construction:   1.3μs     (string builder)
+    ↓
+LLM inference:         500ms+    (Ollama — network + model)
+```
+
+**Total Go pipeline overhead (excluding ML): ~2.3μs**
 
 ---
 
@@ -337,6 +397,7 @@ Mai uses a priority-based interrupt system to handle concurrent requests:
 | Node.js | 18+ | For local npm packages (three, @pixiv/three-vrm) |
 
 ### Optional
+- **NVIDIA GPU** — For CUDA acceleration of ASR/TTS
 - **llama.cpp** — Alternative LLM backend if you prefer it over Ollama
 - **OpenAI / Gemini / Claude API keys** — For hybrid cloud mode (optional)
 - **Git LFS** — If cloning models from Hugging Face
@@ -382,10 +443,10 @@ cp config.example.yaml config.yaml
 
 Edit `config.yaml` to match your preferences. Key sections:
 - `audio`: Sample rate and buffer settings
-- `kws`: Wake word sensitivity and cooldown
-- `vad`: Speech detection thresholds
-- `asr`: Model type (`nemo`, `zipformer`, `qwen3`) and decoding method
-- `tts`: Active voice model and speed
+- `kws`: Wake word sensitivity, cooldown, and GPU provider
+- `vad`: Speech detection thresholds and GPU provider
+- `asr`: Model type (`nemo`, `zipformer`, `qwen3`), decoding method, and GPU provider
+- `tts`: Active voice model, speed, and GPU provider
 - `llm`: Provider, model name, and system prompt
 - `agentic`: Enable/disable agentic mode
 - `server`: Companion web UI settings (port, token)
@@ -526,16 +587,22 @@ Mai's agentic mode includes a universal tool registry with category-based discov
 
 ## Memory System
 
-Mai implements a hierarchical memory architecture with RAG support:
+Mai implements a hierarchical memory architecture with optimized loading:
 
-| Layer | Storage | Purpose | Status |
-|-------|---------|---------|--------|
-| **Working Memory** | In-memory ring buffer (10 entries) | Short-term conversational context | ✅ Implemented |
-| **Episodic Memory** | SQLite (`data/memory/episodic.db`) | Conversation and event history | ✅ Implemented |
-| **Semantic Memory** | JSON vector store (`data/vector/`) | Long-term facts with cosine similarity search | ✅ Implemented |
-| **Procedural Memory** | JSON (`data/memory/procedural.json`) | Skills and tool usage patterns with success rates | ✅ Implemented |
-| **RAG Pipeline** | Semantic + Episodic → LLM | Retrieve-augmented generation with confidence scoring | ✅ Implemented |
-| **User Profile** | JSON (`data/user_profile.json`) | Preferences, habits, frequent apps, topics | ✅ Implemented |
+| Layer | Storage | Purpose | Optimization |
+|-------|---------|---------|--------------|
+| **Working Memory** | In-memory ring buffer | Short-term conversational context | Lock-free O(1) operations |
+| **Episodic Memory** | SQLite (`data/memory/episodic.db`) | Conversation and event history | Indexed queries |
+| **Semantic Memory** | JSON/JSONL vector store | Long-term facts with cosine similarity | Lazy loading + approximate search |
+| **Procedural Memory** | JSON (`data/memory/procedural.json`) | Skills and tool usage patterns | In-memory map |
+| **RAG Pipeline** | Semantic + Episodic → LLM | Retrieve-augmented generation | Context filtering |
+| **User Profile** | JSON (`data/user_profile.json`) | Preferences, habits, frequent apps, topics | Persisted |
+
+### Semantic Memory Optimizations
+- **Lazy loading**: Vectors loaded on first query, not at startup
+- **JSONL append-only**: `AddFact()` appends one line (O(1)) instead of rewriting entire JSON (O(n))
+- **Approximate search**: For >500 vectors, samples 300 + refines neighbors instead of brute-force over all
+- **Non-blocking session restore**: Startup not blocked by memory loading
 
 ---
 
@@ -543,13 +610,14 @@ Mai implements a hierarchical memory architecture with RAG support:
 
 - **Language**: Go 1.25+ (concurrency-first architecture)
 - **Frontend**: Three.js, @pixiv/three-vrm, PixiJS, Web Audio API
-- **Inference**: ONNX Runtime (CPU-optimized for speech/VAD/ASR)
+- **Inference**: ONNX Runtime (CPU/CUDA/CoreML/OpenCL for speech/VAD/ASR)
 - **Automation**: RobotGo (Cross-platform UI control)
 - **Audio**: Malgo (C-bindings for miniaudio)
 - **LLM Backends**: Ollama (default), llama.cpp, OpenAI, Gemini, Claude, OpenRouter, NVIDIA
-- **Memory**: SQLite (episodic), JSON vectors (semantic), JSON files (procedural, user profile)
+- **Memory**: SQLite (episodic), JSON/JSONL vectors (semantic), JSON files (procedural, user profile)
 - **Models**: NeMo CTC, Silero VAD, Supertonic TTS, Qwen/Gemma LLMs
 - **Rendering**: WebGPU → WebGL fallback, PixiJS 2D background
+- **Testing**: testify (assert/require), goleak (goroutine leak detection)
 
 ---
 
@@ -569,12 +637,36 @@ audio:
   sample_rate: 16000
   capture_buffer_ms: 100
   playback_device: ""
+  barge_in_enabled: true
+  barge_in_threshold: 0.008
+  thinking_chime: true
+```
+
+### GPU Provider
+```yaml
+kws:
+  provider: "cpu"  # "cpu" | "cuda" | "coreml" | "opencl"
+  num_threads: 2
+
+vad:
+  provider: "cpu"
+  num_threads: 2
+
+asr:
+  provider: "cpu"
+  num_threads: 2
+
+tts:
+  provider: "cpu"
+  num_threads: 2
 ```
 
 ### TTS
 ```yaml
 tts:
   active_model: "supertonic"
+  voice_style: "soft"
+  base_speed: 1.05
   num_threads: 2
   output_sample_rate: 44100
   supertonic:
@@ -586,10 +678,14 @@ tts:
 ```yaml
 llm:
   provider: "ollama"
-  model: "gemma2:2b"
+  model: "gemma4:e2b-it-qat"
   url: "http://localhost:11434/api/generate"
   auto_start: true
   hybrid_mode: false
+  sampling:
+    temperature: 0.55
+    top_p: 0.85
+    max_tokens: 400
 ```
 
 ---
@@ -607,18 +703,18 @@ cmd/mai/
 └── vision.go        # Vision processing via Ollama
 internal/
 ├── agent/           # Orchestrator, user model, proactive engine, interrupt manager
-├── cognition/       # Prompt engine, function caller, ReAct loop, planner
+├── cognition/       # Unified prompt engine, ReAct loop (natural language reasoning)
 ├── personality/     # Emotion detector, prosody analyzer, TTS adapter
 ├── llm/             # Multi-provider LLM clients and factory
-├── memory/          # Working, episodic, semantic, procedural memory + RAG
+├── memory/          # Working (ring buffer), episodic (SQLite), semantic (lazy JSONL), procedural
 ├── perception/      # Audio and vision bridges
 ├── tools/           # Tool registry with categories and adapters
 ├── server/          # WebSocket hub, HTTP server, static file serving
-├── events/          # Pub/sub event bus
+├── events/          # Snapshot-based pub/sub event bus
 └── observability/   # Metrics, logging, health checks
 pkg/
 ├── interfaces/      # Core Go interfaces
-└── models/          # Configuration structs
+└── models/          # Configuration structs (with GPU provider fields)
 internal/server/static/
 ├── js/
 │   ├── character.js     # VRM 3D character renderer with alive-ness system
@@ -650,14 +746,18 @@ internal/server/static/
 | 8 | Automation | ✅ Complete | WhatsApp, Telegram, YouTube, App control |
 | 9 | Memory System | ✅ Complete | Working + Episodic + Semantic + Procedural + RAG |
 | 10 | Emotion Engine | ✅ Complete | Text + prosody detection, adaptive TTS |
-| 11 | Dynamic Prompts | ✅ Complete | JARVIS personality, 8 task types |
+| 11 | Dynamic Prompts | ✅ Complete | Unified prompt engine with JARVIS personality |
 | 12 | Function Calling | ✅ Complete | Structured JSON tool invocation |
-| 13 | Task Planning | ✅ Complete | ReAct + LLM planner |
+| 13 | ReAct Reasoning | ✅ Complete | Natural language reasoning (not rigid JSON steps) |
 | 14 | User Modeling | ✅ Complete | Preferences, habits, topics |
 | 15 | Proactive Intel | ✅ Complete | Pattern learning, idle reminders |
 | 16 | Companion UI | ✅ Complete | VRM character, streaming TTS, mic input, alive-ness |
 | 17 | Motion3 System | ✅ Complete | VRoid parameter animation playback |
-| 18 | Polish & Performance | 🚧 In Progress | Routing optimization, latency reduction |
+| 18 | Cognitive Optimization | ✅ Complete | Simplified routing (2 paths), unified prompts, lazy memory |
+| 19 | Performance Tuning | ✅ Complete | Zero-alloc event bus, ring buffer, approximate search |
+| 20 | GPU Offloading | ✅ Complete | CUDA/CoreML/OpenCL for KWS, VAD, ASR, TTS |
+| 21 | Native Integrations | 🔜 Planned | Discord/Telegram bots, plugin architecture |
+| 22 | Observability | 🔜 Planned | OpenTelemetry traces + metrics |
 
 ---
 
@@ -689,6 +789,11 @@ internal/server/static/
 - Ensure Ollama is running: `ollama serve`
 - Check `llm.url` matches Ollama's actual port
 
+### GPU not activating
+- Verify `provider: "cuda"` in config.yaml (not hardcoded "cpu")
+- Ensure NVIDIA drivers and CUDA toolkit are installed
+- Check sherpa-onnx was built with CUDA support
+
 ---
 
 ## Contributing
@@ -712,3 +817,5 @@ This project is licensed under the MIT License — see [`LICENSE.md`](LICENSE.md
 - [@pixiv/three-vrm](https://github.com/pixiv/three-vrm) — VRM model loading and animation
 - [PixiJS](https://pixijs.com) — 2D rendering for background
 - [AIRI](https://airi.moeru.ai/) — Alive-ness system inspiration (CPT saccades, spring physics, lip sync)
+- [testify](https://github.com/stretchr/testify) — Testing assertions and requirements
+- [goleak](https://go.uber.org/goleak) — Goroutine leak detection

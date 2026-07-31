@@ -81,7 +81,6 @@ func TestBuildPrompt_Conversation(t *testing.T) {
 
 	assert.Contains(t, prompt, "Mai")
 	assert.Contains(t, prompt, "What's the weather like?")
-	assert.Contains(t, prompt, "ANTI-HALLUCINATION")
 	assert.Contains(t, prompt, "don't know")
 	assert.Contains(t, prompt, "never make up facts")
 }
@@ -98,18 +97,18 @@ func TestBuildPrompt_ConversationWithEmotion(t *testing.T) {
 	prompt := engine.BuildPrompt(ctx)
 
 	assert.Contains(t, prompt, "frustrated")
-	assert.Contains(t, prompt, "patient and direct")
+	assert.Contains(t, prompt, "solution-focused")
 }
 
 func TestBuildPrompt_ConversationWithMemory(t *testing.T) {
 	engine := NewPromptEngine()
 
 	ctx := PromptContext{
-		TaskType:       TaskConversation,
-		UserInput:      "What did we discuss earlier?",
-		WorkingMemory:  "User asked about Go channels",
-		RAGContext:     "Go channels are used for goroutine communication",
-		UserProfile:    "User is a Go developer",
+		TaskType:      TaskConversation,
+		UserInput:     "What did we discuss earlier?",
+		WorkingMemory: "User asked about Go channels",
+		RAGContext:    "Go channels are used for goroutine communication",
+		UserProfile:   "User is a Go developer",
 	}
 
 	prompt := engine.BuildPrompt(ctx)
@@ -128,9 +127,8 @@ func TestBuildPrompt_Reasoning(t *testing.T) {
 
 	prompt := engine.BuildPrompt(ctx)
 
-	assert.Contains(t, prompt, "REASONING PROTOCOL")
-	assert.Contains(t, prompt, "ANTI-HALLUCINATION")
-	assert.Contains(t, prompt, "Ground every claim")
+	assert.Contains(t, prompt, "think something through")
+	assert.Contains(t, prompt, "step by step")
 }
 
 func TestBuildPrompt_Analysis(t *testing.T) {
@@ -143,25 +141,22 @@ func TestBuildPrompt_Analysis(t *testing.T) {
 
 	prompt := engine.BuildPrompt(ctx)
 
-	assert.Contains(t, prompt, "ANALYSIS FRAMEWORK")
-	assert.Contains(t, prompt, "ANTI-HALLUCINATION")
-	assert.Contains(t, prompt, "Only reference facts")
+	assert.Contains(t, prompt, "analysis")
+	assert.Contains(t, prompt, "thorough")
 }
 
 func TestBuildPrompt_Command(t *testing.T) {
 	engine := NewPromptEngine()
 
 	ctx := PromptContext{
-		TaskType:       TaskCommand,
-		UserInput:      "Open Chrome and search for Go tutorials",
-		AvailableTools: `[{"name":"open_application"},{"name":"web_search"}]`,
+		TaskType:  TaskCommand,
+		UserInput: "Open Chrome and search for Go tutorials",
 	}
 
 	prompt := engine.BuildPrompt(ctx)
 
-	assert.Contains(t, prompt, "Execute this command")
-	assert.Contains(t, prompt, "open_application")
-	assert.Contains(t, prompt, "web_search")
+	assert.Contains(t, prompt, "DO something")
+	assert.Contains(t, prompt, "Open Chrome")
 }
 
 func TestBuildPrompt_Creative(t *testing.T) {
@@ -182,13 +177,14 @@ func TestBuildPrompt_Greeting(t *testing.T) {
 	engine := NewPromptEngine()
 
 	ctx := PromptContext{
-		TaskType: TaskGreeting,
+		TaskType:  TaskGreeting,
+		UserInput: "hello",
 	}
 
 	prompt := engine.BuildPrompt(ctx)
 
-	assert.Contains(t, prompt, "greeting")
-	assert.Contains(t, prompt, "Vary your greetings")
+	assert.Contains(t, prompt, "greets you")
+	assert.Contains(t, prompt, "vary it")
 }
 
 func TestBuildPrompt_Emergency(t *testing.T) {
@@ -216,7 +212,7 @@ func TestBuildPrompt_Proactive(t *testing.T) {
 
 	prompt := engine.BuildPrompt(ctx)
 
-	assert.Contains(t, prompt, "proactive")
+	assert.Contains(t, prompt, "initiating contact")
 	assert.Contains(t, prompt, "brief")
 }
 
@@ -234,62 +230,26 @@ func TestBuildPrompt_ActiveSkill(t *testing.T) {
 	assert.Contains(t, prompt, "ACTIVE SKILL: Plan My Day")
 }
 
-func TestGetToneDirective(t *testing.T) {
+func TestBuildPrompt_EmotionContextInjection(t *testing.T) {
 	engine := NewPromptEngine()
 
-	tests := []struct {
-		name     string
-		emotion  personality.EmotionState
-		expected string
-	}{
-		{
-			name:     "neutral emotion",
-			emotion:  personality.EmotionState{Type: personality.EmotionNeutral, Confidence: 0.5},
-			expected: "be natural, calm, and subtly warm",
-		},
-		{
-			name:     "low confidence",
-			emotion:  personality.EmotionState{Type: personality.EmotionStressed, Confidence: 0.2},
-			expected: "be natural, calm, and subtly warm",
-		},
-		{
-			name:     "stressed",
-			emotion:  personality.EmotionState{Type: personality.EmotionStressed, Confidence: 0.8},
-			expected: "be calm, grounded, and practical",
-		},
-		{
-			name:     "frustrated",
-			emotion:  personality.EmotionState{Type: personality.EmotionFrustrated, Confidence: 0.7},
-			expected: "be patient and direct",
-		},
-		{
-			name:     "sad",
-			emotion:  personality.EmotionState{Type: personality.EmotionSad, Confidence: 0.6},
-			expected: "be gentle and present",
-		},
-		{
-			name:     "excited",
-			emotion:  personality.EmotionState{Type: personality.EmotionExcited, Confidence: 0.9},
-			expected: "match their energy subtly",
-		},
-		{
-			name:     "happy",
-			emotion:  personality.EmotionState{Type: personality.EmotionHappy, Confidence: 0.7},
-			expected: "be warm and engaged",
-		},
-		{
-			name:     "calm",
-			emotion:  personality.EmotionState{Type: personality.EmotionCalm, Confidence: 0.5},
-			expected: "be relaxed and thorough",
-		},
+	// High confidence emotion should inject context
+	ctx := PromptContext{
+		TaskType:  TaskConversation,
+		UserInput: "I'm stressed about work",
+		Emotion:   personality.EmotionState{Type: personality.EmotionStressed, Confidence: 0.8},
 	}
+	prompt := engine.BuildPrompt(ctx)
+	assert.Contains(t, prompt, "stressed")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := engine.getToneDirective(tt.emotion)
-			assert.Contains(t, result, tt.expected)
-		})
+	// Low confidence should NOT inject emotion context
+	ctx2 := PromptContext{
+		TaskType:  TaskConversation,
+		UserInput: "Hello",
+		Emotion:   personality.EmotionState{Type: personality.EmotionStressed, Confidence: 0.2},
 	}
+	prompt2 := engine.BuildPrompt(ctx2)
+	assert.NotContains(t, prompt2, "stressed")
 }
 
 func TestBuildSystemPrompt(t *testing.T) {

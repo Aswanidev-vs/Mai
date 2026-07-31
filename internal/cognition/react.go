@@ -69,27 +69,6 @@ func validateToolCall(registry interfaces.ToolRegistry, action string, params js
 	return params, nil
 }
 
-// containsHallucinationMarker checks if the response contains common
-// hallucination markers that should be stripped or flagged.
-func containsHallucinationMarker(s string) bool {
-	lower := strings.ToLower(s)
-	markers := []string{
-		"i'm not sure but",
-		"i think maybe",
-		"i believe perhaps",
-		"according to my knowledge",
-		"as far as i know",
-		"i don't have access to",
-		"i cannot verify",
-	}
-	for _, m := range markers {
-		if strings.Contains(lower, m) {
-			return true
-		}
-	}
-	return false
-}
-
 // ReActStep represents a single iteration in the ReAct loop
 type ReActStep struct {
 	Thought     string          `json:"thought"`
@@ -104,7 +83,6 @@ type ReActLoop struct {
 	llm           interfaces.LLMProvider
 	registry      interfaces.ToolRegistry
 	memory        interfaces.WorkingMemory
-	verifier      *Verifier
 	maxIterations int
 }
 
@@ -113,14 +91,12 @@ func NewReActLoop(llm interfaces.LLMProvider, registry interfaces.ToolRegistry, 
 		llm:           llm,
 		registry:      registry,
 		memory:        memory,
-		verifier:      NewVerifier(llm),
-		maxIterations: 3, // 3 is sufficient — most tasks resolve in 1-2 iterations
+		maxIterations: 3,
 	}
 }
 
 func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 	steps := []ReActStep{}
-	toolCalled := false // Track whether ANY tool has been executed
 
 	// Track tool call history to detect loops
 	type toolCall struct {
@@ -129,7 +105,7 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 	}
 	callHistory := []toolCall{}
 
-	// Apply per-iteration timeout — a single ReAct cycle should not hang forever
+	// Apply per-iteration timeout
 	iterCtx := ctx
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
@@ -141,16 +117,20 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 		// Check context cancellation
 		select {
 		case <-iterCtx.Done():
-			if toolCalled && len(steps) > 0 {
-				return steps[len(steps)-1].Observation, nil
+			if len(steps) > 0 {
+				last := steps[len(steps)-1]
+				if last.Observation != "" {
+					return last.Observation, nil
+				}
 			}
 			return "", fmt.Errorf("ReAct loop cancelled: %w", iterCtx.Err())
 		default:
 		}
-		// 1. Build the prompt
+
+		// Build the prompt — natural language, not rigid JSON format
 		prompt := r.buildPrompt(goal, steps)
 
-		// 2. Generate the next step (structured JSON)
+		// Generate the next step
 		response, err := r.llm.GenerateStructured(ctx, prompt, json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -165,15 +145,12 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 			return "", fmt.Errorf("llm error: %w", err)
 		}
 
-		// Robust JSON sanitizer: strip markdown fences, preamble, trailing garbage
 		cleanResponse := sanitizeJSON(string(response))
 
 		var step ReActStep
 		if err := json.Unmarshal([]byte(cleanResponse), &step); err != nil {
-			// Second attempt: try to extract just the final_answer or thought from raw text
-			log.Printf("[ReAct] JSON parse failed (%v), attempting text extraction from: %.200s", err, string(response))
+			// If JSON parsing fails, treat the entire response as the final answer
 			rawText := strings.TrimSpace(string(response))
-			// Strip any remaining markdown
 			rawText = strings.TrimPrefix(rawText, "```json")
 			rawText = strings.TrimPrefix(rawText, "```")
 			rawText = strings.TrimSuffix(rawText, "```")
@@ -181,173 +158,157 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 			if rawText != "" {
 				return rawText, nil
 			}
-			return "", fmt.Errorf("failed to parse ReAct step: %w. Original: %.200s", err, string(response))
+			return "", fmt.Errorf("failed to parse ReAct step: %w", err)
 		}
 
-		log.Printf("[ReAct] Thought: %s", step.Thought)
+		log.Printf("[ReAct] Step %d — thought: %.120s", i+1, step.Thought)
 
-		// --- ANTI-HALLUCINATION LOGIC ---
+		// --- ACTION HANDLING ---
 
-		// RULE 1: If the LLM provided an action, ALWAYS execute it first,
-		//         even if it also provided a final_answer. The action takes priority.
 		if step.Action != "" {
-			// Validate tool exists in registry before proceeding
+			// Validate tool exists
 			params, err := validateToolCall(r.registry, step.Action, step.ActionInput)
 			if err != nil {
-				log.Printf("[ReAct] Tool validation failed: %v. Treating as conversation.", err)
-				step.Observation = fmt.Sprintf("Tool %q is not available. Error: %v", step.Action, err)
+				log.Printf("[ReAct] Tool validation failed: %v", err)
+				step.Observation = fmt.Sprintf("Tool %q is not available.", step.Action)
 				step.Action = ""
 				steps = append(steps, step)
-				// Force the LLM to provide a final_answer instead
 				continue
 			}
 			step.ActionInput = params
 
-			// LOOP DETECTION: Check if this exact tool+params was already called
+			// Loop detection: same tool+params called twice
 			paramsStr := string(step.ActionInput)
 			currentCall := toolCall{action: step.Action, params: paramsStr}
-			loopCount := 0
 			for _, prev := range callHistory {
 				if prev.action == currentCall.action && prev.params == currentCall.params {
-					loopCount++
+					log.Printf("[ReAct] LOOP DETECTED: %s with same params. Breaking.", step.Action)
+					if len(steps) > 0 {
+						return steps[len(steps)-1].Thought, nil
+					}
+					return step.Thought, nil
 				}
 			}
 
-			if loopCount >= 1 {
-				// Same tool called twice with same params — break the loop
-				log.Printf("[ReAct] LOOP DETECTED: %s called %d times with same params. Breaking loop.", step.Action, loopCount+1)
-				if toolCalled {
-					return fmt.Sprintf("I've determined the %s. No further action needed.", step.Action), nil
-				}
-				return step.Thought, nil
-			}
-
-			// Also detect semantic loops: same tool with different params but
-			// producing no new information (3+ calls to any tool = likely stuck)
-			totalToolCalls := len(callHistory) + 1
-			if totalToolCalls >= 3 {
-				log.Printf("[ReAct] TOO MANY TOOL CALLS (%d). Breaking loop.", totalToolCalls)
-				if toolCalled && len(steps) > 0 {
-					return steps[len(steps)-1].Observation, nil
-				}
-				return step.Thought, nil
+			// Max 3 tool calls per request — humans don't chain more than that either
+			if len(callHistory) >= 2 {
+				log.Printf("[ReAct] TOO MANY TOOL CALLS (%d). Wrapping up.", len(callHistory)+1)
+				break
 			}
 
 			callHistory = append(callHistory, currentCall)
-
 			log.Printf("[ReAct] Action: %s(%s)", step.Action, step.ActionInput)
 
 			result, err := r.registry.Execute(ctx, step.Action, step.ActionInput)
 			if err != nil {
-				step.Observation = fmt.Sprintf("Error executing tool: %v", err)
-				r.reflectOnFailure(ctx, step.Action, err)
+				step.Observation = fmt.Sprintf("Error: %v", err)
+				log.Printf("[ReAct] Tool error: %v", err)
 			} else if result.Error != nil {
-				step.Observation = fmt.Sprintf("Tool returned error: %v. Output: %s", result.Error, result.Output)
-				r.reflectOnFailure(ctx, step.Action, result.Error)
+				step.Observation = fmt.Sprintf("Error: %v", result.Error)
 			} else {
 				step.Observation = result.Output
-				// Verify the tool output for plausibility
-				if result.Output != "" && len(result.Output) < 500 {
-					verification, vErr := r.verifier.VerifyToolCall(ctx, step.Action, params, result.Output)
-					if vErr == nil && verification != nil && !verification.IsValid && verification.Confidence > 0.6 {
-						log.Printf("[ReAct] VERIFICATION FAILED: %s — %v", step.Action, verification.Issues)
-						step.Observation = fmt.Sprintf("WARNING: Result may be unreliable — %s. Raw output: %s",
-							strings.Join(verification.Issues, "; "), result.Output)
-					}
-				}
 			}
 
-			toolCalled = true
-			step.FinalAnswer = "" // Clear any premature final answer
-			log.Printf("[ReAct] Observation: %s", step.Observation)
+			step.FinalAnswer = ""
 			steps = append(steps, step)
 			continue
 		}
 
-		// RULE 2: If only a final_answer is provided:
+		// --- FINAL ANSWER ---
+
 		if step.FinalAnswer != "" {
-			// If no tool was called, accept the answer directly — the LLM
-			// determined no tool was needed (per updated prompt rules).
-			// If a tool WAS called previously, verify before accepting.
-			if toolCalled {
-				lastStep := steps[len(steps)-1]
-				verification, vErr := r.verifier.VerifyClaim(ctx, step.FinalAnswer, lastStep.Observation)
-				if vErr == nil && verification != nil && !verification.IsValid && verification.Confidence > 0.6 {
-					log.Printf("[ReAct] FINAL ANSWER FAILED VERIFICATION: %v. Forcing retry.", verification.Issues)
-					step.Action = "none"
-					step.Observation = fmt.Sprintf("Your proposed answer appears incorrect: %v. Review the observation and try again.", strings.Join(verification.Issues, "; "))
-					step.FinalAnswer = ""
-					steps = append(steps, step)
-					continue
-				}
-			}
 			return step.FinalAnswer, nil
 		}
 
-		// RULE 3: No action AND no final_answer — the LLM is stuck.
-		// If a tool was already called, treat the thought as the final answer.
-		if toolCalled {
+		// No action AND no final_answer — use the thought as the answer
+		if len(steps) > 0 {
 			return step.Thought, nil
 		}
-		return "", fmt.Errorf("agent failed to provide action or final answer")
+		return step.Thought, nil
 	}
 
-	return "", fmt.Errorf("exceeded maximum ReAct iterations (%d)", r.maxIterations)
+	// Max iterations reached — synthesize from what we have
+	if len(steps) > 0 {
+		last := steps[len(steps)-1]
+		if last.Observation != "" {
+			return last.Observation, nil
+		}
+		return last.Thought, nil
+	}
+
+	return "", fmt.Errorf("ReAct loop produced no output")
 }
 
 func (r *ReActLoop) buildPrompt(goal string, steps []ReActStep) string {
 	tools := r.registry.List()
-	toolsStr, _ := json.MarshalIndent(tools, "", "  ")
+	toolsJSON, _ := json.MarshalIndent(tools, "", "  ")
 
-	system := fmt.Sprintf(`You are Mai's reasoning engine. Goal: %s
+	// Build tool usage guide — shorter, more direct
+	toolGuide := r.buildToolGuide()
 
-Available tools (use ONLY these exact names):
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf(`You are Mai — think through this naturally, like a smart assistant would.
+
+GOAL: %s
+
+TOOLS (only use when the goal REQUIRES real-time data or an action):
 %s
 
-RULES:
-1. If the goal can be answered from your general knowledge (facts, explanations, casual conversation, opinions), provide final_answer directly WITHOUT calling any tool.
-2. Only use tools when the goal requires: real-time data (weather, time, current events), performing actions (open app, send message, play media), or specific lookups (web search for recent info).
-3. NEVER call the same tool twice with the same parameters.
-4. action_input must be a JSON object: {"key":"value"}.
-5. Leave final_answer empty ("") only if you NEED to call a tool first.
-6. After one tool call + observation, provide final_answer immediately.
-7. NEVER invent tool names — use ONLY the tools listed above.
-8. NEVER make up facts or data — base your final_answer ONLY on tool observations or your training knowledge.
-9. If a tool returns an error, acknowledge it honestly rather than guessing what the result "should" be.
+%s
+THINKING APPROACH:
+- If you already know the answer from general knowledge → answer directly, no tools needed
+- If the goal needs current info (weather, time, news) or an action (open app, search web) → use a tool
+- If a tool failed → acknowledge it honestly, don't guess what the result "should" be
+- Never call the same tool twice with the same parameters
+- After getting a tool result, synthesize it into a natural answer
 
-Tool selection (use ONLY when truly needed):
-- "play X on Y" → youtube_play {"query":"X","browser":"Y"}
-- "open X" → open_application {"app_name":"X"}
-- "what time" → get_system_time {}
-- "search X" → web_search {"query":"X"}
-- "send message" → whatsapp_send {"message":"...","recipient":"..."}
-- "type/press" → ui_automation {"action":"type","value":"X"}
+`, goal, string(toolsJSON), toolGuide))
 
-Respond: {"thought":"...","action":"tool_name","action_input":{...},"final_answer":""}
-OR after observation: {"thought":"...","action":"","action_input":{},"final_answer":"your answer"}
-OR if no tool needed: {"thought":"...","action":"","action_input":{},"final_answer":"your direct answer"}
-
-Previous steps:
-`, goal, string(toolsStr))
-
-	history := ""
-	for _, s := range steps {
-		history += fmt.Sprintf("Thought: %s\nAction: %s\nObservation: %s\n", s.Thought, s.Action, s.Observation)
+	// Append conversation history naturally, not as rigid steps
+	if len(steps) > 0 {
+		b.WriteString("WHAT HAPPENED SO FAR:\n")
+		for _, s := range steps {
+			if s.Action != "" {
+				b.WriteString(fmt.Sprintf("- Tried %s → %s\n", s.Action, s.Observation))
+			}
+		}
+		b.WriteString("\n")
 	}
 
-	return system + history + "\nNext step (JSON only):"
+	b.WriteString(`RESPOND WITH JSON:
+{"thought": "your reasoning", "action": "tool_name", "action_input": {...}, "final_answer": ""}
+
+OR if you have the answer:
+{"thought": "your reasoning", "action": "", "final_answer": "your answer"}
+
+JSON only — no markdown, no extra text.`)
+
+	return b.String()
 }
 
+func (r *ReActLoop) buildToolGuide() string {
+	tools := r.registry.List()
+	var guide strings.Builder
+	guide.WriteString("TOOL USAGE:\n")
 
-func (r *ReActLoop) reflectOnFailure(ctx context.Context, action string, err error) {
-	log.Printf("[Reflexion] Tool %s failed: %v. Adjusting strategy...", action, err)
-	
-	// In a real Phase 4 implementation, we would call the LLM specifically to 
-	// analyze the failure and update the system prompt or working memory.
-	reflection := fmt.Sprintf("I tried to use %s but it failed with: %v. I should try a different approach or check my parameters.", action, err)
-	
-	r.memory.Add(interfaces.MemoryEntry{
-		Type:    "reflection",
-		Content: reflection,
-	})
+	for _, t := range tools {
+		name := strings.ToLower(t.Name)
+		switch {
+		case strings.Contains(name, "youtube") || strings.Contains(name, "play"):
+			guide.WriteString(fmt.Sprintf("- \"play X on Y\" → %s {\"query\":\"X\"}\n", t.Name))
+		case strings.Contains(name, "open") || strings.Contains(name, "application"):
+			guide.WriteString(fmt.Sprintf("- \"open X\" → %s {\"app_name\":\"X\"}\n", t.Name))
+		case strings.Contains(name, "search"):
+			guide.WriteString(fmt.Sprintf("- \"search X\" → %s {\"query\":\"X\"}\n", t.Name))
+		case strings.Contains(name, "time") || strings.Contains(name, "clock"):
+			guide.WriteString(fmt.Sprintf("- \"what time\" → %s {}\n", t.Name))
+		case strings.Contains(name, "whatsapp") || strings.Contains(name, "send"):
+			guide.WriteString(fmt.Sprintf("- \"send message\" → %s {\"message\":\"...\",\"recipient\":\"...\"}\n", t.Name))
+		case strings.Contains(name, "automation") || strings.Contains(name, "ui"):
+			guide.WriteString(fmt.Sprintf("- \"type/press\" → %s {\"action\":\"type\",\"value\":\"X\"}\n", t.Name))
+		}
+	}
+
+	guide.WriteString("\n")
+	return guide.String()
 }
