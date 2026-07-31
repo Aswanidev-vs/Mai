@@ -21,13 +21,11 @@ type Orchestrator struct {
 	llm      interfaces.LLMProvider
 	registry interfaces.ToolRegistry
 	react    *cognition.ReActLoop
-	planner  *cognition.Planner
 	goals    *GoalManager
 	emotion  *personality.EmotionDetector
 	meta     *MetaCognition
 
 	promptEngine   *cognition.PromptEngine
-	functionCaller *cognition.FunctionCaller
 	userModel      *UserModel
 	proactive      *ProactiveEngine
 	interrupts     *InterruptManager
@@ -76,12 +74,10 @@ func NewOrchestrator(
 		llm:            llm,
 		registry:       registry,
 		react:          reactLoop,
-		planner:        cognition.NewPlanner(llm),
 		goals:          NewGoalManager(),
 		emotion:        personality.NewEmotionDetector(),
 		meta:           NewMetaCognition(),
 		promptEngine:   cognition.NewPromptEngine(),
-		functionCaller: cognition.NewFunctionCaller(llm, registry),
 		userModel:      userModel,
 		proactive:      proactive,
 		interrupts:     NewInterruptManager(),
@@ -110,7 +106,7 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 		},
 	)
 
-	o.restoreSession()
+	go o.restoreSession() // non-blocking: don't delay startup
 
 	proactiveTicker := time.NewTicker(2 * time.Minute)
 	improveTicker := time.NewTicker(10 * time.Minute)
@@ -238,15 +234,9 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return nil, fmt.Errorf("input must contain 'text' field")
 	}
 
-	// Echo guard: drop inputs that are just Mai's own previous speech echoed
-	// back through the mic, or the user's own words repeated (the TTS→STT loop).
-	// Window measured from when she FINISHED speaking would be ideal, but
-	// lastSpokenAt is set when speech starts; widen it so long replies still
-	// covered, and also reject near-duplicate recent user inputs.
 	inputLower := strings.ToLower(text)
 
-	// Time-based echo detection: shortly after TTS finishes, use stricter
-	// matching to catch partial echoes from room reverberation.
+	// --- Echo guard ---
 	timeSinceTTS := time.Since(o.lastSpokenAt)
 	nearTTS := timeSinceTTS < 2*time.Second
 
@@ -258,19 +248,17 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 			isEchoResult = isEcho(inputLower, o.lastSpoken)
 		}
 		if isEchoResult {
-			log.Printf("[Agent] Echo of Mai's speech detected (nearTTS=%v, sinceTTS=%v) — ignoring: %q", nearTTS, timeSinceTTS, text)
+			log.Printf("[Agent] Echo detected (nearTTS=%v) — ignoring: %q", nearTTS, text)
 			return &interfaces.AgentResponse{Text: "", Success: true}, nil
 		}
 	}
 	for _, prev := range o.recentUserInputs {
 		if isEcho(inputLower, prev) {
-			log.Printf("[Agent] Repeat of recent user input detected — ignoring: %q", text)
+			log.Printf("[Agent] Repeat input — ignoring: %q", text)
 			return &interfaces.AgentResponse{Text: "", Success: true}, nil
 		}
 	}
 
-	// Record this as a genuine user turn (bounded ring) so we can reject it if
-	// the mic echoes it back within the loop window.
 	o.recentUserInputs = append(o.recentUserInputs, inputLower)
 	if len(o.recentUserInputs) > 5 {
 		o.recentUserInputs = o.recentUserInputs[1:]
@@ -284,79 +272,41 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		o.meta.RecordLatency("handle_input", time.Since(startTime))
 	}()
 
+	// --- Emotion & memory recording ---
 	emotionState := o.emotion.DetectFromText(text)
-	log.Printf("[Agent] Detected emotion: %s (%.2f)", emotionState.Type, emotionState.Confidence)
+	log.Printf("[Agent] Emotion: %s (%.2f)", emotionState.Type, emotionState.Confidence)
 
 	o.userModel.RecordInteraction(text, "")
-
 	o.memory.Working().Add(interfaces.MemoryEntry{
-		Type:      "user_input",
-		Content:   text,
-		Timestamp: time.Now().Unix(),
-		Metadata:  map[string]interface{}{"emotion": string(emotionState.Type)},
+		Type: "user_input", Content: text, Timestamp: time.Now().Unix(),
+		Metadata: map[string]interface{}{"emotion": string(emotionState.Type)},
 	})
-
 	o.memory.Episodic().StoreEvent(interfaces.MemoryEntry{
-		ID:        fmt.Sprintf("user_%d", time.Now().UnixMilli()),
-		Type:      "user_input",
-		Content:   text,
-		Timestamp: time.Now().Unix(),
-		Metadata:  map[string]interface{}{"emotion": string(emotionState.Type)},
+		ID: fmt.Sprintf("user_%d", time.Now().UnixMilli()), Type: "user_input",
+		Content: text, Timestamp: time.Now().Unix(),
+		Metadata: map[string]interface{}{"emotion": string(emotionState.Type)},
 	})
-
 	o.proactive.RecordAction(text, text)
 
+	// --- Interrupt handling ---
 	if interruptLevel := ClassifyInterrupt(text); interruptLevel >= InterruptHigh {
 		o.interrupts.RequestInterrupt(InterruptRequest{
-			Level:   interruptLevel,
-			Source:  "user",
-			Message: text,
+			Level: interruptLevel, Source: "user", Message: text,
 		})
 	}
 
-	// Companion Skills (Proposal 1): attempt skill routing before command/function execution.
+	// --- Skills check ---
 	if o.skillsRunner != nil {
-		// Note: runner uses its own matching; if it matches, return immediately.
 		if matched, skillResp, err := o.skillsRunner.TryRun(ctx, text, emotionState); err != nil {
-			log.Printf("[Skills] Error while executing skill: %v", err)
-			// fall back to normal pipeline
+			log.Printf("[Skills] Error: %v", err)
 		} else if matched && skillResp != "" {
-			o.memory.Working().Add(interfaces.MemoryEntry{
-				Type:      "assistant_response",
-				Content:   skillResp,
-				Timestamp: time.Now().Unix(),
-			})
-
-			o.memory.Episodic().StoreEvent(interfaces.MemoryEntry{
-				ID:        fmt.Sprintf("mai_%d", time.Now().UnixMilli()),
-				Type:      "assistant_response",
-				Content:   skillResp,
-				Timestamp: time.Now().Unix(),
-			})
-
+			o.storeResponse(skillResp)
 			return &interfaces.AgentResponse{Text: o.adaptResponse(skillResp, emotionState), Success: true}, nil
 		}
 	}
 
-	lowerText := strings.ToLower(text)
-
-	searchPlatforms := []string{"google", "bing", "yahoo", "duckduckgo", "wikipedia", "youtube"}
-	isSearchWithoutPlatform := false
-	// Only match explicit search/find commands at the start, not casual "I'll search" etc.
-	if strings.HasPrefix(lowerText, "search ") || strings.HasPrefix(lowerText, "find ") {
-		hasPlatform := false
-		for _, p := range searchPlatforms {
-			if strings.Contains(lowerText, " on "+p) || strings.Contains(lowerText, " using "+p) {
-				hasPlatform = true
-				break
-			}
-		}
-		if !hasPlatform {
-			isSearchWithoutPlatform = true
-		}
-	}
-
-	if o.DirectAction != nil && !isSearchWithoutPlatform {
+	// --- PATH 1: Regex fast path (imperative commands) ---
+	if o.DirectAction != nil {
 		executed, feedback, err := o.DirectAction(text)
 		if err != nil {
 			o.meta.RecordActionResult(false)
@@ -365,133 +315,38 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		if executed {
 			o.meta.RecordActionResult(true)
 			o.userModel.RecordFrequentApp(text)
-			log.Printf("[Agent] Executed via regex parser.")
+			log.Printf("[Agent] Regex fast path hit.")
 			return &interfaces.AgentResponse{Text: feedback, Success: true}, nil
 		}
-	} else if isSearchWithoutPlatform {
-		log.Printf("[Agent] Search without platform detected — routing to deep_search via ReAct")
-		response, err := o.react.Execute(ctx, text)
-		if err != nil {
-			return nil, err
-		}
-		return &interfaces.AgentResponse{Text: response, Success: true}, nil
 	}
 
-	isLikelyCommand := false
-	// Only treat as a command if it starts with an imperative verb or contains
-	// an explicit action pattern. Avoid matching casual conversational uses
-	// like "I'll search for that" or "Can you find...".
-	commandTriggers := []string{
-		"send message", "send a message", "send the message",
-		"play ", "open ", "close ", "launch ",
-		"type ", "press ",
-		"whatsapp", "youtube", "spotify",
-		"set a reminder", "set reminder", "schedule ", "remind me to",
-	}
-	for _, cmd := range commandTriggers {
-		if strings.Contains(lowerText, cmd) {
-			isLikelyCommand = true
-			break
-		}
+	// --- PATH 2: LLM handles everything else ---
+	// Classify the task type for prompt shaping, but let the LLM decide
+	// whether to use tools or answer from knowledge.
+	taskType := o.promptEngine.ClassifyTask(text, false)
+	log.Printf("[Agent] Routing to LLM (taskType=%s): %s", taskType, text)
+
+	response, err := o.react.Execute(ctx, text)
+	if err != nil {
+		// Fallback: direct conversation if ReAct fails
+		log.Printf("[Agent] ReAct failed: %v, falling back to conversation", err)
+		return o.handleConversation(ctx, text, emotionState, taskType)
 	}
 
-	knowledgeTriggers := []string{
-		"list me the", "list the", "top 10", "top 5", "top three",
-		"best way to", "best approach to", "recommend a", "recommend an",
-		"compare the", "pros and cons of", "alternatives to", "how do i choose",
-	}
-	isKnowledgeRequest := false
-	for _, kw := range knowledgeTriggers {
-		if strings.Contains(lowerText, kw) {
-			isKnowledgeRequest = true
-			break
-		}
-	}
-	if isKnowledgeRequest && !isLikelyCommand {
-		log.Printf("[Agent] Knowledge request detected, routing to ReAct: %s", text)
-		response, err := o.react.Execute(ctx, text)
-		if err != nil {
-			return nil, err
-		}
-		return &interfaces.AgentResponse{Text: response, Success: true}, nil
-	}
-
-	multiStepIndicators := []string{
-		"and then", "after that,", "first,", "then ", "next ",
-		"do all of these", "prep ", "prepare ", "set up ",
-	}
-	isMultiStep := false
-	for _, ind := range multiStepIndicators {
-		if strings.Contains(lowerText, ind) {
-			isMultiStep = true
-			break
-		}
-	}
-
-	if isMultiStep && isLikelyCommand {
-		return o.handleMultiStep(ctx, text)
-	}
-
-	taskType := o.promptEngine.ClassifyTask(text, isLikelyCommand)
-
-	if taskType == cognition.TaskCommand && isLikelyCommand {
-		log.Printf("[Agent] Command detected, using function calling: %s", text)
-		return o.handleFunctionCall(ctx, text, emotionState)
-	}
-
-	// Use PromptEngine's classification for reasoning - it's much more restrictive
-	// and only triggers on explicit analytical requests, not casual questions.
-	if taskType == cognition.TaskReasoning {
-		log.Printf("[Agent] Engaging Reasoning Engine (PromptEngine classified as reasoning): %s", text)
-		response, err := o.react.Execute(ctx, text)
-		if err != nil {
-			return nil, err
-		}
-		return &interfaces.AgentResponse{Text: o.adaptResponse(response, emotionState), Success: true}, nil
-	}
-
-	log.Printf("[Agent] Conversational input (taskType=%s): %s", taskType, text)
-	return o.handleConversation(ctx, text, emotionState, taskType)
+	adapted := o.adaptResponse(response, emotionState)
+	o.storeResponse(adapted)
+	return &interfaces.AgentResponse{Text: adapted, Success: true}, nil
 }
 
-func (o *Orchestrator) handleFunctionCall(ctx context.Context, text string, emotion personality.EmotionState) (*interfaces.AgentResponse, error) {
-	emotionHint := ""
-	if emotion.Type != personality.EmotionNeutral && emotion.Confidence > 0.3 {
-		emotionHint = fmt.Sprintf("User appears %s.", emotion.Type)
-	}
-
-	output, results, err := o.functionCaller.Execute(ctx, text, emotionHint)
-	if err != nil {
-		log.Printf("[FunctionCall] Error: %v, falling back to ReAct", err)
-		response, reactErr := o.react.Execute(ctx, text)
-		if reactErr != nil {
-			return nil, reactErr
-		}
-		return &interfaces.AgentResponse{Text: response, Success: true}, nil
-	}
-
-	if len(results) > 0 {
-		o.meta.RecordActionResult(results[0].Error == "")
-	}
-
-	if output == "" {
-		output = "Done."
-	}
-
+// storeResponse records Mai's response in working and episodic memory.
+func (o *Orchestrator) storeResponse(text string) {
 	o.memory.Working().Add(interfaces.MemoryEntry{
-		Type:      "assistant_response",
-		Content:   output,
-		Timestamp: time.Now().Unix(),
+		Type: "assistant_response", Content: text, Timestamp: time.Now().Unix(),
 	})
-
 	o.memory.Episodic().StoreEvent(interfaces.MemoryEntry{
-		ID:        fmt.Sprintf("mai_%d", time.Now().UnixMilli()),
-		Type:      "assistant_response",
-		Content:   output,
-		Timestamp: time.Now().Unix(),
+		ID: fmt.Sprintf("mai_%d", time.Now().UnixMilli()), Type: "assistant_response",
+		Content: text, Timestamp: time.Now().Unix(),
 	})
-
-	return &interfaces.AgentResponse{Text: o.adaptResponse(output, emotion), Success: true}, nil
 }
 
 func (o *Orchestrator) handleConversation(ctx context.Context, text string, emotion personality.EmotionState, taskType cognition.TaskType) (*interfaces.AgentResponse, error) {
@@ -716,97 +571,6 @@ func consumeSentence(buf *strings.Builder, s string, end int) (string, bool) {
 
 func isLowerByte(b byte) bool { return b >= 'a' && b <= 'z' }
 
-func (o *Orchestrator) handleMultiStep(ctx context.Context, text string) (*interfaces.AgentResponse, error) {
-	log.Printf("[Agent] Multi-step task detected, engaging planner...")
-
-	relevantTools := o.selectRelevantTools(text)
-	plan, err := o.planner.Decompose(ctx, text, relevantTools)
-	if err != nil {
-		log.Printf("[Agent] Planning failed, falling back to ReAct: %v", err)
-		response, err := o.react.Execute(ctx, text)
-		if err != nil {
-			return nil, err
-		}
-		return &interfaces.AgentResponse{Text: response, Success: true}, nil
-	}
-
-	log.Printf("[Agent] Plan created with %d steps", len(plan.Root))
-
-	var results []string
-	for _, task := range plan.Root {
-		log.Printf("[Agent] Executing: %s", task.Description)
-
-		if task.Tool != "" {
-			result, err := o.registry.Execute(ctx, task.Tool, task.ToolInput)
-			if err != nil {
-				results = append(results, fmt.Sprintf("FAILED (%s): %v", task.Description, err))
-				o.planner.MarkFailed(plan, task.ID)
-				o.meta.RecordActionResult(false)
-			} else {
-				results = append(results, fmt.Sprintf("DONE (%s): %s", task.Description, result.Output))
-				o.planner.MarkCompleted(plan, task.ID)
-				o.meta.RecordActionResult(true)
-			}
-		} else {
-			response, err := o.llm.Generate(ctx, task.Description, o.genOpts)
-			if err == nil {
-				results = append(results, fmt.Sprintf("DONE (%s): %s", task.Description, response))
-				o.planner.MarkCompleted(plan, task.ID)
-			}
-		}
-	}
-
-	summaryPrompt := fmt.Sprintf("Summarize these task results concisely:\n%s", strings.Join(results, "\n"))
-	summary, err := o.llm.Generate(ctx, summaryPrompt, o.genOpts)
-	if err != nil {
-		summary = fmt.Sprintf("Completed %d/%d steps.", len(results), len(plan.Root))
-	}
-
-	return &interfaces.AgentResponse{Text: summary, Success: true}, nil
-}
-
-func (o *Orchestrator) selectRelevantTools(text string) []interfaces.ToolMetadata {
-	allTools := o.registry.List()
-	lower := strings.ToLower(text)
-
-	var relevant []interfaces.ToolMetadata
-	for _, tool := range allTools {
-		name := strings.ToLower(tool.Name)
-		desc := strings.ToLower(tool.Description)
-
-		if name == "get_system_time" || name == "ui_automation" {
-			relevant = append(relevant, tool)
-			continue
-		}
-
-		keywords := strings.Fields(name)
-		for _, kw := range keywords {
-			if len(kw) > 2 && strings.Contains(lower, kw) {
-				relevant = append(relevant, tool)
-				break
-			}
-		}
-
-		descWords := strings.Fields(desc)
-		for i, kw := range descWords {
-			if i >= 5 {
-				break
-			}
-			if len(kw) > 3 && strings.Contains(lower, kw) {
-				relevant = append(relevant, tool)
-				break
-			}
-		}
-	}
-
-	if len(relevant) == 0 {
-		return allTools
-	}
-
-	log.Printf("[Agent] Contextual tool selection: %d/%d tools relevant", len(relevant), len(allTools))
-	return relevant
-}
-
 func (o *Orchestrator) adaptResponse(response string, emotion personality.EmotionState) string {
 	response = cleanResponse(response)
 
@@ -1010,6 +774,39 @@ func (o *Orchestrator) handleVision(event interfaces.Event) {
 	}
 }
 
+// echoWordSet is a stack-allocated set for echo detection.
+// Avoids heap allocation for the common case (< 64 words).
+type echoWordSet struct {
+	small [16]string // stack-allocated for small sets
+	big   map[string]bool
+	n     int
+}
+
+func newEchoWordSet(words []string) echoWordSet {
+	s := echoWordSet{n: len(words)}
+	if len(words) <= 16 {
+		copy(s.small[:], words)
+	} else {
+		s.big = make(map[string]bool, len(words))
+		for _, w := range words {
+			s.big[w] = true
+		}
+	}
+	return s
+}
+
+func (s *echoWordSet) has(word string) bool {
+	if s.big != nil {
+		return s.big[word]
+	}
+	for i := 0; i < s.n && i < 16; i++ {
+		if s.small[i] == word {
+			return true
+		}
+	}
+	return false
+}
+
 func isEcho(input, spoken string) bool {
 	inputWords := strings.Fields(input)
 	spokenWords := strings.Fields(spoken)
@@ -1018,33 +815,23 @@ func isEcho(input, spoken string) bool {
 		return false
 	}
 
-	// Very short inputs (1 word) should NOT be treated as echoes —
-	// they're more likely genuine short commands like "yes", "no", "stop".
-	// But 2+ word inputs that overlap heavily with Mai's speech are likely echoes.
 	if len(inputWords) <= 1 {
 		return false
 	}
 
-	spokenSet := make(map[string]bool)
-	for _, w := range spokenWords {
-		spokenSet[w] = true
-	}
+	spokenSet := newEchoWordSet(spokenWords)
 
 	matchCount := 0
 	for _, w := range inputWords {
-		if spokenSet[w] {
+		if spokenSet.has(w) {
 			matchCount++
 		}
 	}
 
 	matchRatio := float64(matchCount) / float64(len(inputWords))
-	// Require 60%+ word overlap AND the input must be shorter or equal
-	// to the spoken text (an echo can't be longer than the original).
 	return matchRatio > 0.6 && len(inputWords) <= len(spokenWords)
 }
 
-// isEchoStrict is a more aggressive echo check used shortly after TTS finishes,
-// when room reverberation is most likely to cause partial transcriptions.
 func isEchoStrict(input, spoken string) bool {
 	inputWords := strings.Fields(input)
 	spokenWords := strings.Fields(spoken)
@@ -1053,20 +840,16 @@ func isEchoStrict(input, spoken string) bool {
 		return false
 	}
 
-	spokenSet := make(map[string]bool)
-	for _, w := range spokenWords {
-		spokenSet[w] = true
-	}
+	spokenSet := newEchoWordSet(spokenWords)
 
 	matchCount := 0
 	for _, w := range inputWords {
-		if spokenSet[w] {
+		if spokenSet.has(w) {
 			matchCount++
 		}
 	}
 
 	matchRatio := float64(matchCount) / float64(len(inputWords))
-	// Within 2s of TTS ending: lower threshold to 40% and allow any length
 	return matchRatio > 0.4
 }
 

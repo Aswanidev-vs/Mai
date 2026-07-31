@@ -7,6 +7,35 @@ Tracking implementation of JARVIS-class capabilities across reasoning, tool use,
 
 ---
 
+## 6. COGNITIVE PIPELINE OPTIMIZATION — Natural Human-Like Reasoning — DONE
+
+| Change | Status | File(s) | Notes |
+|---|---|---|---|
+| ReAct loop rewrite | DONE | `internal/cognition/react.go` | Removed rigid JSON step format. Now uses natural language reasoning with structured tool calls only when needed. Removed Verifier dependency (was over-aggressive). Max 3 tool calls (matches human behavior). Simplified prompt — "think naturally, like a smart assistant would." |
+| Prompt engine unification | DONE | `internal/cognition/prompt_engine.go` | Collapsed 8 fragmented prompt templates into 1 unified prompt. Personality stays constant — only context injection and a brief task hint tail change. Emotion hints only inject when confidence > 50% (was 30%). Tone directives removed from prompt (personality shouldn't shift per emotion). |
+| Routing simplification | DONE | `internal/agent/loop.go` | Reduced from 5 overlapping paths (regex, function calling, ReAct, planner, conversation) to 2 (regex fast path → LLM handles everything else). Removed knowledge request routing, multi-step routing, and separate function calling path. The LLM decides whether to use tools or answer from knowledge. |
+| Dead code cleanup | DONE | `internal/agent/loop.go` | Removed `handleMultiStep()`, `selectRelevantTools()`, `handleFunctionCall()`, `functionCaller` field, `planner` field. These were unused after routing simplification. |
+
+### What Changed (Before → After)
+
+**ReAct prompt:**
+- Before: "You are Mai's reasoning engine. Goal: X. RULES: 1. If the goal can be answered from your general knowledge... Respond: {"thought":"...","action":"tool_name",...}"
+- After: "You are Mai — think through this naturally, like a smart assistant would. GOAL: X. If you already know the answer → answer directly. If the goal needs current info → use a tool."
+
+**Routing:**
+- Before: 5 paths with string matching for "search without platform", "knowledge triggers", "multi-step indicators", "command triggers", then task classification into 8 types
+- After: Regex fast path (if matched → done). Everything else → ReAct loop (LLM decides tools vs. knowledge).
+
+**Prompt templates:**
+- Before: 8 separate templates with different system prompts per task type
+- After: 1 unified prompt. Personality always the same. Only the last 1-2 lines hint at response shape (e.g., "respond warmly" for greetings, "be thorough" for analysis).
+
+**Emotion adaptation:**
+- Before: Confidence threshold 0.3, tone directives that change personality ("be calm and grounded", "be patient and direct")
+- After: Confidence threshold 0.5, subtle notes ("They seem stressed. Keep it simple.") that don't override personality
+
+---
+
 ## 1. REASONING DEFICITS — Severity: CRITICAL — ALL RESOLVED
 
 | Deficiency | Status | File(s) | Notes |
@@ -87,12 +116,13 @@ Tracking implementation of JARVIS-class capabilities across reasoning, tool use,
 
 | File | Changes |
 |---|---|
-| `internal/agent/loop.go` | **MAJOR REWRITE**: Integrated prompt engine, function calling, user model, proactive engine, interrupt manager, prosody analyzer, TTS adapter. New `handleFunctionCall()` method. Emotion-aware TTS params passed via event bus. Added `SetTTSVoiceStyle()`. |
+| `internal/agent/loop.go` | **ROUTING SIMPLIFIED**: Reduced 5 overlapping paths to 2 (regex fast path → ReAct for everything else). Removed `handleFunctionCall()`, `handleMultiStep()`, `selectRelevantTools()`. Added `storeResponse()` helper. Removed `functionCaller` and `planner` fields. |
+| `internal/cognition/react.go` | **REACT REWRITE**: Natural language reasoning instead of rigid JSON steps. Removed Verifier dependency. Simplified prompt ("think naturally"). Max 3 tool calls. Cleaner loop detection. |
+| `internal/cognition/prompt_engine.go` | **PROMPT UNIFICATION**: Collapsed 8 templates into 1. Personality constant regardless of task. Emotion hints only at >50% confidence. Brief task-hint tail instead of full prompt rewrite. |
 | `internal/tools/registry.go` | Enhanced with categories (`ToolCategory`), `DiscoverByCategory()`, `Search()` (scored keyword matching), `Unregister()`, `Count()`, `GetMetadata()`, `ListByCategory()`. |
 | `pkg/interfaces/tools.go` | Added `ToolCategory` type with 8 categories (system, web, media, communication, file, automation, query, external). Added `Category` and `Keywords` fields to `ToolMetadata`. |
 | `cmd/mai/main.go` | Barge-in detection with VAD confirmation. Thinking chime. Reduced silence wait. Removed pre-TTS delays. RMS computation consolidated. Audio callback restructured. TTS voice style wiring. Event bus panic recovery. VAD C memory leak fix. |
 | `cmd/mai/audio.go` | `playAudio` interruptible (context + stop flag). Added `generateThinkingChime()`. |
-| `internal/cognition/react.go` | Verifier wired into ReAct loop. 30s context timeout. Max iterations 5→3. |
 | `internal/events/bus.go` | Panic recovery in Publish handler dispatch. |
 | `internal/memory/episodic.go` | QueryEvents now uses LIKE query. |
 | `internal/tools/mcp/client.go` | Fixed sessionID race with RWMutex. |
@@ -104,28 +134,26 @@ Tracking implementation of JARVIS-class capabilities across reasoning, tool use,
 
 ## How the New Architecture Works
 
-### Request Flow (Agentic Mode)
+### Request Flow (Simplified)
 ```
 User Speech → ASR → Transcription
     ↓
 Orchestrator.HandleInput()
     ├── Echo Detection (ignore TTS echo)
-    ├── Emotion Detection (text keywords)
-    ├── User Model Recording (interaction, topics, patterns)
-    ├── Prosody Analysis (if audio samples available)
-    ├── Interrupt Classification (critical/high/normal/low)
+    ├── Emotion Detection (text keywords, >50% confidence)
     ├── Memory Storage (working + episodic)
+    ├── Skills Check (if matched → execute & return)
     │
-    ├── SMART ROUTING:
-    │   ├── Regex Fast Path → DirectAction (legacy, most reliable)
-    │   ├── Knowledge Request → ReAct Loop (deep_search)
-    │   ├── Multi-Step Command → Planner → Sequential Execution
-    │   ├── Command → Function Calling (structured JSON tool calls)
-    │   ├── Reasoning → ReAct Loop (think → act → observe)
-    │   └── Conversation → Prompt Engine → LLM (JARVIS personality)
+    ├── PATH 1: Regex Fast Path
+    │   └── Imperative command matched? → Execute directly → Done
     │
-    ├── Response Adaptation (emotion-aware truncation, prefix)
-    └── TTS with Emotion-Adaptive Parameters (speed, pitch, volume)
+    └── PATH 2: LLM (handles everything else)
+        └── ReAct Loop (natural language reasoning)
+            ├── "I know this" → Answer directly (no tools)
+            ├── "I need current info/action" → Call tool → Observe → Synthesize
+            └── "I don't know" → Say so honestly
+    │
+    └── Response Adaptation (subtle emotion hints, not personality override)
 ```
 
 ### Two-Way Communication Flow

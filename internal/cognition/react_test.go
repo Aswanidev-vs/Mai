@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 
 	"github.com/user/mai/pkg/interfaces"
 )
@@ -132,34 +133,6 @@ func TestSanitizeJSON_PreservesValidJSON(t *testing.T) {
 	assert.Equal(t, "web_search", parsed["action"])
 }
 
-func TestContainsHallucinationMarker(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected bool
-	}{
-		{"clear statement", "The weather is sunny today.", false},
-		{"hedging phrase 1", "I'm not sure but it might rain.", true},
-		{"hedging phrase 2", "I think maybe the answer is 42.", true},
-		{"hedging phrase 3", "I believe perhaps this is correct.", true},
-		{"hedging phrase 4", "According to my knowledge, this works.", true},
-		{"hedging phrase 5", "As far as I know, this is true.", true},
-		{"hedging phrase 6", "I don't have access to that system.", true},
-		{"hedging phrase 7", "I cannot verify this information.", true},
-		{"confident answer", "The answer is 42.", false},
-		{"empty string", "", false},
-		{"case insensitive", "I'M NOT SURE BUT this works.", true},
-		{"partial match not exact", "I'm not sure about the details but the result is 5.", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := containsHallucinationMarker(tt.input)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
 func TestValidateToolCall(t *testing.T) {
 	registry := &mockToolRegistry{
 		tools: []interfaces.Tool{
@@ -240,4 +213,74 @@ func TestValidateToolCall(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReActLoop_BuildPrompt_NaturalLanguage(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	registry := &mockToolRegistry{
+		tools: []interfaces.Tool{
+			&mockTool{metadata: interfaces.ToolMetadata{Name: "web_search", Description: "Search the web"}},
+			&mockTool{metadata: interfaces.ToolMetadata{Name: "get_system_time", Description: "Get current time"}},
+		},
+	}
+
+	loop := NewReActLoop(nil, registry, nil)
+
+	// Test that prompt uses natural language, not rigid JSON format
+	prompt := loop.buildPrompt("What time is it?", nil)
+
+	assert.Contains(t, prompt, "think through this naturally")
+	assert.Contains(t, prompt, "What time is it?")
+	assert.Contains(t, prompt, "get_system_time")
+	// Should NOT contain rigid step labels
+	assert.NotContains(t, prompt, "RULE 1:")
+	assert.NotContains(t, prompt, "RULE 2:")
+}
+
+func TestReActLoop_BuildPrompt_WithHistory(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	registry := &mockToolRegistry{
+		tools: []interfaces.Tool{
+			&mockTool{metadata: interfaces.ToolMetadata{Name: "web_search", Description: "Search the web"}},
+		},
+	}
+
+	loop := NewReActLoop(nil, registry, nil)
+
+	steps := []ReActStep{
+		{Thought: "I should search", Action: "web_search", Observation: "Found results"},
+	}
+
+	prompt := loop.buildPrompt("What's the weather?", steps)
+
+	assert.Contains(t, prompt, "WHAT HAPPENED SO FAR")
+	assert.Contains(t, prompt, "web_search")
+	assert.Contains(t, prompt, "Found results")
+}
+
+func TestReActLoop_BuildToolGuide(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	registry := &mockToolRegistry{
+		tools: []interfaces.Tool{
+			&mockTool{metadata: interfaces.ToolMetadata{Name: "youtube_play", Description: "Play YouTube videos"}},
+			&mockTool{metadata: interfaces.ToolMetadata{Name: "open_application", Description: "Open an app"}},
+			&mockTool{metadata: interfaces.ToolMetadata{Name: "web_search", Description: "Search the web"}},
+			&mockTool{metadata: interfaces.ToolMetadata{Name: "get_system_time", Description: "Get time"}},
+			&mockTool{metadata: interfaces.ToolMetadata{Name: "whatsapp_send", Description: "Send WhatsApp message"}},
+			&mockTool{metadata: interfaces.ToolMetadata{Name: "ui_automation", Description: "UI automation"}},
+		},
+	}
+
+	loop := NewReActLoop(nil, registry, nil)
+	guide := loop.buildToolGuide()
+
+	assert.Contains(t, guide, "youtube_play")
+	assert.Contains(t, guide, "open_application")
+	assert.Contains(t, guide, "web_search")
+	assert.Contains(t, guide, "get_system_time")
+	assert.Contains(t, guide, "whatsapp_send")
+	assert.Contains(t, guide, "ui_automation")
 }

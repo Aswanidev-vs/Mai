@@ -205,7 +205,7 @@ func main() {
 	kwsConfig.KeywordsBufSize = len(kwsConfig.KeywordsBuf)
 	kwsConfig.KeywordsThreshold = cfg.KWS.Threshold
 	kwsConfig.ModelConfig.NumThreads = cfg.KWS.NumThreads
-	kwsConfig.ModelConfig.Provider = "cpu"
+	kwsConfig.ModelConfig.Provider = cfg.KWS.Provider
 
 	spotter := sherpa.NewKeywordSpotter(&kwsConfig)
 	if spotter == nil {
@@ -231,7 +231,7 @@ func main() {
 	vadConfig.SileroVad.WindowSize = cfg.VAD.WindowSize
 	vadConfig.SampleRate = 16000
 	vadConfig.NumThreads = cfg.VAD.NumThreads
-	vadConfig.Provider = "cpu"
+	vadConfig.Provider = cfg.VAD.Provider
 
 	vadDetector := sherpa.NewVoiceActivityDetector(&vadConfig, 20)
 	if vadDetector == nil {
@@ -257,7 +257,7 @@ func main() {
 		offlineConfig.ModelConfig.Qwen3ASR.Decoder = join(cfg.ASR.ModelDir, cfg.ASR.Decoder)
 		offlineConfig.ModelConfig.Qwen3ASR.Tokenizer = join(cfg.ASR.ModelDir, cfg.ASR.Tokenizer)
 		offlineConfig.ModelConfig.NumThreads = cfg.ASR.NumThreads
-		offlineConfig.ModelConfig.Provider = "cpu"
+		offlineConfig.ModelConfig.Provider = cfg.ASR.Provider
 		offlineConfig.DecodingMethod = "greedy_search"
 
 		offlineRecognizer = sherpa.NewOfflineRecognizer(&offlineConfig)
@@ -282,7 +282,7 @@ func main() {
 		}
 
 		asrConfig.ModelConfig.NumThreads = cfg.ASR.NumThreads
-		asrConfig.ModelConfig.Provider = "cpu"
+		asrConfig.ModelConfig.Provider = cfg.ASR.Provider
 		asrConfig.DecodingMethod = cfg.ASR.DecodingMethod
 		asrConfig.MaxActivePaths = cfg.ASR.MaxActivePaths
 		asrConfig.EnableEndpoint = cfg.ASR.EnableEndpoint
@@ -307,7 +307,7 @@ func main() {
 	// 4. Initialize TTS
 	ttsConfig := sherpa.OfflineTtsConfig{}
 	ttsConfig.Model.NumThreads = cfg.TTS.NumThreads
-	ttsConfig.Model.Provider = "cpu"
+	ttsConfig.Model.Provider = cfg.TTS.Provider
 
 	switch cfg.TTS.ActiveModel {
 	case "supertonic":
