@@ -153,11 +153,43 @@ func (pe *PromptEngine) appendEmotionContext(b *strings.Builder, ctx PromptConte
 }
 
 func (pe *PromptEngine) appendMemoryContext(b *strings.Builder, ctx PromptContext) {
-	if ctx.WorkingMemory != "" {
-		b.WriteString(fmt.Sprintf("\nRECENT CONTEXT:\n%s\n", ctx.WorkingMemory))
+	// Context budget: limit total context to prevent overflow
+	// ~4 chars per token, leave room for system prompt + user input
+	const maxContextChars = 3000
+
+	totalLen := len(ctx.WorkingMemory) + len(ctx.RAGContext)
+	if totalLen <= maxContextChars {
+		// Fits — include everything
+		if ctx.WorkingMemory != "" {
+			b.WriteString(fmt.Sprintf("\nRECENT CONTEXT:\n%s\n", ctx.WorkingMemory))
+		}
+		if ctx.RAGContext != "" {
+			b.WriteString(fmt.Sprintf("\nRELEVANT INFO:\n%s\n", ctx.RAGContext))
+		}
+		return
 	}
+
+	// Too large — prioritize RAG context (more relevant), truncate working memory
 	if ctx.RAGContext != "" {
-		b.WriteString(fmt.Sprintf("\nRELEVANT INFO:\n%s\n", ctx.RAGContext))
+		ragBudget := maxContextChars * 6 / 10 // 60% for RAG
+		rag := ctx.RAGContext
+		if len(rag) > ragBudget {
+			rag = rag[:ragBudget] + "...[truncated]"
+		}
+		b.WriteString(fmt.Sprintf("\nRELEVANT INFO:\n%s\n", rag))
+	}
+
+	if ctx.WorkingMemory != "" {
+		wmBudget := maxContextChars * 4 / 10 // 40% for working memory
+		wm := ctx.WorkingMemory
+		if len(wm) > wmBudget {
+			// Keep the most recent entries (from end)
+			wm = wm[len(wm)-wmBudget:]
+			if idx := strings.Index(wm, "\n"); idx != -1 {
+				wm = "[older entries summarized]\n" + wm[idx+1:]
+			}
+		}
+		b.WriteString(fmt.Sprintf("\nRECENT CONTEXT:\n%s\n", wm))
 	}
 }
 
