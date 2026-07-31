@@ -23,6 +23,76 @@ func TestWorkingMemory_AddAndGetContext(t *testing.T) {
 	assert.Contains(t, ctx, "Hello")
 }
 
+func TestWorkingMemory_AutoCompact(t *testing.T) {
+	// Create memory with very small maxChars to trigger compaction
+	mem := NewWorkingMemory(20)
+	mem.SetMaxChars(200) // Very small threshold
+
+	// Add many long entries
+	for i := 0; i < 15; i++ {
+		mem.Add(interfaces.MemoryEntry{
+			Type:    "user_input",
+			Content: "This is a long message that should trigger compaction when the context exceeds the limit.",
+		})
+	}
+
+	// Context should be compacted (shorter than if all entries were kept)
+	ctx := mem.GetContext()
+	assert.LessOrEqual(t, len(ctx), 200+200) // Allow some overflow for the summary marker
+	assert.Contains(t, ctx, "auto-compact")
+}
+
+func TestWorkingMemory_Truncation(t *testing.T) {
+	mem := NewWorkingMemory(20)
+	mem.SetMaxChars(100) // Small threshold
+
+	// Add entries that exceed the limit
+	for i := 0; i < 10; i++ {
+		mem.Add(interfaces.MemoryEntry{
+			Type:    "user_input",
+			Content: "Short message",
+		})
+	}
+
+	ctx := mem.GetContext()
+	// Should be truncated but still contain recent entries
+	assert.LessOrEqual(t, len(ctx), 300) // Allow some overflow for markers
+	assert.Contains(t, ctx, "Short message")
+}
+
+func TestWorkingMemory_NoCompactWhenUnderLimit(t *testing.T) {
+	mem := NewWorkingMemory(20)
+	mem.SetMaxChars(10000) // Large threshold
+
+	for i := 0; i < 5; i++ {
+		mem.Add(interfaces.MemoryEntry{
+			Type:    "user_input",
+			Content: "Hello",
+		})
+	}
+
+	ctx := mem.GetContext()
+	// Should NOT contain compaction marker
+	assert.NotContains(t, ctx, "auto-compact")
+	assert.Equal(t, 5, mem.Len()) // All entries preserved
+}
+
+func TestWorkingMemory_GetContextRespectsMaxChars(t *testing.T) {
+	mem := NewWorkingMemory(20)
+	mem.SetMaxChars(50)
+
+	for i := 0; i < 10; i++ {
+		mem.Add(interfaces.MemoryEntry{
+			Type:    "user_input",
+			Content: "Test entry",
+		})
+	}
+
+	ctx := mem.GetContext()
+	// Should be truncated
+	assert.LessOrEqual(t, len(ctx), 200) // Allow some overflow for markers
+}
+
 func TestWorkingMemory_MaxEntries(t *testing.T) {
 	mem := NewWorkingMemory(3)
 

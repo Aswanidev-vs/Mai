@@ -117,6 +117,35 @@ func TestBuildPrompt_ConversationWithMemory(t *testing.T) {
 	assert.Contains(t, prompt, "Go developer")
 }
 
+func TestBuildPrompt_ContextBudget(t *testing.T) {
+	engine := NewPromptEngine()
+
+	// Create very large context that exceeds the 3000 char budget
+	largeWM := ""
+	for i := 0; i < 100; i++ {
+		largeWM += "This is a long working memory entry that adds up. "
+	}
+	largeRAG := ""
+	for i := 0; i < 100; i++ {
+		largeRAG += "This is a long RAG context entry that also adds up. "
+	}
+
+	ctx := PromptContext{
+		TaskType:      TaskConversation,
+		UserInput:     "Hello",
+		WorkingMemory: largeWM,
+		RAGContext:    largeRAG,
+	}
+
+	prompt := engine.BuildPrompt(ctx)
+
+	// Total prompt should be reasonable (under ~5000 chars including system prompt)
+	assert.Less(t, len(prompt), 6000, "prompt should respect context budget")
+	// Should still contain some context (not empty)
+	assert.Contains(t, prompt, "RECENT CONTEXT")
+	assert.Contains(t, prompt, "RELEVANT INFO")
+}
+
 func TestBuildPrompt_Reasoning(t *testing.T) {
 	engine := NewPromptEngine()
 

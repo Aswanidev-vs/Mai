@@ -353,7 +353,8 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	lowerText := strings.ToLower(text)
 	var contextParts []string
 
-	if wm := o.memory.Working().GetContext(); wm != "" {
+	wm := o.memory.Working().GetContext()
+	if wm != "" {
 		contextParts = append(contextParts, "Recent conversation:\n"+wm)
 	}
 

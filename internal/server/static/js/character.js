@@ -791,19 +791,20 @@ class CharacterRenderer {
             if (this.lipSyncRelease.remainingMs > 0) {
                 this.lipSyncRelease.remainingMs = Math.max(0, this.lipSyncRelease.remainingMs - delta * 1000);
                 const blend = this._smoothstep(1 - this.lipSyncRelease.remainingMs / LIP_RELEASE_DURATION_MS);
-                // Read current motion-driven mouth value and crossfade
-                const motionValue = this.vrm.expressionManager.getValue('aa') || 0;
-                const blended = this.lipSyncRelease.lastForcedValue * (1 - blend) + motionValue * blend;
+                // Crossfade from last forced value to zero (not motion value — that keeps mouth open)
+                const faded = this.lipSyncRelease.lastForcedValue * (1 - blend);
                 for (const bs of Object.values(VOWEL_MAP)) {
-                    this.vrm.expressionManager.setValue(bs, blended * 0.7);
+                    this.vrm.expressionManager.setValue(bs, faded * 0.7);
+                }
+                // Update smoothed vowels to match so next frame is consistent
+                for (const key of Object.keys(this.smoothedVowels)) {
+                    this.smoothedVowels[key] = faded;
                 }
             } else {
-                // Fully released — fade to zero
+                // Fully released — snap to zero (don't linger)
                 for (const bs of Object.values(VOWEL_MAP)) {
-                    const r = 1 - Math.exp(-LIP_RELEASE * delta);
-                    this.smoothedVowels[bs] += (0 - this.smoothedVowels[bs]) * r;
-                    if (this.smoothedVowels[bs] < 0.004) this.smoothedVowels[bs] = 0;
-                    this.vrm.expressionManager.setValue(bs, this.smoothedVowels[bs]);
+                    this.smoothedVowels[bs] = 0;
+                    this.vrm.expressionManager.setValue(bs, 0);
                 }
             }
             return;
