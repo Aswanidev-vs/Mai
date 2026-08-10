@@ -13,29 +13,53 @@ import (
 	"github.com/user/mai/pkg/interfaces"
 )
 
+// OllamaOptions configures runtime behavior shared across all Ollama calls.
+// Zero values fall back to Ollama's own defaults.
+type OllamaOptions struct {
+	// MinP is the minimum token probability (0-1) — keeps low-end/local model
+	// sampling from wandering into irrelevant tokens. 0 disables.
+	MinP float64
+}
+
 // OllamaProvider implements interfaces.LLMProvider using the Ollama API
 type OllamaProvider struct {
 	model        string
 	url          string
 	systemPrompt string
 	think        *bool // nil = use model default, false = disable thinking
+	minP         float64
 	client       *http.Client
 }
 
-func NewOllamaProvider(model, url, systemPrompt string, think *bool) *OllamaProvider {
+func NewOllamaProvider(model, url, systemPrompt string, think *bool, opts OllamaOptions) *OllamaProvider {
 	return &OllamaProvider{
 		model:        model,
 		url:          url,
 		systemPrompt: systemPrompt,
 		think:        think,
+		minP:         opts.MinP,
 		client:       &http.Client{Timeout: 5 * time.Minute},
 	}
 }
 
-func (p *OllamaProvider) Generate(ctx context.Context, prompt string, opts interfaces.GenerationOptions) (string, error) {
-	options := map[string]interface{}{
-		"temperature": opts.Temperature,
+// applyTokenOptions adds min_p to an options map (creating it if nil).
+// keep_alive/num_ctx are intentionally NOT set: Ollama owns model residency
+// (default 5-min unload) and VRAM-based context sizing, so it decides
+// offloading itself.
+func (p *OllamaProvider) applyTokenOptions(options map[string]interface{}) map[string]interface{} {
+	if p.minP > 0 {
+		if options == nil {
+			options = make(map[string]interface{}, 1)
+		}
+		options["min_p"] = p.minP
 	}
+	return options
+}
+
+func (p *OllamaProvider) Generate(ctx context.Context, prompt string, opts interfaces.GenerationOptions) (string, error) {
+	options := p.applyTokenOptions(map[string]interface{}{
+		"temperature": opts.Temperature,
+	})
 	if opts.TopP > 0 {
 		options["top_p"] = opts.TopP
 	}
@@ -93,9 +117,9 @@ func (p *OllamaProvider) Generate(ctx context.Context, prompt string, opts inter
 }
 
 func (p *OllamaProvider) Stream(ctx context.Context, prompt string, opts interfaces.GenerationOptions, callback func(chunk string)) error {
-	options := map[string]interface{}{
+	options := p.applyTokenOptions(map[string]interface{}{
 		"temperature": opts.Temperature,
-	}
+	})
 	if opts.TopP > 0 {
 		options["top_p"] = opts.TopP
 	}
@@ -151,13 +175,19 @@ func (p *OllamaProvider) Stream(ctx context.Context, prompt string, opts interfa
 }
 
 func (p *OllamaProvider) GenerateStructured(ctx context.Context, prompt string, schema json.RawMessage) (json.RawMessage, error) {
-	// Ollama support for format: "json"
+	// Ollama supports format: "json" (or a full JSON schema object).
+	// options carry temperature/num_predict so structured calls aren't
+	// unbounded and don't run at the model's default temperature.
+	options := p.applyTokenOptions(map[string]interface{}{})
+	options["temperature"] = 0.2 // low temp keeps tool calls deterministic
+	options["num_predict"] = 1500
 	reqBody := map[string]interface{}{
-		"model":  p.model,
-		"prompt": prompt,
-		"system": p.systemPrompt,
-		"stream": false,
-		"format": "json",
+		"model":   p.model,
+		"prompt":  prompt,
+		"system":  p.systemPrompt,
+		"stream":  false,
+		"format":  formatFromSchema(schema),
+		"options": options,
 	}
 	if p.think != nil {
 		reqBody["think"] = *p.think
@@ -194,6 +224,19 @@ func (p *OllamaProvider) GenerateStructured(ctx context.Context, prompt string, 
 	return json.RawMessage(result.Response), nil
 }
 
+// formatFromSchema returns the Ollama `format` value for a JSON schema.
+// Ollama accepts either the literal "json" or a full JSON Schema object; we
+// pass the schema through when available for deterministic structured output.
+func formatFromSchema(schema json.RawMessage) interface{} {
+	if len(schema) > 0 {
+		var v interface{}
+		if json.Unmarshal(schema, &v) == nil {
+			return v
+		}
+	}
+	return "json"
+}
+
 func (p *OllamaProvider) Embed(ctx context.Context, text string) ([]float32, error) {
 	// Ollama embeddings endpoint is usually /api/embeddings
 	// We might need a different URL for this if url is /api/generate
@@ -204,10 +247,14 @@ func (p *OllamaProvider) Embed(ctx context.Context, text string) ([]float32, err
 		baseURL = baseURL[:len(baseURL)-9] + "/embeddings"
 	}
 
-	requestBody, err := json.Marshal(map[string]interface{}{
+	body := map[string]interface{}{
 		"model":  p.model,
 		"prompt": text,
-	})
+	}
+	if opts := p.applyTokenOptions(nil); opts != nil {
+		body["options"] = opts
+	}
+	requestBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}

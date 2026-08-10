@@ -93,8 +93,8 @@ func (pe *ProactiveEngine) RecordAction(action string, context string) {
 }
 
 func (pe *ProactiveEngine) AnalyzePatterns() []ProactiveEvent {
-	pe.mu.RLock()
-	defer pe.mu.RUnlock()
+	pe.mu.Lock()
+	defer pe.mu.Unlock()
 
 	if !pe.enabled {
 		return nil
@@ -119,6 +119,11 @@ func (pe *ProactiveEngine) AnalyzePatterns() []ProactiveEvent {
 	}
 
 	events = append(events, pe.checkSystemEvents()...)
+
+	// Push into the queue so GetPendingEvents (drained by proactiveMonitor in
+	// loop.go) actually gets something to speak. Previously events were
+	// computed and discarded — the whole engine was inert.
+	pe.eventQueue = append(pe.eventQueue, events...)
 
 	return events
 }

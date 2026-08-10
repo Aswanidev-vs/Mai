@@ -1,7 +1,6 @@
 package cognition
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -79,10 +78,11 @@ func TestBuildPrompt_Conversation(t *testing.T) {
 
 	prompt := engine.BuildPrompt(ctx)
 
-	assert.Contains(t, prompt, "Mai")
+	// Personality now lives single-source in the provider `system` field
+	// (config.yaml llm.system_prompt); the scaffold carries situation only.
+	assert.NotContains(t, prompt, "You are Mai")
 	assert.Contains(t, prompt, "What's the weather like?")
-	assert.Contains(t, prompt, "don't know")
-	assert.Contains(t, prompt, "never make up facts")
+	assert.Contains(t, prompt, "Respond:")
 }
 
 func TestBuildPrompt_ConversationWithEmotion(t *testing.T) {
@@ -120,7 +120,7 @@ func TestBuildPrompt_ConversationWithMemory(t *testing.T) {
 func TestBuildPrompt_ContextBudget(t *testing.T) {
 	engine := NewPromptEngine()
 
-	// Create very large context that exceeds the 3000 char budget
+	// Create very large context that exceeds the char budget
 	largeWM := ""
 	for i := 0; i < 100; i++ {
 		largeWM += "This is a long working memory entry that adds up. "
@@ -139,8 +139,9 @@ func TestBuildPrompt_ContextBudget(t *testing.T) {
 
 	prompt := engine.BuildPrompt(ctx)
 
-	// Total prompt should be reasonable (under ~5000 chars including system prompt)
-	assert.Less(t, len(prompt), 6000, "prompt should respect context budget")
+	// Total prompt should stay within budget + scaffold overhead (~9k):
+	// RAG get's 60% of 8000, working memory 40% — input is ~12k chars raw.
+	assert.Less(t, len(prompt), 10000, "prompt should respect context budget")
 	// Should still contain some context (not empty)
 	assert.Contains(t, prompt, "RECENT CONTEXT")
 	assert.Contains(t, prompt, "RELEVANT INFO")
@@ -290,5 +291,8 @@ func TestBuildSystemPrompt(t *testing.T) {
 	prompt := BuildSystemPrompt("base prompt", ctx)
 
 	require.NotEmpty(t, prompt)
-	assert.True(t, strings.Contains(prompt, "Mai"))
+	// Personality is single-sourced in the provider system field — the
+	// scaffold must NOT re-declare an identity.
+	assert.Contains(t, prompt, "Hello")
+	assert.NotContains(t, prompt, "You are Mai")
 }

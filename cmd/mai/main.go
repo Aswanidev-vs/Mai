@@ -112,14 +112,17 @@ func main() {
 	var lastMicMu sync.Mutex
 	var sherpaMu sync.Mutex // Mutex for all other Sherpa-ONNX calls
 
-	// Post-TTS cooldown: suppress mic input for 300ms after TTS finishes to
+	// Post-TTS cooldown: suppress mic input briefly after TTS finishes to
 	// prevent room reverberation from reaching ASR as false user input.
-	var lastTTSEndTime time.Time
-	const ttsCooldown = 300 * time.Millisecond
+	// Stored as atomic UnixNano so the audio callback goroutine can read
+	// without holding a mutex.
+	var lastTTSEndNano atomic.Int64
+	const ttsCooldown = 150 * time.Millisecond
 
 	// Post-TTS AEC window: continue echo cancellation for this long after
-	// TTS finishes, so room reverberation doesn't pass through to ASR.
-	const postTTSAECWindow = 800 * time.Millisecond
+	// TTS finishes, so room reverberation doesn't pass through to ASR. 2.5s
+	// covers typical room reverb + browser playback tail.
+	const postTTSAECWindow = 2500 * time.Millisecond
 
 	// Shared across main scope so greeting / TTS / browser-mic paths can reach the bus.
 	var bus interfaces.EventBus
@@ -131,7 +134,7 @@ func main() {
 
 	// Echo cancellation for genuine barge-in: subtracts Mai's own TTS (echoed
 	// through the mic) so only a real second speaker survives in the residual.
-	echoCanceller := NewEchoCanceller(1024)
+	echoCanceller := NewEchoCanceller(4096)
 	var bargeCount int
 	var ttsStartedAt time.Time
 
@@ -244,65 +247,150 @@ func main() {
 
 	log.Println("[VAD] Voice activity detector ready")
 
-	// 3. Initialize ASR
+	// 3. Initialize ASR (supports: qwen3, nemotron, omnilingual, transducer)
 	var recognizer *sherpa.OnlineRecognizer
 	var offlineRecognizer *sherpa.OfflineRecognizer
 	var asrStream *sherpa.OnlineStream
+	// Dual-mode fallback
+	var fallbackOfflineRecognizer *sherpa.OfflineRecognizer
 
-	if cfg.ASR.Type == "qwen3" {
+	switch cfg.ASR.ActiveModel {
+	case "qwen3":
 		offlineConfig := sherpa.OfflineRecognizerConfig{}
 		offlineConfig.FeatConfig = sherpa.FeatureConfig{SampleRate: 16000, FeatureDim: 80}
-		offlineConfig.ModelConfig.Qwen3ASR.ConvFrontend = join(cfg.ASR.ModelDir, cfg.ASR.ConvFrontend)
-		offlineConfig.ModelConfig.Qwen3ASR.Encoder = join(cfg.ASR.ModelDir, cfg.ASR.Encoder)
-		offlineConfig.ModelConfig.Qwen3ASR.Decoder = join(cfg.ASR.ModelDir, cfg.ASR.Decoder)
-		offlineConfig.ModelConfig.Qwen3ASR.Tokenizer = join(cfg.ASR.ModelDir, cfg.ASR.Tokenizer)
+		offlineConfig.ModelConfig.Qwen3ASR.ConvFrontend = join(cfg.ASR.Qwen3.ModelDir, cfg.ASR.Qwen3.ConvFrontend)
+		offlineConfig.ModelConfig.Qwen3ASR.Encoder = join(cfg.ASR.Qwen3.ModelDir, cfg.ASR.Qwen3.Encoder)
+		offlineConfig.ModelConfig.Qwen3ASR.Decoder = join(cfg.ASR.Qwen3.ModelDir, cfg.ASR.Qwen3.Decoder)
+		offlineConfig.ModelConfig.Qwen3ASR.Tokenizer = join(cfg.ASR.Qwen3.ModelDir, cfg.ASR.Qwen3.Tokenizer)
+		offlineConfig.ModelConfig.NumThreads = cfg.ASR.NumThreads
+		offlineConfig.ModelConfig.Provider = cfg.ASR.Provider
+		offlineConfig.DecodingMethod = cfg.ASR.Qwen3.DecodingMethod
+		if offlineConfig.DecodingMethod == "" {
+			offlineConfig.DecodingMethod = "greedy_search"
+		}
+
+		offlineRecognizer = sherpa.NewOfflineRecognizer(&offlineConfig)
+		if offlineRecognizer == nil {
+			log.Fatal("[ASR] Failed to create Qwen3 recognizer")
+		}
+		defer sherpa.DeleteOfflineRecognizer(offlineRecognizer)
+		log.Println("[ASR] Offline Qwen3 recognizer ready")
+
+	case "nemotron":
+		asrConfig := sherpa.OnlineRecognizerConfig{}
+		asrConfig.FeatConfig = sherpa.FeatureConfig{SampleRate: 16000, FeatureDim: 80}
+		asrConfig.ModelConfig.Transducer.Encoder = join(cfg.ASR.Nemotron.ModelDir, cfg.ASR.Nemotron.Encoder)
+		asrConfig.ModelConfig.Transducer.Decoder = join(cfg.ASR.Nemotron.ModelDir, cfg.ASR.Nemotron.Decoder)
+		asrConfig.ModelConfig.Transducer.Joiner = join(cfg.ASR.Nemotron.ModelDir, cfg.ASR.Nemotron.Joiner)
+		asrConfig.ModelConfig.Tokens = join(cfg.ASR.Nemotron.ModelDir, cfg.ASR.Nemotron.Tokens)
+		asrConfig.ModelConfig.NumThreads = cfg.ASR.NumThreads
+		asrConfig.ModelConfig.Provider = cfg.ASR.Provider
+		asrConfig.DecodingMethod = cfg.ASR.Nemotron.DecodingMethod
+		if asrConfig.DecodingMethod == "" {
+			asrConfig.DecodingMethod = "greedy_search"
+		}
+		asrConfig.MaxActivePaths = cfg.ASR.Nemotron.MaxActivePaths
+		asrConfig.EnableEndpoint = cfg.ASR.Nemotron.EnableEndpoint
+		asrConfig.Rule1MinTrailingSilence = cfg.ASR.Nemotron.Rule1MinTrailingSilence
+		asrConfig.Rule2MinTrailingSilence = cfg.ASR.Nemotron.Rule2MinTrailingSilence
+		asrConfig.Rule3MinUtteranceLength = cfg.ASR.Nemotron.Rule3MinUtteranceLength
+
+		recognizer = sherpa.NewOnlineRecognizer(&asrConfig)
+		if recognizer == nil {
+			log.Fatal("[ASR] Failed to create Nemotron recognizer")
+		}
+		defer sherpa.DeleteOnlineRecognizer(recognizer)
+
+		asrStream = sherpa.NewOnlineStream(recognizer)
+		if asrStream == nil {
+			log.Fatal("[ASR] Failed to create Nemotron stream")
+		}
+		defer sherpa.DeleteOnlineStream(asrStream)
+		log.Println("[ASR] Streaming Nemotron recognizer ready")
+
+	case "omnilingual":
+		offlineConfig := sherpa.OfflineRecognizerConfig{}
+		offlineConfig.FeatConfig = sherpa.FeatureConfig{SampleRate: 16000, FeatureDim: 80}
+		offlineConfig.ModelConfig.ZipformerCtc.Model = join(cfg.ASR.Omnilingual.ModelDir, cfg.ASR.Omnilingual.Model)
+		offlineConfig.ModelConfig.Tokens = join(cfg.ASR.Omnilingual.ModelDir, cfg.ASR.Omnilingual.Tokens)
 		offlineConfig.ModelConfig.NumThreads = cfg.ASR.NumThreads
 		offlineConfig.ModelConfig.Provider = cfg.ASR.Provider
 		offlineConfig.DecodingMethod = "greedy_search"
 
 		offlineRecognizer = sherpa.NewOfflineRecognizer(&offlineConfig)
 		if offlineRecognizer == nil {
-			log.Fatal("Failed to create Offline ASR recognizer")
+			log.Fatal("[ASR] Failed to create Omnilingual recognizer")
 		}
 		defer sherpa.DeleteOfflineRecognizer(offlineRecognizer)
-		log.Println("[ASR] Offline Qwen3 recognizer ready")
-	} else {
+		log.Println("[ASR] Offline Omnilingual recognizer ready (1600+ languages)")
+
+	case "transducer":
 		asrConfig := sherpa.OnlineRecognizerConfig{}
 		asrConfig.FeatConfig = sherpa.FeatureConfig{SampleRate: 16000, FeatureDim: 80}
-
-		if cfg.ASR.Type == "nemo" {
-			asrConfig.ModelConfig.NemoCtc.Model = join(cfg.ASR.ModelDir, cfg.ASR.Encoder)
-			asrConfig.ModelConfig.Tokens = join(cfg.ASR.ModelDir, cfg.ASR.Tokens)
-		} else {
-			// Default to Transducer (Zipformer)
-			asrConfig.ModelConfig.Transducer.Encoder = join(cfg.ASR.ModelDir, cfg.ASR.Encoder)
-			asrConfig.ModelConfig.Transducer.Decoder = join(cfg.ASR.ModelDir, cfg.ASR.Decoder)
-			asrConfig.ModelConfig.Transducer.Joiner = join(cfg.ASR.ModelDir, cfg.ASR.Joiner)
-			asrConfig.ModelConfig.Tokens = join(cfg.ASR.ModelDir, cfg.ASR.Tokens)
-		}
-
+		asrConfig.ModelConfig.Transducer.Encoder = join(cfg.ASR.Transducer.ModelDir, cfg.ASR.Transducer.Encoder)
+		asrConfig.ModelConfig.Transducer.Decoder = join(cfg.ASR.Transducer.ModelDir, cfg.ASR.Transducer.Decoder)
+		asrConfig.ModelConfig.Transducer.Joiner = join(cfg.ASR.Transducer.ModelDir, cfg.ASR.Transducer.Joiner)
+		asrConfig.ModelConfig.Tokens = join(cfg.ASR.Transducer.ModelDir, cfg.ASR.Transducer.Tokens)
 		asrConfig.ModelConfig.NumThreads = cfg.ASR.NumThreads
 		asrConfig.ModelConfig.Provider = cfg.ASR.Provider
-		asrConfig.DecodingMethod = cfg.ASR.DecodingMethod
-		asrConfig.MaxActivePaths = cfg.ASR.MaxActivePaths
-		asrConfig.EnableEndpoint = cfg.ASR.EnableEndpoint
-		asrConfig.Rule1MinTrailingSilence = cfg.ASR.Rule1MinTrailingSilence
-		asrConfig.Rule2MinTrailingSilence = cfg.ASR.Rule2MinTrailingSilence
-		asrConfig.Rule3MinUtteranceLength = cfg.ASR.Rule3MinUtteranceLength
+		asrConfig.DecodingMethod = cfg.ASR.Transducer.DecodingMethod
+		if asrConfig.DecodingMethod == "" {
+			asrConfig.DecodingMethod = "greedy_search"
+		}
+		asrConfig.MaxActivePaths = cfg.ASR.Transducer.MaxActivePaths
+		asrConfig.EnableEndpoint = cfg.ASR.Transducer.EnableEndpoint
+		asrConfig.Rule1MinTrailingSilence = cfg.ASR.Transducer.Rule1MinTrailingSilence
+		asrConfig.Rule2MinTrailingSilence = cfg.ASR.Transducer.Rule2MinTrailingSilence
+		asrConfig.Rule3MinUtteranceLength = cfg.ASR.Transducer.Rule3MinUtteranceLength
 
 		recognizer = sherpa.NewOnlineRecognizer(&asrConfig)
 		if recognizer == nil {
-			log.Fatal("Failed to create ASR recognizer")
+			log.Fatal("[ASR] Failed to create Transducer recognizer")
 		}
 		defer sherpa.DeleteOnlineRecognizer(recognizer)
 
 		asrStream = sherpa.NewOnlineStream(recognizer)
 		if asrStream == nil {
-			log.Fatal("Failed to create ASR stream")
+			log.Fatal("[ASR] Failed to create Transducer stream")
 		}
 		defer sherpa.DeleteOnlineStream(asrStream)
-		log.Println("[ASR] Streaming recognizer ready")
+		log.Println("[ASR] Streaming Transducer recognizer ready")
+
+	default:
+		log.Fatalf("[ASR] Unknown active_model: %q (valid: qwen3, nemotron, omnilingual, transducer)", cfg.ASR.ActiveModel)
 	}
+
+	// Initialize dual-mode fallback recognizer if enabled
+	if cfg.ASR.DualMode.Enabled && cfg.ASR.DualMode.FallbackModel != "" {
+		switch cfg.ASR.DualMode.FallbackModel {
+		case "qwen3":
+			fbConfig := sherpa.OfflineRecognizerConfig{}
+			fbConfig.FeatConfig = sherpa.FeatureConfig{SampleRate: 16000, FeatureDim: 80}
+			fbConfig.ModelConfig.Qwen3ASR.ConvFrontend = join(cfg.ASR.Qwen3.ModelDir, cfg.ASR.Qwen3.ConvFrontend)
+			fbConfig.ModelConfig.Qwen3ASR.Encoder = join(cfg.ASR.Qwen3.ModelDir, cfg.ASR.Qwen3.Encoder)
+			fbConfig.ModelConfig.Qwen3ASR.Decoder = join(cfg.ASR.Qwen3.ModelDir, cfg.ASR.Qwen3.Decoder)
+			fbConfig.ModelConfig.Qwen3ASR.Tokenizer = join(cfg.ASR.Qwen3.ModelDir, cfg.ASR.Qwen3.Tokenizer)
+			fbConfig.ModelConfig.NumThreads = cfg.ASR.NumThreads
+			fbConfig.ModelConfig.Provider = cfg.ASR.Provider
+			fbConfig.DecodingMethod = "greedy_search"
+			fallbackOfflineRecognizer = sherpa.NewOfflineRecognizer(&fbConfig)
+		case "omnilingual":
+			fbConfig := sherpa.OfflineRecognizerConfig{}
+			fbConfig.FeatConfig = sherpa.FeatureConfig{SampleRate: 16000, FeatureDim: 80}
+			fbConfig.ModelConfig.ZipformerCtc.Model = join(cfg.ASR.Omnilingual.ModelDir, cfg.ASR.Omnilingual.Model)
+			fbConfig.ModelConfig.Tokens = join(cfg.ASR.Omnilingual.ModelDir, cfg.ASR.Omnilingual.Tokens)
+			fbConfig.ModelConfig.NumThreads = cfg.ASR.NumThreads
+			fbConfig.ModelConfig.Provider = cfg.ASR.Provider
+			fbConfig.DecodingMethod = "greedy_search"
+			fallbackOfflineRecognizer = sherpa.NewOfflineRecognizer(&fbConfig)
+		}
+		if fallbackOfflineRecognizer != nil {
+			defer sherpa.DeleteOfflineRecognizer(fallbackOfflineRecognizer)
+			log.Printf("[ASR] Dual-mode fallback ready: %s\n", cfg.ASR.DualMode.FallbackModel)
+		}
+	}
+
+	_ = fallbackOfflineRecognizer // used in dual-mode audio processing below
 
 	// 4. Initialize TTS
 	ttsConfig := sherpa.OfflineTtsConfig{}
@@ -504,20 +592,16 @@ func main() {
 			publishTTSAudioChunk(bus, nil, 44100, true)
 		} else {
 			// ── Local-only path: streaming playback ──
-			atomic.StoreInt32(&ttsPlaying, 1)
-			atomic.StoreInt32(&stopPlayback, 0)
 			_ = playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
 				synthesize(text, speed, func(samples []float32) bool {
 					if atomic.LoadInt32(&stopPlayback) != 0 {
 						return false
 					}
-					// Resample TTS native rate to 44.1k for local playback.
 					resampled := ttsToBrowserResampler.resample(samples)
 					ch <- resampled
 					return true
 				})
 			})
-			atomic.StoreInt32(&ttsPlaying, 0)
 		}
 
 		lastResponseMu.Lock()
@@ -552,12 +636,12 @@ func main() {
 			if len(ttsSentCh) == 0 {
 				atomic.StoreInt32(&isSpeaking, 0)
 				atomic.StoreInt32(&stopPlayback, 0) // ensure clean state for next response
-				lastTTSEndTime = time.Now()
+				lastTTSEndNano.Store(time.Now().UnixNano())
 			}
 		}
 		atomic.StoreInt32(&isSpeaking, 0)
 		atomic.StoreInt32(&stopPlayback, 0)
-		lastTTSEndTime = time.Now()
+		lastTTSEndNano.Store(time.Now().UnixNano())
 	}()
 	// Test TTS on startup
 	go func() {
@@ -582,6 +666,9 @@ func main() {
 	var agentBridge *perception.Bridge
 	// Cancels the in-flight LLM stream when a genuine barge-in occurs.
 	var interruptCurrent func()
+	// The cognitive orchestrator — reached from the audio pipeline for
+	// prosody ingestion, so it must live in main() scope, not the agentic block.
+	var orch *agent.Orchestrator
 	if cfg.Agentic.Enabled {
 		log.Println("[BOOT] Initializing Agentic Architecture...")
 		bus = events.NewBus()
@@ -645,7 +732,7 @@ func main() {
 		react := cognition.NewReActLoop(llmProvider, registry, workingMem)
 
 		// Orchestrator
-		orch := agent.NewOrchestrator(bus, memManager, llmProvider, registry, react,
+		orch = agent.NewOrchestrator(bus, memManager, llmProvider, registry, react,
 			interfaces.GenerationOptions{
 				Temperature: cfg.LLM.Sampling.Temperature,
 				TopP:        cfg.LLM.Sampling.TopP,
@@ -769,7 +856,6 @@ func main() {
 	go func() {
 		defer wg.Done()
 		for task := range workerChan {
-			atomic.StoreInt32(&isSpeaking, 1) // Pause ASR while thinking and talking
 			log.Printf("[LLM] Thinking about: %s", task.Text)
 
 			// Play thinking chime only for reasoning tasks (not simple chat)
@@ -821,6 +907,7 @@ func main() {
 			}
 
 			// Streaming TTS: generate chunks and play them as they arrive.
+			atomic.StoreInt32(&isSpeaking, 1) // Block ASR during TTS playback
 			atomic.StoreInt32(&ttsPlaying, 1)
 			ttsStartedAt = time.Now()
 			bargeCount = 0
@@ -860,12 +947,23 @@ func main() {
 	var lastText string
 	var sessionText string
 
+	// Prosody sample buffer: the most recent user utterance (16kHz), capped at
+	// ~3s to bound analysis cost. Fed to the orchestrator's prosody→emotion
+	// path at segment end so Mai hears *how* the user said something.
+	var prosodySamples []float32
+	const prosodyMaxSamples = 16000 * 3 // 3 seconds
+
 	// Audio callback
 	// runListening: the VAD + ASR + segment-end detection pipeline.
 	// Shared by local mic (in listening state) and browser mic.
 	runListening := func(samples []float32) {
 		if atomic.LoadInt32(&ttsPlaying) != 0 {
 			return
+		}
+		// Accumulate the live utterance for prosody analysis (both ASR paths).
+		prosodySamples = append(prosodySamples, samples...)
+		if len(prosodySamples) > prosodyMaxSamples {
+			prosodySamples = prosodySamples[len(prosodySamples)-prosodyMaxSamples:]
 		}
 		vadBuffer.Push(samples)
 		for vadBuffer.Size() >= cfg.VAD.WindowSize {
@@ -894,10 +992,18 @@ func main() {
 				// by adding a synthetic silence chunk won't help — instead
 				// just process what we have
 				if offlineRecognizer != nil && len(sessionSamples) > 0 {
-					log.Println("[ASR] Processing oversized segment with Offline Qwen3...")
+					log.Printf("[ASR] Processing oversized segment with %s...\n", cfg.ASR.ActiveModel)
 					offlineStream := sherpa.NewOfflineStream(offlineRecognizer)
-					if cfg.ASR.Language != "" {
-						offlineStream.SetOption("language", cfg.ASR.Language)
+					// Set language for models that support it (qwen3, omnilingual)
+					var lang string
+					switch cfg.ASR.ActiveModel {
+					case "qwen3":
+						lang = cfg.ASR.Qwen3.Language
+					case "omnilingual":
+						lang = cfg.ASR.Omnilingual.Language
+					}
+					if lang != "" && lang != "auto" {
+						offlineStream.SetOption("language", lang)
 					}
 					offlineStream.AcceptWaveform(16000, sessionSamples)
 					offlineRecognizer.Decode(offlineStream)
@@ -937,10 +1043,18 @@ func main() {
 				}
 				sessionSamples = nil
 			} else if offlineRecognizer != nil {
-				log.Println("\n[ASR] Processing segment with Offline Qwen3...")
+				log.Printf("\n[ASR] Processing segment with %s...\n", cfg.ASR.ActiveModel)
 				offlineStream := sherpa.NewOfflineStream(offlineRecognizer)
-				if cfg.ASR.Language != "" {
-					offlineStream.SetOption("language", cfg.ASR.Language)
+				// Set language for models that support it (qwen3, omnilingual)
+				var lang string
+				switch cfg.ASR.ActiveModel {
+				case "qwen3":
+					lang = cfg.ASR.Qwen3.Language
+				case "omnilingual":
+					lang = cfg.ASR.Omnilingual.Language
+				}
+				if lang != "" && lang != "auto" {
+					offlineStream.SetOption("language", lang)
 				}
 				offlineStream.AcceptWaveform(16000, sessionSamples)
 				offlineRecognizer.Decode(offlineStream)
@@ -956,6 +1070,12 @@ func main() {
 			if sessionText != "" {
 				if agentBridge != nil {
 					log.Println("[AGENT] Routing to cognitive orchestrator...")
+					// Feed the voice-derived emotion to Mai *before* the
+					// transcription event so HandleInput can merge it with the
+					// text keywords ("I'm fine" said flatly vs. stressed).
+					if orch != nil && len(prosodySamples) > 0 {
+						orch.IngestProsody(orch.AnalyzeProsody(prosodySamples, 16000))
+					}
 					go agentBridge.PublishTranscription(sessionText)
 				} else {
 					log.Println("[PIPELINE] Routing to legacy pipeline...")
@@ -967,6 +1087,7 @@ func main() {
 				state = StateWakeWord
 				sessionText = ""
 				sessionSamples = nil
+				prosodySamples = nil
 				if recognizer != nil {
 					recognizer.Reset(asrStream)
 				}
@@ -1025,6 +1146,7 @@ func main() {
 						if interruptCurrent != nil {
 							interruptCurrent()
 						}
+						echoCanceller.Reset()
 						state = StateListening
 						sessionText = ""
 						lastText = ""
@@ -1062,29 +1184,29 @@ func main() {
 		}
 
 		// Post-TTS AEC: after TTS finishes, continue echo cancellation for
-		// postTTSAECWindow so room reverberation doesn't reach ASR. If the
-		// residual is low (just echo), drop the frame. If high (real speech),
-		// let it through for normal processing.
-		if !lastTTSEndTime.IsZero() && time.Since(lastTTSEndTime) < postTTSAECWindow {
-			if echoCanceller != nil {
-				clean := echoCanceller.Process(samples)
-				var csum float32
-				for _, s := range clean {
-					csum += s * s
+		// postTTSAECWindow so room reverberation doesn't reach ASR. During the
+		// first ttsCooldown the echo canceller settles; after that, only
+		// genuine speech (residual above threshold) passes through.
+		if nano := lastTTSEndNano.Load(); nano > 0 {
+			elapsed := time.Since(time.Unix(0, nano))
+			if elapsed < postTTSAECWindow {
+				if echoCanceller != nil {
+					clean := echoCanceller.Process(samples)
+					var csum float32
+					for _, s := range clean {
+						csum += s * s
+					}
+					crms := math.Sqrt(float64(csum / float32(len(clean))))
+					if crms < cfg.Audio.BargeInThreshold {
+						return // just echo, drop it
+					}
+					// Residual above threshold — genuine speech, fall through
+				} else {
+					return
 				}
-				crms := math.Sqrt(float64(csum / float32(len(clean))))
-				if crms < cfg.Audio.BargeInThreshold {
-					return // just echo, drop it
-				}
-				// Residual above threshold — genuine speech, fall through
 			} else {
-				return
+				lastTTSEndNano.Store(0)
 			}
-		}
-
-		// Clear the lastTTSEndTime after the AEC window expires
-		if !lastTTSEndTime.IsZero() && time.Since(lastTTSEndTime) >= postTTSAECWindow {
-			lastTTSEndTime = time.Time{}
 		}
 
 		if fromBrowser {
@@ -1167,13 +1289,7 @@ func main() {
 					// Route greeting through the same speak() helper so it streams
 					// to the browser companion (lips sync) when a client is connected.
 					go func() {
-						greetings := []string{
-							"Yes Sir. How can I assist you?",
-							"At your service. What is the objective?",
-							"I'm here. What do you need?",
-						}
-						greet := greetings[time.Now().UnixNano()%int64(len(greetings))]
-						speak(greet, cfg.TTS.Supertonic.Speed)
+						speak(pickGreeting(), cfg.TTS.Supertonic.Speed)
 					}()
 
 					state = StateListening
@@ -1230,6 +1346,42 @@ func main() {
 	}
 }
 
+// pickGreeting returns a persona-consistent, time-of-day aware opener instead
+// of the old JARVIS-style "Yes Sir / At your service" lines. Rotated per
+// hour so repeated wake-ups don't sound scripted ("greet by context" — the
+// single biggest companionship cue per companion-AI research).
+func pickGreeting() string {
+	hour := time.Now().Hour()
+	var pool []string
+	switch {
+	case hour >= 5 && hour < 12:
+		pool = []string{
+			"Good morning. What are we getting into today?",
+			"Morning. I'm awake. What do you need?",
+			"Good morning, Aswani-kun.",
+		}
+	case hour >= 12 && hour < 17:
+		pool = []string{
+			"Hey. What's on your mind?",
+			"I'm here. What do we have today?",
+			"Good afternoon. What do you need?",
+		}
+	case hour >= 17 && hour < 22:
+		pool = []string{
+			"Evening. I'm with you.",
+			"Hey, good evening. What are we doing?",
+			"Evening, Aswani-kun. I'm here.",
+		}
+	default:
+		pool = []string{
+			"Still up? I'm here. What do you need?",
+			"Night owl hours. What's on your mind?",
+			"Late one, hm? Say the word.",
+		}
+	}
+	return pool[time.Now().UnixNano()%int64(len(pool))]
+}
+
 // startOllama starts the ollama serve process and returns a function to kill it.
 func startOllama() func() {
 	cmd := exec.Command("ollama", "serve")
@@ -1260,6 +1412,9 @@ func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt strin
 			"top_p":       cfg.LLM.Sampling.TopP,
 			"num_predict": cfg.LLM.Sampling.MaxTokens,
 		},
+	}
+	if cfg.LLM.Sampling.MinP > 0 {
+		body["options"].(map[string]interface{})["min_p"] = cfg.LLM.Sampling.MinP
 	}
 	if cfg.LLM.Think != nil {
 		body["think"] = *cfg.LLM.Think

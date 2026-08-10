@@ -48,6 +48,13 @@ type Orchestrator struct {
 	// a second time, we drop it instead of speaking it back.
 	recentUserInputs []string
 
+	// lastProsody is the most recent voice-derived emotion state, ingested by
+	// the audio pipeline (main.go) after each user utterance segment. Merged
+	// over text keywords in HandleInput — the voice is the stronger signal.
+	prosodyMu    sync.Mutex
+	lastProsody  personality.EmotionState
+	lastProsodyAt time.Time
+
 	DirectAction func(text string) (bool, string, error)
 	TTSFunc      func(text string, speed float32)
 
@@ -68,7 +75,7 @@ func NewOrchestrator(
 	skillRegistry := skills.LoadRegistry()
 	skillsRunner := skills.NewRunner(skillRegistry, reactLoop, llm, mem)
 
-	return &Orchestrator{
+	o := &Orchestrator{
 		bus:            bus,
 		memory:         mem,
 		llm:            llm,
@@ -87,6 +94,87 @@ func NewOrchestrator(
 		skillsRunner:   skillsRunner,
 		genOpts:        genOpts,
 	}
+
+	// Real context compression: when working memory drops old entries, the
+	// LLM summarizes them and the summary is re-injected, so long sessions
+	// keep a thread of continuity instead of "[auto-compact: N summarized]".
+	if wm, ok := mem.Working().(*memory.WorkingMemory); ok {
+		wm.SetOnCompact(o.summarizeDropped)
+	}
+
+	// ReAct tool steps are separate LLM calls; re-inject session context
+	// (recent conversation, user profile, emotion) on every step so the
+	// persona doesn't go blank between tool calls.
+	reactLoop.SetContextSnippet(o.sessionContextSnippet)
+
+	return o
+}
+
+// sessionContextSnippet builds the compact session context injected into
+// every ReAct step prompt: recent conversation, user profile, current emotion.
+func (o *Orchestrator) sessionContextSnippet() string {
+	const budget = 1400 // chars — keep tool-turn prompts lean on modest hardware
+
+	var b strings.Builder
+	if wm := o.memory.Working().GetContext(); wm != "" {
+		if len(wm) > budget {
+			wm = wm[len(wm)-budget:]
+		}
+		b.WriteString("RECENT CONVERSATION:\n")
+		b.WriteString(wm)
+		b.WriteByte('\n')
+	}
+	if profile := o.userModel.GetContextString(); profile != "" {
+		b.WriteString("USER PROFILE:\n")
+		b.WriteString(profile)
+		b.WriteByte('\n')
+	}
+	if em := o.emotion.GetCurrent(); em.Type != personality.EmotionNeutral && em.Confidence >= 0.5 {
+		b.WriteString("USER'S CURRENT MOOD: ")
+		b.WriteString(string(em.Type))
+		b.WriteString("\n")
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// summarizeDropped compresses working-memory entries that were compacted away
+// and re-injects the summary as a fresh entry. Runs on a background goroutine
+// from WorkingMemory — never blocks the audio/turn hot path.
+func (o *Orchestrator) summarizeDropped(entries []interfaces.MemoryEntry) {
+	if o.llm == nil || len(entries) == 0 {
+		return
+	}
+
+	var b strings.Builder
+	b.WriteString("Summarize the following conversation history into a compact memory note (2-4 short lines, first person, plain text). Keep the user's name, topics, preferences, emotions, and unfinished tasks. Drop filler.\n\n")
+	for _, e := range entries {
+		if strings.TrimSpace(e.Content) == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "- [%s] %s\n", e.Type, e.Content)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	opts := o.genOpts
+	opts.Temperature = 0.2 // deterministic compression
+	summary, err := o.llm.Generate(ctx, b.String(), opts)
+	if err != nil {
+		log.Printf("[Memory] Summarization failed (keeping marker): %v", err)
+		return
+	}
+	summary = strings.TrimSpace(summary)
+	if summary == "" || summary == "..." {
+		return
+	}
+	log.Printf("[Memory] Working-memory compacted: %.100s...", summary)
+	o.memory.Working().Add(interfaces.MemoryEntry{
+		Type:      "summary",
+		Content:   summary,
+		Timestamp: time.Now().Unix(),
+		Metadata:  map[string]interface{}{"source": "auto-compact"},
+	})
 }
 
 func (o *Orchestrator) Start(ctx context.Context) error {
@@ -274,6 +362,11 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 
 	// --- Emotion & memory recording ---
 	emotionState := o.emotion.DetectFromText(text)
+	// The user's voice is a stronger emotional signal than their words
+	// ("I'm fine" + stressed prosody = stressed). Merge when it's fresh.
+	if ps, ok := o.recentProsody(); ok {
+		emotionState = o.emotion.MergeProsody(emotionState, ps)
+	}
 	log.Printf("[Agent] Emotion: %s (%.2f)", emotionState.Type, emotionState.Confidence)
 
 	o.userModel.RecordInteraction(text, "")
@@ -320,11 +413,18 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		}
 	}
 
-	// --- PATH 2: LLM handles everything else ---
-	// Classify the task type for prompt shaping, but let the LLM decide
-	// whether to use tools or answer from knowledge.
-	taskType := o.promptEngine.ClassifyTask(text, false)
-	log.Printf("[Agent] Routing to LLM (taskType=%s): %s", taskType, text)
+	// --- PATH 2: Route by task type ---
+	// Conversational turns (small talk, greeting, storytelling) go through the
+	// streaming companion path: persona + memory + emotion in the prompt,
+	// sentence-by-sentence TTS so audio starts while the LLM is still talking.
+	// Imperative/analytic turns keep using the ReAct tool loop.
+	taskType := o.promptEngine.ClassifyTask(text, hasCommandTriggers(text))
+	log.Printf("[Agent] Routing (taskType=%s): %s", taskType, text)
+
+	switch taskType {
+	case cognition.TaskConversation, cognition.TaskGreeting, cognition.TaskCreative:
+		return o.handleConversation(ctx, text, emotionState, taskType)
+	}
 
 	response, err := o.react.Execute(ctx, text)
 	if err != nil {
@@ -336,6 +436,28 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	adapted := o.adaptResponse(response, emotionState)
 	o.storeResponse(adapted)
 	return &interfaces.AgentResponse{Text: adapted, Success: true}, nil
+}
+
+// hasCommandTriggers reports whether the utterance looks like a direct
+// command that needs tool execution (ReAct) rather than plain conversation.
+func hasCommandTriggers(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	triggers := []string{
+		"open ", "launch ", "start ", "stop ", "close ", "quit ",
+		"send ", "type ", "press ", "click ",
+		"search ", "search for", "look up", "google", "weather", "news",
+		"play ", "pause ", "youtube", "download ",
+		"create ", "write a file", "save ", "delete ", "rename ", "move ",
+		"install ", "run ", "execute ", "compile ", "build ",
+		"set a timer", "remind me", "set an alarm", "volume", "brightness",
+		"screenshot", "what time", "what's the time",
+	}
+	for _, t := range triggers {
+		if strings.Contains(lower, t) {
+			return true
+		}
+	}
+	return false
 }
 
 // storeResponse records Mai's response in working and episodic memory.
@@ -358,13 +480,16 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		contextParts = append(contextParts, "Recent conversation:\n"+wm)
 	}
 
-	// Skip RAG and procedural lookups for short/trivial inputs (greetings, short questions).
-	// These are expensive vector queries that rarely help with simple conversational turns.
-	// Also skip for short self-contained questions that don't need historical context.
+	// Skip RAG and procedural lookups only for genuinely trivial short
+	// questions (greetings, "what is X" encyclopedic asks). Correctness: the
+	// old code set isSimpleQuestion = wordCount < 15 and never turned it off,
+	// so NO short turn ever retrieved memory. Now a short *statement* that is
+	// a real request ("I feel terrible about tomorrow's interview") does pull
+	// history, which is where companionship lives.
 	wordCount := len(strings.Fields(text))
 	simpleQuestionPrefixes := []string{"what ", "how ", "when ", "where ", "who ", "is ", "are ", "can ", "do ", "does ", "have "}
-	isSimpleQuestion := wordCount < 15
-	if isSimpleQuestion {
+	isSimpleQuestion := wordCount < 3
+	if wordCount < 15 && !isSimpleQuestion {
 		for _, p := range simpleQuestionPrefixes {
 			if strings.HasPrefix(lowerText, p) {
 				isSimpleQuestion = true
@@ -392,7 +517,7 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		TaskType:       taskType,
 		UserInput:      text,
 		Emotion:        emotion,
-		WorkingMemory:  o.memory.Working().GetContext(),
+		WorkingMemory:  wm, // already computed above — don't rebuild it
 		RAGContext:     "",
 		UserProfile:    "",
 		AvailableTools: "",
@@ -402,10 +527,10 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		promptCtx.RAGContext = strings.Join(contextParts, "\n---\n")
 	}
 
-	// Only include user profile and tools for substantive conversations, not short turns.
-	if wordCount >= 8 {
-		promptCtx.UserProfile = o.userModel.GetContextString()
-	}
+	// The persona ("behaves like someone who has known the user a long time")
+	// only works when the profile is actually present. Inject it every turn —
+	// it's compact (topics, frequent apps, preferences).
+	promptCtx.UserProfile = o.userModel.GetContextString()
 
 	fullPrompt := o.promptEngine.BuildPrompt(promptCtx)
 
@@ -443,7 +568,10 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 			}
 			sentence := cleanResponse(seg)
 			if strings.TrimSpace(sentence) != "" {
-				o.publishTTS(sentence)
+				// Speak the same cleaned text that gets stored — strip hedging
+				// BEFORE the audio is generated so what she says matches the
+				// transcript ("I'm not sure, but..." never reaches the mic).
+				o.publishTTS(stripHallucinationHedging(sentence))
 			}
 		}
 	}
@@ -454,7 +582,7 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	// Flush any trailing text that didn't end on a sentence boundary (unless interrupted).
 	if ctx.Err() == nil {
 		if rem := cleanResponse(pending.String()); strings.TrimSpace(rem) != "" {
-			o.publishTTS(rem)
+			o.publishTTS(stripHallucinationHedging(rem))
 		}
 		// Signal stream completion so the browser companion finalizes the transcript.
 		if o.bus != nil {
@@ -666,6 +794,26 @@ func (o *Orchestrator) AnalyzeProsody(samples []float32, sampleRate int) persona
 	return o.prosody.DetectEmotion(features)
 }
 
+// IngestProsody records a voice-derived emotion state, produced by
+// AnalyzeProsody in the audio pipeline after a user utterance segment ends.
+func (o *Orchestrator) IngestProsody(state personality.EmotionState) {
+	o.prosodyMu.Lock()
+	defer o.prosodyMu.Unlock()
+	o.lastProsody = state
+	o.lastProsodyAt = time.Now()
+}
+
+// recentProsody returns the last voice-derived emotion if it is recent enough
+// to belong to the current turn (< 3s — matches the utterance-to-ASR window).
+func (o *Orchestrator) recentProsody() (personality.EmotionState, bool) {
+	o.prosodyMu.Lock()
+	defer o.prosodyMu.Unlock()
+	if o.lastProsodyAt.IsZero() || time.Since(o.lastProsodyAt) > 3*time.Second {
+		return personality.EmotionState{}, false
+	}
+	return o.lastProsody, true
+}
+
 func (o *Orchestrator) GetUserModel() *UserModel {
 	return o.userModel
 }
@@ -736,12 +884,9 @@ func (o *Orchestrator) handleTranscription(event interfaces.Event) {
 		return
 	}
 
-	o.memory.Working().Add(interfaces.MemoryEntry{
-		Type:      "user_input",
-		Content:   text,
-		Timestamp: time.Now().Unix(),
-	})
-
+	// NOTE: no Working().Add here — HandleInput records the user input once
+	// (working + episodic). Adding again here would double every voice turn
+	// in the ring and trigger compaction prematurely.
 	resp, err := o.HandleInput(context.Background(), map[string]interface{}{"text": text})
 	if err != nil {
 		log.Printf("[Agent] Error handling input: %v", err)

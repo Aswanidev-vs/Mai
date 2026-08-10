@@ -41,19 +41,64 @@ vad:
   buffer_size_seconds: 20
 
 asr:
-  type: "nemo"
+  # Active model: "qwen3" | "nemotron" | "omnilingual" | "transducer"
+  active_model: "nemotron"
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
-  model_dir: "./sherpa-onnx-nemo-streaming-fast-conformer-ctc-en-480ms"
-  encoder: "model.onnx"
-  tokens: "tokens.txt"
-  decoding_method: "greedy_search"
-  max_active_paths: 4
-  enable_endpoint: 1
-  rule1_min_trailing_silence: 2.4
-  rule2_min_trailing_silence: 1.2
-  rule3_min_utterance_length: 20
+
+  # Dual-model: use a secondary offline model for unsupported languages
+  dual_mode:
+    enabled: false
+    fallback_model: "omnilingual"  # "qwen3" | "omnilingual"
+    fallback_languages: ["ml"]     # Languages that trigger fallback (e.g. "ml" = Malayalam)
+
+  # Qwen3-ASR (offline, LLM-based, 30+ languages)
+  qwen3:
+    model_dir: "./sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"
+    conv_frontend: "conv_frontend.onnx"
+    encoder: "encoder.int8.onnx"
+    decoder: "decoder.int8.onnx"
+    tokenizer: "tokenizer"
+    language: "en"
+    decoding_method: "greedy_search"
+
+  # Nemotron 3.5 (streaming transducer, 40 languages, Hindi supported)
+  nemotron:
+    model_dir: "./sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-1120ms-int8-2026-06-11"
+    encoder: "encoder.int8.onnx"
+    decoder: "decoder.int8.onnx"
+    joiner: "joiner.int8.onnx"
+    tokens: "tokens.txt"
+    language: "en"  # or "auto" for auto-detection
+    decoding_method: "greedy_search"
+    max_active_paths: 4
+    enable_endpoint: 1
+    rule1_min_trailing_silence: 2.4
+    rule2_min_trailing_silence: 1.2
+    rule3_min_utterance_length: 20
+
+  # Omnilingual ASR (offline CTC, 1600+ languages incl. Malayalam)
+  omnilingual:
+    model_dir: "./sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-v2-int8-2026-02-05"
+    model: "model.int8.onnx"
+    tokens: "tokens.txt"
+    language: "auto"
+
+  # Transducer (Zipformer, Conformer, etc.)
+  transducer:
+    model_dir: "./sherpa-onnx-streaming-zipformer-en-2023-02-21"
+    encoder: "encoder-epoch-99-avg-1.int8.onnx"
+    decoder: "decoder-epoch-99-avg-1.int8.onnx"
+    joiner: "joiner-epoch-99-avg-1.int8.onnx"
+    tokens: "tokens.txt"
+    language: "en"
+    decoding_method: "greedy_search"
+    max_active_paths: 4
+    enable_endpoint: 1
+    rule1_min_trailing_silence: 2.4
+    rule2_min_trailing_silence: 1.2
+    rule3_min_utterance_length: 20
 
 tts:
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
@@ -116,3 +161,11 @@ llm:
   url: "http://localhost:11434/api/generate"
   auto_start: true
   system_prompt: "You are Mai, a helpful and concise offline AI assistant. Keep your answers short and friendly."
+  # Note: keep_alive / num_ctx intentionally omitted — Ollama manages model
+  # residency (default 5-min unload) and auto-sizes the context by VRAM.
+  sampling:
+    temperature: 0.55
+    top_p: 0.85
+    # min_p filters low-probability tokens — small models benefit (~0.05).
+    min_p: 0.05
+    max_tokens: 400

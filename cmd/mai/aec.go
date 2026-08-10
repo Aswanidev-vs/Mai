@@ -105,8 +105,17 @@ func NewEchoCanceller(L int) *EchoCanceller {
 		ref: refBuffer,
 		L:   L,
 		w:   make([]float32, L),
-		mu:  0.2,
+		mu:  0.1,
 		eps: 1e-4,
+	}
+}
+
+// Reset clears the adaptive filter weights so the canceller re-learns
+// the echo path from scratch. Call after barge-in or when the acoustic
+// environment changes significantly.
+func (e *EchoCanceller) Reset() {
+	for k := range e.w {
+		e.w[k] = 0
 	}
 }
 

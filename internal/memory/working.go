@@ -18,13 +18,26 @@ type WorkingMemory struct {
 	head     int
 	count    int
 	maxChars int // auto-compact threshold (0 = no limit)
+
+	// onCompact is invoked (async) with the dropped entries whenever
+	// compaction discards them, so a summarizer can compress them for
+	// re-injection instead of losing them to "older entries summarized".
+	onCompact func(dropped []interfaces.MemoryEntry)
+}
+
+// SetOnCompact registers a callback invoked with the entries dropped during
+// compaction. Set by the agent so the LLM can summarize them asynchronously.
+func (m *WorkingMemory) SetOnCompact(fn func(dropped []interfaces.MemoryEntry)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onCompact = fn
 }
 
 func NewWorkingMemory(limit int) *WorkingMemory {
 	return &WorkingMemory{
 		entries:  make([]interfaces.MemoryEntry, limit),
 		limit:    limit,
-		maxChars: 4000, // default: ~1000 tokens, leaves room for system prompt + user input
+		maxChars: 12000, // ~3k tokens — fits any VRAM-sized context; summaries keep it bounded
 	}
 }
 
@@ -130,8 +143,9 @@ func (m *WorkingMemory) truncateContext(ctx string, maxChars int) string {
 	return result
 }
 
-// compactLocked summarizes old entries and keeps recent ones (must hold lock).
-// This is called when context exceeds maxChars.
+// compactLocked drops older entries, keeps recent ones, and hands the dropped
+// entries to the onCompact callback on a background goroutine so a summarizer
+// can compress them instead of losing them to a static marker (must hold lock).
 func (m *WorkingMemory) compactLocked() {
 	if m.count <= 3 {
 		return // too few entries to compact
@@ -139,10 +153,17 @@ func (m *WorkingMemory) compactLocked() {
 
 	// Keep the 3 most recent entries, mark the rest as summarized
 	keepCount := 3
-	newCount := 0
+	droppedCount := m.count - keepCount
 	start := (m.head - m.count + m.limit) % m.limit
 
+	// Snapshot the dropped entries before overwriting them.
+	dropped := make([]interfaces.MemoryEntry, 0, droppedCount)
+	for i := 0; i < droppedCount; i++ {
+		dropped = append(dropped, m.entries[(start+i)%m.limit])
+	}
+
 	// Shift entries: move recent ones to the beginning
+	newCount := 0
 	for i := m.count - keepCount; i < m.count; i++ {
 		idx := (start + i) % m.limit
 		m.entries[newCount] = m.entries[idx]
@@ -150,16 +171,22 @@ func (m *WorkingMemory) compactLocked() {
 	}
 
 	// Add a summary entry
-	summaryCount := m.count - keepCount
 	m.entries[newCount] = interfaces.MemoryEntry{
 		Type:    "system",
-		Content: fmt.Sprintf("[auto-compact: %d older entries summarized]", summaryCount),
+		Content: fmt.Sprintf("[auto-compact: %d older entries summarized]", droppedCount),
 	}
 	newCount++
 
 	// Reset state
 	m.head = newCount % m.limit
 	m.count = newCount
+
+	// Hand the dropped entries to the summarizer off the hot path. A
+	// summarizer SHOULD be set — without one this keeps the legacy
+	// placeholder-marker behavior.
+	if m.onCompact != nil {
+		go m.onCompact(dropped)
+	}
 }
 
 func (m *WorkingMemory) Clear() {
