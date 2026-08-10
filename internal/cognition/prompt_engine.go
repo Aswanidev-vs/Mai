@@ -37,33 +37,17 @@ type PromptContext struct {
 	ActiveSkill    string
 }
 
-type PromptEngine struct {
-	personalityName string
-}
+type PromptEngine struct{}
 
-func NewPromptEngine() *PromptEngine {
-	return &PromptEngine{
-		personalityName: "Mai",
-	}
-}
+func NewPromptEngine() *PromptEngine { return &PromptEngine{} }
 
 func (pe *PromptEngine) BuildPrompt(ctx PromptContext) string {
-	// Single unified prompt — personality stays constant regardless of task type.
-	// The only things that change are: what context we inject, and a brief
-	// instruction tail that hints at the desired response shape.
+	// Single unified prompt — personality comes from the provider `system`
+	// field (config.yaml llm.system_prompt); this scaffold only layers
+	// situation: time, emotion, memory, user profile, and task shape.
+	// Deliberately does NOT re-declare "You are Mai" — a second identity
+	// line dilutes the persona and costs tokens on every turn.
 	var b strings.Builder
-
-	// --- Core personality (always the same) ---
-	b.WriteString(fmt.Sprintf(`You are %s. Be natural, concise, and genuinely helpful — like a sharp friend who happens to know a lot.
-
-RULES:
-- Keep answers short unless the user clearly wants depth
-- If you don't know something, say so simply — never make up facts
-- Match the user's energy: short question → short answer, deep question → thorough answer
-- Don't over-explain or add filler ("Great question!", "I'd be happy to help!")
-- Don't use hedging phrases ("I think maybe", "It seems like", "According to my training data")
-
-`, pe.personalityName))
 
 	// --- Time context (always useful) ---
 	pe.appendTimeContext(&b, ctx)
@@ -153,9 +137,10 @@ func (pe *PromptEngine) appendEmotionContext(b *strings.Builder, ctx PromptConte
 }
 
 func (pe *PromptEngine) appendMemoryContext(b *strings.Builder, ctx PromptContext) {
-	// Context budget: limit total context to prevent overflow
-	// ~4 chars per token, leave room for system prompt + user input
-	const maxContextChars = 3000
+	// Context budget: ~2k tokens of memory (~8k chars) fits comfortably in
+	// Ollama's VRAM-sized windows (4k/32k/256k) while staying lean on modest
+	// hardware. Pair with summary-compacted working memory to stay bounded.
+	const maxContextChars = 8000
 
 	totalLen := len(ctx.WorkingMemory) + len(ctx.RAGContext)
 	if totalLen <= maxContextChars {

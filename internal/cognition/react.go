@@ -84,15 +84,38 @@ type ReActLoop struct {
 	registry      interfaces.ToolRegistry
 	memory        interfaces.WorkingMemory
 	maxIterations int
+
+	// Precomputed once at construction — the tool guide is identical every
+	// prompt, so marshaling per iteration was pure overhead.
+	toolsJSON string
+	toolGuide string
+
+	// contextFunc returns personality/session context (recent conversation,
+	// user profile, emotion) injected into EVERY step's prompt. Why: tool
+	// steps in ReAct are run as separate LLM calls — without re-injecting
+	// this context each time, the persona "Mai remembers / knows you" is lost
+	// between tool calls. The system prompt (provider "system" field) carries
+	// the static persona; this carries the dynamic session state.
+	contextFunc func() string
+}
+
+// SetContextSnippet registers a callback supplying session context for every
+// prompt built during this loop's steps (executed per step, never cached).
+func (r *ReActLoop) SetContextSnippet(fn func() string) {
+	r.contextFunc = fn
 }
 
 func NewReActLoop(llm interfaces.LLMProvider, registry interfaces.ToolRegistry, memory interfaces.WorkingMemory) *ReActLoop {
-	return &ReActLoop{
+	r := &ReActLoop{
 		llm:           llm,
 		registry:      registry,
 		memory:        memory,
 		maxIterations: 3,
 	}
+	toolsJSON, _ := json.MarshalIndent(registry.List(), "", "  ")
+	r.toolsJSON = string(toolsJSON)
+	r.toolGuide = r.buildToolGuide()
+	return r
 }
 
 func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
@@ -240,29 +263,33 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 }
 
 func (r *ReActLoop) buildPrompt(goal string, steps []ReActStep) string {
-	tools := r.registry.List()
-	toolsJSON, _ := json.MarshalIndent(tools, "", "  ")
-
-	// Build tool usage guide — shorter, more direct
-	toolGuide := r.buildToolGuide()
-
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf(`You are Mai — think through this naturally, like a smart assistant would.
 
-GOAL: %s
+	// Session context (recent conversation, user profile, emotion) — injected
+	// on EVERY step so the model keeps its persona and memory across tool
+	// calls, not just on the first step. Falls back to a minimal identity
+	// line when no context provider is registered.
+	if r.contextFunc != nil {
+		if ctx := strings.TrimSpace(r.contextFunc()); ctx != "" {
+			b.WriteString("SESSION CONTEXT (who the user is and what was said recently — stay in character):\n")
+			b.WriteString(ctx)
+			b.WriteString("\n\n")
+		}
+	} else {
+		// Only reached when no orchestrator wired a snippet provider (tests).
+		b.WriteString("You are Mai — think through this naturally.\n\n")
+	}
 
-TOOLS (only use when the goal REQUIRES real-time data or an action):
-%s
+	b.WriteString(fmt.Sprintf("\n\nGOAL: %s\n\nTOOLS (only use when the goal REQUIRES real-time data or an action):\n%s\n\n%s\n",
+		goal, r.toolsJSON, r.toolGuide))
 
-%s
-THINKING APPROACH:
+	b.WriteString(`THINKING APPROACH:
 - If you already know the answer from general knowledge → answer directly, no tools needed
 - If the goal needs current info (weather, time, news) or an action (open app, search web) → use a tool
 - If a tool failed → acknowledge it honestly, don't guess what the result "should" be
 - Never call the same tool twice with the same parameters
 - After getting a tool result, synthesize it into a natural answer
-
-`, goal, string(toolsJSON), toolGuide))
+`)
 
 	// Append conversation history naturally, not as rigid steps
 	if len(steps) > 0 {

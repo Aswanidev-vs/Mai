@@ -137,3 +137,7 @@ dlib-20.0.zip
 faceai/
 .mimocode/
 refer/
+cuda_v13/
+vulkan/
+sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-1120ms-int8-2026-06-11/
+sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-v2-int8-2026-02-05/

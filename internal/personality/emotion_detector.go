@@ -155,6 +155,25 @@ func (ed *EmotionDetector) GetCurrent() EmotionState {
 	return ed.current
 }
 
+// MergeProsody blends a prosody-derived state over the text-derived state.
+// How someone *says* something ("I'm fine" + stressed prosody) is a stronger
+// emotional signal than the literal words, so a confident non-neutral
+// prosody result wins. Returns the merged state and records it as current.
+func (ed *EmotionDetector) MergeProsody(text, prosody EmotionState) EmotionState {
+	if prosody.Type == "" || prosody.Type == EmotionNeutral || prosody.Confidence < 0.5 {
+		return text
+	}
+	merged := prosody
+	merged.Source = "combined"
+	// Explicit text emotion with higher confidence still wins (e.g. "I'm so
+	// excited!" said flatly) — words can carry intent the voice hides.
+	if text.Type != EmotionNeutral && text.Confidence > prosody.Confidence {
+		merged.Type = text.Type
+	}
+	ed.record(merged)
+	return merged
+}
+
 func (ed *EmotionDetector) GetHistory(n int) []EmotionState {
 	ed.mu.RLock()
 	defer ed.mu.RUnlock()
