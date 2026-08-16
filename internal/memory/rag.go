@@ -32,8 +32,6 @@ type RAGResult struct {
 }
 
 func (r *RAGPipeline) Query(ctx context.Context, question string) (*RAGResult, error) {
-	log.Printf("[RAG] Processing query: %s", truncateStr(question, 80))
-
 	// Step 1: Retrieve from semantic memory (vector search)
 	semanticResults, err := r.semantic.SearchFacts(question, r.topK)
 	if err != nil {
@@ -52,7 +50,6 @@ func (r *RAGPipeline) Query(ctx context.Context, question string) (*RAGResult, e
 	merged := r.mergeResults(semanticResults, episodicResults)
 
 	if len(merged) == 0 {
-		log.Printf("[RAG] No relevant context found")
 		return &RAGResult{Answer: "", Sources: nil, Confidence: 0}, nil
 	}
 
@@ -71,7 +68,6 @@ func (r *RAGPipeline) Query(ctx context.Context, question string) (*RAGResult, e
 	}
 
 	if len(filtered) == 0 {
-		log.Printf("[RAG] All retrieved entries were low-quality after filtering")
 		return &RAGResult{Answer: "", Sources: nil, Confidence: 0}, nil
 	}
 
@@ -88,7 +84,6 @@ func (r *RAGPipeline) Query(ctx context.Context, question string) (*RAGResult, e
 	// Step 6: Only use RAG if the context looks relevant
 	// If top result is just conversation fragments, skip the LLM call
 	if !r.isContextRelevant(question, filtered) {
-		log.Printf("[RAG] Retrieved context not relevant enough to question")
 		return &RAGResult{Answer: "", Sources: nil, Confidence: 0}, nil
 	}
 
@@ -111,13 +106,11 @@ Answer (or NO_ANSWER):`, retrievedContext, question)
 
 	// Step 8: Check if LLM said there's no answer
 	if strings.Contains(strings.ToUpper(answer), "NO_ANSWER") || len(answer) < 5 {
-		log.Printf("[RAG] LLM determined no answer available in context")
 		return &RAGResult{Answer: "", Sources: nil, Confidence: 0}, nil
 	}
 
 	confidence := r.calculateConfidence(filtered, answer)
 
-	log.Printf("[RAG] Found answer with confidence %.2f", confidence)
 	return &RAGResult{
 		Answer:     answer,
 		Sources:    filtered,

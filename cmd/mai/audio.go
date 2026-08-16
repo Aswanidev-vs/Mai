@@ -198,6 +198,13 @@ func playAudioStreaming(ctx context.Context, sampleRate int, stop *int32, genera
 	// Wait for generation to finish.
 	<-done
 
+	// Drain remaining channel content to unblock the generator goroutine.
+	// When stop is set mid-stream, the drain goroutine exits early, leaving
+	// the generator blocked on ch <- chunk (channel full). Consuming the
+	// remaining chunks lets the generator finish and close the channel.
+	for range ch {
+	}
+
 	// Wait for playback to drain.
 	for {
 		mu.Lock()
