@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/user/mai/internal/cognition"
@@ -56,7 +57,12 @@ type Orchestrator struct {
 	lastProsodyAt time.Time
 
 	DirectAction func(text string) (bool, string, error)
-	TTSFunc      func(text string, speed float32)
+	TTSFunc      func(text string, speed float32, seq int64)
+
+	// ttsSeq is a monotonic counter tagging every spoken sentence with the
+	// turn it belongs to. The TTS player uses it to drop audio from a turn
+	// that was superseded by an interruption (production-grade barge-in).
+	ttsSeq atomic.Int64
 
 	skillsRunner *skills.Runner
 }
@@ -186,11 +192,29 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 
 	o.interrupts.SetCallbacks(
 		func(message string) {
+			// The user's words already reached HandleInput (via
+			// handleTranscription) which generates the real reply, so we must
+			// NOT parrot them back as TTS. The only job here is to abort the
+			// previous turn's in-flight generation so a stale answer doesn't
+			// keep streaming after the user takes over.
 			log.Printf("[Interrupt] Interrupting current task: %s", message)
-			o.publishTTS(message)
+			o.InterruptCurrent()
+			// Halt any sentence currently being spoken so the new reply (the
+			// highest turn sequence) replaces it promptly. The TTS player
+			// drops superseded-turn audio but always keeps the newest turn.
+			if o.bus != nil {
+				o.bus.Publish(interfaces.Event{
+					Type:   "agent.interrupt",
+					Source: "agent.orchestrator",
+				})
+			}
 		},
 		func(message string) {
-			o.publishTTS(message)
+			// A queued interrupt that was deferred until Mai went idle is a
+			// genuine user turn — route it through the normal pipeline for a
+			// real response instead of echoing the raw text.
+			log.Printf("[Interrupt] Processing queued interrupt: %s", message)
+			go o.HandleInput(context.Background(), map[string]interface{}{"text": message})
 		},
 	)
 
@@ -352,6 +376,18 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		o.recentUserInputs = o.recentUserInputs[1:]
 	}
 
+	// --- Greeting fast-path: instant response, no RAG/LLM ---
+	if isGreeting(inputLower) {
+		resp := pickGreetingResponse(inputLower)
+		o.lastUserTime = time.Now()
+		o.userModel.RecordInteraction(text, "")
+		o.memory.Working().Add(interfaces.MemoryEntry{
+			Type: "user_input", Content: text, Timestamp: time.Now().Unix(),
+		})
+		o.storeResponse(resp)
+		return &interfaces.AgentResponse{Text: resp, Success: true, Spoken: true}, nil
+	}
+
 	o.status = interfaces.StatusThinking
 	o.lastUserTime = time.Now()
 	startTime := time.Now()
@@ -367,8 +403,6 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	if ps, ok := o.recentProsody(); ok {
 		emotionState = o.emotion.MergeProsody(emotionState, ps)
 	}
-	log.Printf("[Agent] Emotion: %s (%.2f)", emotionState.Type, emotionState.Confidence)
-
 	o.userModel.RecordInteraction(text, "")
 	o.memory.Working().Add(interfaces.MemoryEntry{
 		Type: "user_input", Content: text, Timestamp: time.Now().Unix(),
@@ -419,7 +453,6 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	// sentence-by-sentence TTS so audio starts while the LLM is still talking.
 	// Imperative/analytic turns keep using the ReAct tool loop.
 	taskType := o.promptEngine.ClassifyTask(text, hasCommandTriggers(text))
-	log.Printf("[Agent] Routing (taskType=%s): %s", taskType, text)
 
 	switch taskType {
 	case cognition.TaskConversation, cognition.TaskGreeting, cognition.TaskCreative:
@@ -436,6 +469,100 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	adapted := o.adaptResponse(response, emotionState)
 	o.storeResponse(adapted)
 	return &interfaces.AgentResponse{Text: adapted, Success: true}, nil
+}
+
+// isGreeting reports whether the input is a simple greeting that can be
+// answered instantly without LLM inference.
+func isGreeting(lower string) bool {
+	lower = strings.TrimSpace(lower)
+	greetings := []string{
+		"hi", "hey", "hello", "yo", "sup", "hiya",
+		"good morning", "good afternoon", "good evening", "good night",
+		"morning", "afternoon", "evening", "night",
+		"what's up", "whats up", "howdy", "howdy-do",
+		"hi mai", "hey mai", "hello mai",
+	}
+	for _, g := range greetings {
+		if lower == g {
+			return true
+		}
+	}
+	// "good morning/afternoon/evening" with trailing punctuation or name
+	for _, g := range []string{"good morning", "good afternoon", "good evening", "good night"} {
+		if strings.HasPrefix(lower, g) && len(lower) < len(g)+15 {
+			return true
+		}
+	}
+	return false
+}
+
+// pickGreetingResponse returns a cached, time-of-day appropriate greeting
+// without hitting the LLM.
+func pickGreetingResponse(input string) string {
+	hour := time.Now().Hour()
+	lower := strings.TrimSpace(input)
+
+	// Match specific greetings to natural responses
+	switch {
+	case strings.Contains(lower, "good morning") || lower == "morning":
+		pool := []string{
+			"Morning. I'm here.",
+			"Good morning. Sleep well?",
+			"Morning. What's the plan today?",
+		}
+		return pool[time.Now().UnixNano()%int64(len(pool))]
+	case strings.Contains(lower, "good afternoon") || lower == "afternoon":
+		pool := []string{
+			"Hey. How's the day going?",
+			"Afternoon. I'm with you.",
+			"What's on your mind?",
+		}
+		return pool[time.Now().UnixNano()%int64(len(pool))]
+	case strings.Contains(lower, "good evening") || lower == "evening":
+		pool := []string{
+			"Evening. I'm here.",
+			"Hey. What are we doing tonight?",
+			"Evening. How was your day?",
+		}
+		return pool[time.Now().UnixNano()%int64(len(pool))]
+	case strings.Contains(lower, "good night") || lower == "night":
+		pool := []string{
+			"Good night. Get some rest.",
+			"Night. I'll be here if you need me.",
+			"Sleep well.",
+		}
+		return pool[time.Now().UnixNano()%int64(len(pool))]
+	}
+
+	// Generic greeting pool, rotated by time of day
+	var pool []string
+	switch {
+	case hour >= 5 && hour < 12:
+		pool = []string{
+			"Hey. What's up?",
+			"Morning. What do you need?",
+			"Hi. I'm here.",
+		}
+	case hour >= 12 && hour < 17:
+		pool = []string{
+			"Hey. What's on your mind?",
+			"Hi. What do we have today?",
+			"I'm here. What's up?",
+		}
+	case hour >= 17 && hour < 22:
+		pool = []string{
+			"Hey. What are we doing?",
+			"Evening. I'm with you.",
+			"What's up?",
+		}
+	default:
+		pool = []string{
+			"Still up? What's on your mind?",
+			"Hey. What do you need?",
+			"I'm here.",
+		}
+	}
+	return pool[time.Now().UnixNano()%int64(len(pool))]
 }
 
 // hasCommandTriggers reports whether the utterance looks like a direct
@@ -827,6 +954,7 @@ func (o *Orchestrator) GetInterruptManager() *InterruptManager {
 }
 
 func (o *Orchestrator) publishTTS(text string) {
+	seq := o.ttsSeq.Add(1)
 	o.lastSpoken = strings.ToLower(text)
 	o.lastSpokenAt = time.Now()
 
@@ -854,7 +982,7 @@ func (o *Orchestrator) publishTTS(text string) {
 	// If a direct TTS sink is wired (streaming sentence queue), use it so the
 	// bus subscribers don't double-play. Otherwise fall back to the event bus.
 	if o.TTSFunc != nil {
-		o.TTSFunc(text, ttsParams.Speed)
+		o.TTSFunc(text, ttsParams.Speed, seq)
 		return
 	}
 
@@ -865,6 +993,7 @@ func (o *Orchestrator) publishTTS(text string) {
 			"text":  text,
 			"speed": ttsParams.Speed,
 			"pitch": ttsParams.Pitch,
+			"seq":   seq,
 		},
 	})
 }
@@ -872,6 +1001,12 @@ func (o *Orchestrator) publishTTS(text string) {
 func (o *Orchestrator) SetGoal(ctx context.Context, goal interfaces.Goal) error {
 	o.goals.AddGoal(goal)
 	return nil
+}
+
+// Speak streams text to TTS, tagging it with the orchestrator's monotonic
+// turn sequence so the player can drop it if a newer turn supersedes it.
+func (o *Orchestrator) Speak(text string) {
+	o.publishTTS(text)
 }
 
 func (o *Orchestrator) GetStatus() interfaces.AgentStatus {

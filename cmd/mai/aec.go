@@ -105,7 +105,8 @@ func NewEchoCanceller(L int) *EchoCanceller {
 		ref: refBuffer,
 		L:   L,
 		w:   make([]float32, L),
-		mu:  0.1,
+		mu:  0.25, // faster convergence: the echo path must be learned within the
+		// barge-in warmup window, before detection arms
 		eps: 1e-4,
 	}
 }

@@ -8,7 +8,7 @@ require (
 	github.com/gen2brain/malgo v0.11.24
 	github.com/go-vgo/robotgo v1.0.2
 	github.com/gorilla/websocket v1.5.3
-	github.com/k2-fsa/sherpa-onnx-go v1.12.39
+	github.com/k2-fsa/sherpa-onnx-go v1.13.5
 	github.com/mattn/go-sqlite3 v1.14.44
 	github.com/pion/mediadevices v0.10.0
 	github.com/stretchr/testify v1.11.1
@@ -26,9 +26,9 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jezek/xgb v1.3.0 // indirect
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a // indirect
-	github.com/k2-fsa/sherpa-onnx-go-linux v1.12.39 // indirect
-	github.com/k2-fsa/sherpa-onnx-go-macos v1.12.39 // indirect
-	github.com/k2-fsa/sherpa-onnx-go-windows v1.12.39 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-linux v1.13.5 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-macos v1.13.5 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-windows v1.13.5 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260324052639-156f7da3f749 // indirect
 	github.com/otiai10/gosseract/v2 v2.4.1 // indirect
 	github.com/pion/datachannel v1.5.10 // indirect

@@ -124,6 +124,15 @@ func main() {
 	// covers typical room reverb + browser playback tail.
 	const postTTSAECWindow = 2500 * time.Millisecond
 
+	// Barge-in tuning (while TTS is playing). A real interruption is a loud,
+	// sustained voice; a one-frame echo leak or a noise/reverb spike must not
+	// cut Mai off mid-sentence. Detection only arms after ttsBargeInWarmup
+	// (so the AEC has converged) and fires only when the residual stays above
+	// BargeInThreshold * bargeInMargin for bargeInSustain straight.
+	const ttsBargeInWarmup = 700 * time.Millisecond
+	const bargeInMargin = 2.5                     // x BargeInThreshold for real speech
+	const bargeInSustain = 250 * time.Millisecond // sustained speech required
+
 	// Shared across main scope so greeting / TTS / browser-mic paths can reach the bus.
 	var bus interfaces.EventBus
 	var companionServer *server.Server
@@ -135,8 +144,8 @@ func main() {
 	// Echo cancellation for genuine barge-in: subtracts Mai's own TTS (echoed
 	// through the mic) so only a real second speaker survives in the residual.
 	echoCanceller := NewEchoCanceller(4096)
-	var bargeCount int
-	var ttsStartedAt time.Time
+	var bargeStartNano atomic.Int64 // when the residual first crossed the barge-in gate (0 = idle)
+	var ttsStartedNano atomic.Int64 // UnixNano when current TTS playback started
 
 	// waitForMicSilence blocks until the mic stays quiet (RMS < 0.0015 for 3 consecutive checks)
 	// or a 500ms deadline is reached. Returns true if silence was detected, false if timed out.
@@ -306,6 +315,9 @@ func main() {
 			log.Fatal("[ASR] Failed to create Nemotron stream")
 		}
 		defer sherpa.DeleteOnlineStream(asrStream)
+		if lang := cfg.ASR.Nemotron.Language; lang != "" {
+			asrStream.SetOption("language", lang)
+		}
 		log.Println("[ASR] Streaming Nemotron recognizer ready")
 
 	case "omnilingual":
@@ -511,7 +523,7 @@ func main() {
 			// Pocket/ZipVoice need Speed + Sid.
 			genCfg := &sherpa.GenerationConfig{
 				Speed: speed,
-				Sid:   cfg.TTS.Supertonic.Sid, // Reused for Kokoro/Pocket speaker ID
+				Sid:   cfg.TTS.Supertonic.Sid, // Default speaker id; kokoro overrides with its own below
 			}
 			if cfg.TTS.ActiveModel == "supertonic" {
 				genCfg.NumSteps = cfg.TTS.Supertonic.NumSteps
@@ -519,6 +531,7 @@ func main() {
 					genCfg.Extra = json.RawMessage(cfg.TTS.Supertonic.Extra)
 				}
 			} else if cfg.TTS.ActiveModel == "kokoro" {
+				genCfg.Sid = cfg.TTS.Kokoro.Sid
 				// Kokoro uses Extra for language (e.g., {"lang": "en-us"})
 				if cfg.TTS.Kokoro.Lang != "" {
 					genCfg.Extra = json.RawMessage(fmt.Sprintf(`{"lang": "%s"}`, cfg.TTS.Kokoro.Lang))
@@ -538,6 +551,7 @@ func main() {
 	type ttsItem struct {
 		text  string
 		speed float32
+		seq   int64 // turn sequence from the orchestrator; used to drop stale audio
 	}
 	ttsSentCh := make(chan ttsItem, 64)
 
@@ -546,11 +560,11 @@ func main() {
 	// speak enqueues a sentence for the streaming player (see playSentence +
 	// the player goroutine below). Keeping a single consumer serializes all
 	// TTS so sentences never overlap, and lets barge-in drain the queue.
-	speak := func(text string, speed float32) {
+	speak := func(text string, speed float32, seq int64) {
 		if speed == 0 {
 			speed = cfg.TTS.Supertonic.Speed
 		}
-		ttsSentCh <- ttsItem{text: text, speed: speed}
+		ttsSentCh <- ttsItem{text: text, speed: speed, seq: seq}
 	}
 
 	// playSentence synthesizes and plays ONE sentence, halting immediately if
@@ -565,13 +579,16 @@ func main() {
 		// ttsPlaying and Mai's own voice (echoed through the browser mic) reaches
 		// ASR and gets transcribed as a user turn — the classic feedback loop.
 		atomic.StoreInt32(&ttsPlaying, 1)
-		ttsStartedAt = time.Now()
+		ttsStartedNano.Store(time.Now().UnixNano())
+		bargeStartNano.Store(0)
 		atomic.StoreInt32(&stopPlayback, 0)
 		defer atomic.StoreInt32(&ttsPlaying, 0)
 		log.Printf("[TTS-PLAY] Starting synthesis: speed=%.2f, text=%.80s...", speed, text)
 
 		if bus != nil && cfg.Server.Enabled && companionHasClient() {
 			// ── Browser companion: stream chunks, stop on barge-in ──
+			synthStart := time.Now()
+			var publishedSamples int64
 			synthesize(text, speed, func(samples []float32) bool {
 				if atomic.LoadInt32(&stopPlayback) != 0 {
 					return false
@@ -581,6 +598,7 @@ func main() {
 				// mic) — otherwise barge-in detection would misread her echo as
 				// a user interruption and cut her off.
 				if len(samples) > 0 {
+					publishedSamples += int64(len(samples))
 					resampledForEcho := ttsToEchoResampler.resample(samples)
 					refBuffer.Push(resampledForEcho)
 					// Resample to 44.1k for browser playback.
@@ -590,6 +608,26 @@ func main() {
 				return true
 			})
 			publishTTSAudioChunk(bus, nil, 44100, true)
+
+			// Browser playback lags publishing by the audio duration plus
+			// network/decode latency. Keep ttsPlaying asserted until the
+			// estimated playback end: clearing it at publish time opens a
+			// window where Mai's own voice (browser speakers → browser mic)
+			// reaches the barge-in detector mid-sentence and she interrupts
+			// herself. A genuine barge-in (stopPlayback) exits early.
+			if ttsSampleRate > 0 {
+				estEnd := synthStart.Add(time.Duration(float64(publishedSamples)/float64(ttsSampleRate)*float64(time.Second)) + 400*time.Millisecond)
+				for time.Now().Before(estEnd) {
+					if atomic.LoadInt32(&stopPlayback) != 0 {
+						break
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(20 * time.Millisecond):
+					}
+				}
+			}
 		} else {
 			// ── Local-only path: streaming playback ──
 			_ = playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
@@ -609,28 +647,34 @@ func main() {
 		lastResponseMu.Unlock()
 	}
 
-	// Player goroutine: consumes the sentence queue sequentially. Skips any
-	// sentence left queued after a barge-in (stopPlayback). isSpeaking stays
-	// set across sentences and is only cleared once the queue drains.
+	// Player goroutine: consumes the sentence queue sequentially. Each
+	// sentence carries a turn sequence (orchestrator.ttsSeq). When a newer
+	// turn arrives we (a) halt any sentence currently being spoken and
+	// (b) drop every queued sentence belonging to an older, now-superseded
+	// turn. This is what makes interruption production-grade: the previous
+	// answer's tail is discarded instead of playing after the user takes
+	// over, while the NEW reply (the highest seq) is always preserved.
 	go func() {
+		var playingSeq int64
 		for item := range ttsSentCh {
-			if atomic.LoadInt32(&stopPlayback) != 0 {
-				log.Printf("[TTS-PLAYER] Skipping sentence due to barge-in: %.60s...", item.text)
-				// DRAIN: discard all remaining queued sentences so stale
-				// responses don't play after the user interrupts.
-				drained := false
-				for !drained {
-					select {
-					case <-ttsSentCh:
-						// discarded
-					default:
-						drained = true
-					}
+			// Stale audio from a turn the user already interrupted: drop it.
+			if item.seq > 0 && item.seq <= playingSeq {
+				log.Printf("[TTS-PLAYER] Dropping stale sentence (turn %d <= %d): %.60s...", item.seq, playingSeq, item.text)
+				if len(ttsSentCh) == 0 {
+					atomic.StoreInt32(&isSpeaking, 0)
+					atomic.StoreInt32(&stopPlayback, 0)
+					lastTTSEndNano.Store(time.Now().UnixNano())
 				}
-				atomic.StoreInt32(&stopPlayback, 0)
 				continue
 			}
-			log.Printf("[TTS-PLAYER] Playing sentence (len=%d): %.80s...", len(item.text), item.text)
+			// A newer turn started: halt the sentence currently being spoken
+			// so the new reply begins promptly. playSentence resets
+			// stopPlayback at its own start, so this never blocks the new turn.
+			if item.seq > playingSeq {
+				atomic.StoreInt32(&stopPlayback, 1)
+				playingSeq = item.seq
+			}
+			log.Printf("[TTS-PLAYER] Playing sentence (len=%d, turn=%d): %.80s...", len(item.text), item.seq, item.text)
 			playSentence(item.text, item.speed)
 			log.Printf("[TTS-PLAYER] Finished playing sentence, queue_depth=%d", len(ttsSentCh))
 			if len(ttsSentCh) == 0 {
@@ -745,9 +789,9 @@ func main() {
 		// forwards them to the browser); when no client is connected it
 		// falls back to local audio playback.  The bus subscription added
 		// below covers the local-only fallback path as well.
-		orch.TTSFunc = func(text string, speed float32) {
-			log.Printf("[TTS-FUNC] Enqueuing sentence (len=%d, speed=%.2f): %.80s...", len(text), speed, text)
-			ttsSentCh <- ttsItem{text: text, speed: speed}
+		orch.TTSFunc = func(text string, speed float32, seq int64) {
+			log.Printf("[TTS-FUNC] Enqueuing sentence (len=%d, speed=%.2f, turn=%d): %.80s...", len(text), speed, seq, text)
+			ttsSentCh <- ttsItem{text: text, speed: speed, seq: seq}
 		}
 		interruptCurrent = orch.InterruptCurrent
 		orch.DirectAction = executor.ParseAndExecute // Wire up the legacy highly-reliable regex parser
@@ -805,12 +849,21 @@ func main() {
 			// The worker goroutine will chime when it actually starts thinking.
 		})
 
+		// Agent-level interruption (e.g. a "stop"/"cancel" command routed
+		// through HandleInput): halt the sentence currently being spoken.
+		// The player keeps the newest turn's audio and drops superseded ones,
+		// so this never discards the user's actual reply.
+		bus.Subscribe("agent.interrupt", func(event interfaces.Event) {
+			atomic.StoreInt32(&stopPlayback, 1)
+		})
+
 		// Bridge for TTS — with emotion-adaptive parameters
 		bus.Subscribe("action.tts.request", func(event interfaces.Event) {
 			text, _ := event.Payload["text"].(string)
 			speed, _ := event.Payload["speed"].(float32)
-			log.Printf("[AGENT] Speaking (speed=%.2f): %s", speed, text)
-			speak(text, speed)
+			seq, _ := event.Payload["seq"].(int64)
+			log.Printf("[AGENT] Speaking (speed=%.2f, turn=%d): %s", speed, seq, text)
+			speak(text, speed, seq)
 			log.Printf("[FOLLOW-UP] Listening for follow-up (15s window)...")
 		})
 
@@ -847,8 +900,8 @@ func main() {
 
 	// 6. Pipeline Worker (LLM + TTS + Actions)
 	type Task struct {
-		Text          string
-		IsReasoning   bool // true if task requires actual reasoning (not just chat)
+		Text        string
+		IsReasoning bool // true if task requires actual reasoning (not just chat)
 	}
 	workerChan := make(chan Task, 10)
 	var wg sync.WaitGroup
@@ -909,8 +962,8 @@ func main() {
 			// Streaming TTS: generate chunks and play them as they arrive.
 			atomic.StoreInt32(&isSpeaking, 1) // Block ASR during TTS playback
 			atomic.StoreInt32(&ttsPlaying, 1)
-			ttsStartedAt = time.Now()
-			bargeCount = 0
+			ttsStartedNano.Store(time.Now().UnixNano())
+			bargeStartNano.Store(0)
 			atomic.StoreInt32(&stopPlayback, 0)
 			playErr := playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
 				synthesize(response, cfg.TTS.Supertonic.Speed, func(samples []float32) bool {
@@ -953,6 +1006,41 @@ func main() {
 	var prosodySamples []float32
 	const prosodyMaxSamples = 16000 * 3 // 3 seconds
 
+	// finalizeTurn routes the accumulated utterance to the agent/legacy
+	// pipeline and resets all per-turn state. Called by both VAD segment-end
+	// and the streaming-ASR endpoint path.
+	finalizeTurn := func() {
+		// Display-only transcript of what the user said. Never fed back into
+		// ASR/turn input anywhere else — routing below is the single consumer.
+		if trimmed := strings.TrimSpace(sessionText); trimmed != "" {
+			log.Printf("[USER] %s", trimmed)
+		}
+		if agentBridge != nil {
+			log.Println("[AGENT] Routing to cognitive orchestrator...")
+			// Feed the voice-derived emotion to Mai *before* the transcription
+			// event so HandleInput can merge it with the text keywords
+			// ("I'm fine" said flatly vs. stressed).
+			if orch != nil && len(prosodySamples) > 0 {
+				orch.IngestProsody(orch.AnalyzeProsody(prosodySamples, 16000))
+			}
+			go agentBridge.PublishTranscription(sessionText)
+		} else {
+			log.Println("[PIPELINE] Routing to legacy pipeline...")
+			// Heuristic: longer inputs (>15 words) are more likely to be
+			// reasoning tasks vs. simple conversational turns.
+			isReasoning := len(strings.Fields(sessionText)) > 15
+			workerChan <- Task{Text: sessionText, IsReasoning: isReasoning}
+		}
+		state = StateWakeWord
+		sessionText = ""
+		sessionSamples = nil
+		prosodySamples = nil
+		if recognizer != nil {
+			recognizer.Reset(asrStream)
+		}
+		lastText = ""
+	}
+
 	// Audio callback
 	// runListening: the VAD + ASR + segment-end detection pipeline.
 	// Shared by local mic (in listening state) and browser mic.
@@ -983,6 +1071,20 @@ func main() {
 				lastText = text
 				fmt.Printf("\r[ASR] Live: %s%s", sessionText, text)
 			}
+			// Finalize when the recognizer's own endpoint rules fire (e.g.
+			// rule1/rule2 trailing silence). Silero VAD alone is unreliable as
+			// the sole end-of-turn signal — with streaming ASR live text keeps
+			// flowing with no VAD involvement, so a missed VAD segment would
+			// leave the turn stuck at "[ASR] Live:" forever.
+			if text != "" && recognizer.IsEndpoint(asrStream) {
+				log.Printf("\n[ASR] Endpoint detected, finalizing (text=%q)", text)
+				sessionText += text + " "
+				finalizeTurn()
+				for !vadDetector.IsEmpty() {
+					vadDetector.Pop()
+				}
+				return
+			}
 		} else {
 			// Safety cap: force finalization if buffer grows too large
 			if len(sessionSamples) >= offlineASRMaxSamples {
@@ -1010,7 +1112,7 @@ func main() {
 					result := offlineStream.GetResult()
 					if result != nil && result.Text != "" {
 						sessionText = result.Text
-						log.Printf("[ASR] Offline result: %s", sessionText)
+						log.Printf("[USER] %s", strings.TrimSpace(sessionText))
 						if agentBridge != nil {
 							go agentBridge.PublishTranscription(sessionText)
 						} else {
@@ -1068,30 +1170,7 @@ func main() {
 
 			log.Println("\n[VAD] End of segment detected.")
 			if sessionText != "" {
-				if agentBridge != nil {
-					log.Println("[AGENT] Routing to cognitive orchestrator...")
-					// Feed the voice-derived emotion to Mai *before* the
-					// transcription event so HandleInput can merge it with the
-					// text keywords ("I'm fine" said flatly vs. stressed).
-					if orch != nil && len(prosodySamples) > 0 {
-						orch.IngestProsody(orch.AnalyzeProsody(prosodySamples, 16000))
-					}
-					go agentBridge.PublishTranscription(sessionText)
-				} else {
-					log.Println("[PIPELINE] Routing to legacy pipeline...")
-					// Heuristic: longer inputs (>15 words) are more likely to be
-					// reasoning tasks vs. simple conversational turns.
-					isReasoning := len(strings.Fields(sessionText)) > 15
-					workerChan <- Task{Text: sessionText, IsReasoning: isReasoning}
-				}
-				state = StateWakeWord
-				sessionText = ""
-				sessionSamples = nil
-				prosodySamples = nil
-				if recognizer != nil {
-					recognizer.Reset(asrStream)
-				}
-				lastText = ""
+				finalizeTurn()
 				return
 			}
 		}
@@ -1123,7 +1202,11 @@ func main() {
 		// up in the residual, that's a genuine barge-in — stop playback and hand
 		// the user's echo-free words to ASR.
 		if atomic.LoadInt32(&ttsPlaying) != 0 {
-			if cfg.Audio.BargeInEnabled && echoCanceller != nil && time.Since(ttsStartedAt) > 400*time.Millisecond {
+			if cfg.Audio.BargeInEnabled && echoCanceller != nil {
+				// Adapt from the very first playback frame: during the warmup
+				// window the gate below stays closed, so feeding the filter
+				// early is pure training (echo only) and it converges before
+				// detection arms.
 				clean := echoCanceller.Process(samples)
 				var csum float32
 				for _, s := range clean {
@@ -1134,14 +1217,20 @@ func main() {
 				lastMicRMS = crms
 				lastMicMu.Unlock()
 
-				if crms > cfg.Audio.BargeInThreshold {
-					bargeCount++
-					// Require sustained residual (not a single-frame echo leak)
-					// and a margin above threshold, so Mai's own voice echoing
-					// through the mic doesn't get misread as a user interruption
-					// and fed back to ASR (which makes her "say back" what was said).
-					if bargeCount >= 4 && crms > cfg.Audio.BargeInThreshold*2 {
-						log.Printf("[BARGE-IN] Real speech over TTS detected (residual RMS=%.4f). Stopping playback.", crms)
+				warm := time.Since(time.Unix(0, ttsStartedNano.Load())) > ttsBargeInWarmup
+				loud := crms > cfg.Audio.BargeInThreshold*bargeInMargin
+				// Require sustained, clearly-louder-than-echo residual (not a
+				// one-frame echo leak or reverb spike), so Mai's own voice
+				// echoing through the mic doesn't get misread as a user
+				// interruption and fed back to ASR (which makes her "say back"
+				// what was said).
+				if warm && loud {
+					start := bargeStartNano.Load()
+					if start == 0 {
+						bargeStartNano.Store(time.Now().UnixNano())
+					} else if held := time.Since(time.Unix(0, start)); held >= bargeInSustain {
+						log.Printf("[BARGE-IN] Real speech over TTS detected (residual RMS=%.4f, held %v). Stopping playback.", crms, held)
+						bargeStartNano.Store(0)
 						atomic.StoreInt32(&stopPlayback, 1)
 						if interruptCurrent != nil {
 							interruptCurrent()
@@ -1168,11 +1257,10 @@ func main() {
 								recognizer.Decode(asrStream)
 							}
 						}
-						bargeCount = 0
 						return
 					}
 				} else {
-					bargeCount = 0
+					bargeStartNano.Store(0)
 				}
 			}
 			// No genuine interruption: her echo is not user input, so drop the frame.
@@ -1286,11 +1374,9 @@ func main() {
 					lastDetected = time.Now()
 					log.Println("\n[WAKE] Detected! Listening...")
 
-					// Route greeting through the same speak() helper so it streams
-					// to the browser companion (lips sync) when a client is connected.
-					go func() {
-						speak(pickGreeting(), cfg.TTS.Supertonic.Speed)
-					}()
+					// Route greeting through the orchestrator so it shares the
+					// turn-sequence space and can be truncated by an interruption.
+					go orch.Speak(pickGreeting())
 
 					state = StateListening
 					sessionText = ""

@@ -63,9 +63,11 @@ asr:
     language: "en"
     decoding_method: "greedy_search"
 
-  # Nemotron 3.5 (streaming transducer, 40 languages, Hindi supported)
+  # Nemotron 3.5 (streaming transducer, 40 languages, Hindi supported).
+  # model_dir selects the latency variant; the suffix in the directory name
+  # (e.g. 560ms) is the export's chunk latency. All variants share this path.
   nemotron:
-    model_dir: "./sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-1120ms-int8-2026-06-11"
+    model_dir: "./sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11"
     encoder: "encoder.int8.onnx"
     decoder: "decoder.int8.onnx"
     joiner: "joiner.int8.onnx"
