@@ -42,10 +42,13 @@ func NewOllamaProvider(model, url, systemPrompt string, think *bool, opts Ollama
 	}
 }
 
+// ollamaKeepAlive pins the model in memory across turns. Ollama's default
+// 5-min unload makes every idle gap pay a multi-second cold load, which is
+// fatal for voice latency.
+const ollamaKeepAlive = "10m"
+
 // applyTokenOptions adds min_p to an options map (creating it if nil).
-// keep_alive/num_ctx are intentionally NOT set: Ollama owns model residency
-// (default 5-min unload) and VRAM-based context sizing, so it decides
-// offloading itself.
+// num_ctx is intentionally NOT set: Ollama auto-sizes context by VRAM.
 func (p *OllamaProvider) applyTokenOptions(options map[string]interface{}) map[string]interface{} {
 	if p.minP > 0 {
 		if options == nil {
@@ -70,11 +73,12 @@ func (p *OllamaProvider) Generate(ctx context.Context, prompt string, opts inter
 		options["stop"] = opts.StopSequences
 	}
 	reqBody := map[string]interface{}{
-		"model":   p.model,
-		"prompt":  prompt,
-		"system":  p.systemPrompt,
-		"stream":  false,
-		"options": options,
+		"model":      p.model,
+		"prompt":     prompt,
+		"system":     p.systemPrompt,
+		"stream":     false,
+		"keep_alive": ollamaKeepAlive,
+		"options":    options,
 	}
 	if p.think != nil {
 		reqBody["think"] = *p.think
@@ -127,11 +131,12 @@ func (p *OllamaProvider) Stream(ctx context.Context, prompt string, opts interfa
 		options["num_predict"] = opts.MaxTokens
 	}
 	reqBody := map[string]interface{}{
-		"model":   p.model,
-		"prompt":  prompt,
-		"system":  p.systemPrompt,
-		"stream":  true,
-		"options": options,
+		"model":      p.model,
+		"prompt":     prompt,
+		"system":     p.systemPrompt,
+		"stream":     true,
+		"keep_alive": ollamaKeepAlive,
+		"options":    options,
 	}
 	if p.think != nil {
 		reqBody["think"] = *p.think
@@ -182,12 +187,13 @@ func (p *OllamaProvider) GenerateStructured(ctx context.Context, prompt string, 
 	options["temperature"] = 0.2 // low temp keeps tool calls deterministic
 	options["num_predict"] = 1500
 	reqBody := map[string]interface{}{
-		"model":   p.model,
-		"prompt":  prompt,
-		"system":  p.systemPrompt,
-		"stream":  false,
-		"format":  formatFromSchema(schema),
-		"options": options,
+		"model":      p.model,
+		"prompt":     prompt,
+		"system":     p.systemPrompt,
+		"stream":     false,
+		"format":     formatFromSchema(schema),
+		"keep_alive": ollamaKeepAlive,
+		"options":    options,
 	}
 	if p.think != nil {
 		reqBody["think"] = *p.think
@@ -287,7 +293,7 @@ func (p *OllamaProvider) HealthCheck(ctx context.Context) error {
 	if len(baseURL) > 9 && baseURL[len(baseURL)-9:] == "/generate" {
 		baseURL = baseURL[:len(baseURL)-9] + "/tags"
 	}
-	
+
 	req, err := http.NewRequestWithContext(ctx, "GET", baseURL, nil)
 	if err != nil {
 		return err

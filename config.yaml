@@ -11,6 +11,8 @@ audio:
   playback_device: ""  # empty = default
   barge_in_enabled: true    # Interrupt TTS by speaking during playback
   barge_in_threshold: 0.008 # Mic energy threshold for barge-in
+  barge_in_warmup_ms: 400   # AEC convergence wait before barge-in detection arms
+  barge_in_sustain_ms: 150  # Sustained loud residual required to confirm a real interruption
   thinking_chime: true      # Play a subtle tone during LLM processing
 
 kws:
@@ -35,14 +37,14 @@ vad:
 
   window_size: 512
   threshold: 0.6
-  min_silence_duration: 0.8
+  min_silence_duration: 0.5
   min_speech_duration: 0.5
   max_speech_duration: 10.0
   buffer_size_seconds: 20
 
 asr:
   # Active model: "qwen3" | "nemotron" | "omnilingual" | "transducer"
-  active_model: "qwen3"
+  active_model: "nemotron"
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
@@ -72,12 +74,12 @@ asr:
     decoder: "decoder.int8.onnx"
     joiner: "joiner.int8.onnx"
     tokens: "tokens.txt"
-    language: "en"  # or "auto" for auto-detection
+    language: "auto"  # or "auto" for auto-detection
     decoding_method: "greedy_search"
     max_active_paths: 4
     enable_endpoint: 1
     rule1_min_trailing_silence: 2.4
-    rule2_min_trailing_silence: 1.2
+    rule2_min_trailing_silence: 0.8
     rule3_min_utterance_length: 20
 
   # Omnilingual ASR (offline CTC, 1600+ languages incl. Malayalam)
