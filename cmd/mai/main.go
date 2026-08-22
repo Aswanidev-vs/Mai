@@ -126,12 +126,18 @@ func main() {
 
 	// Barge-in tuning (while TTS is playing). A real interruption is a loud,
 	// sustained voice; a one-frame echo leak or a noise/reverb spike must not
-	// cut Mai off mid-sentence. Detection only arms after ttsBargeInWarmup
-	// (so the AEC has converged) and fires only when the residual stays above
-	// BargeInThreshold * bargeInMargin for bargeInSustain straight.
-	const ttsBargeInWarmup = 700 * time.Millisecond
-	const bargeInMargin = 2.5                     // x BargeInThreshold for real speech
-	const bargeInSustain = 250 * time.Millisecond // sustained speech required
+	// cut Mai off mid-sentence. Detection only arms after the AEC warmup
+	// window (so the filter has converged) and fires only when the residual
+	// stays above BargeInThreshold * bargeInMargin for bargeInSustain straight.
+	bargeInWarmup := time.Duration(cfg.Audio.BargeInWarmupMs) * time.Millisecond
+	if bargeInWarmup <= 0 {
+		bargeInWarmup = 400 * time.Millisecond
+	}
+	const bargeInMargin = 2.5 // x BargeInThreshold for real speech
+	bargeInSustain := time.Duration(cfg.Audio.BargeInSustainMs) * time.Millisecond
+	if bargeInSustain <= 0 {
+		bargeInSustain = 150 * time.Millisecond
+	}
 
 	// Shared across main scope so greeting / TTS / browser-mic paths can reach the bus.
 	var bus interfaces.EventBus
@@ -1217,7 +1223,7 @@ func main() {
 				lastMicRMS = crms
 				lastMicMu.Unlock()
 
-				warm := time.Since(time.Unix(0, ttsStartedNano.Load())) > ttsBargeInWarmup
+				warm := time.Since(time.Unix(0, ttsStartedNano.Load())) > bargeInWarmup
 				loud := crms > cfg.Audio.BargeInThreshold*bargeInMargin
 				// Require sustained, clearly-louder-than-echo residual (not a
 				// one-frame echo leak or reverb spike), so Mai's own voice
@@ -1489,10 +1495,11 @@ func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt strin
 	client := &http.Client{}
 
 	body := map[string]interface{}{
-		"model":  cfg.LLM.Model,
-		"prompt": prompt,
-		"system": cfg.LLM.SystemPrompt,
-		"stream": false,
+		"model":      cfg.LLM.Model,
+		"prompt":     prompt,
+		"system":     cfg.LLM.SystemPrompt,
+		"stream":     false,
+		"keep_alive": "30m",
 		"options": map[string]interface{}{
 			"temperature": cfg.LLM.Sampling.Temperature,
 			"top_p":       cfg.LLM.Sampling.TopP,

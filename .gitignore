@@ -125,7 +125,7 @@ recordings/
 # Ollama (if running locally in project)
 # --------------------------------------------
 .ollama/
-models/
+/models/
 TODO.md
 .env
 
