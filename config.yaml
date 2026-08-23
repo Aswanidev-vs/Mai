@@ -189,16 +189,18 @@ llm:
   local_model: gemma4:e2b-it-qat  # Model for local fallback (Ollama)
   # stream: true
   think: false
-  # num_ctx pins Ollama's context window. The VRAM-based default is 4096 on
-  # small GPUs while Mai's worst-case turn is ~4.7k tokens — the overflow
-  # caused silent mid-context truncation ("she forgets"). 32768 was verified
-  # to fit this machine's 4GB VRAM with the model fully offloaded; the KV
-  # cache is prefix-cached so steady-state latency is unchanged.
-  num_ctx: 32768
+  # num_ctx pins Ollama's context window to 4096 — the same value its
+  # VRAM-based default picks on this machine, pinned explicitly so behavior
+  # can't drift if VRAM or defaults change. The ~2.4k-token persona plus
+  # generation fit comfortably; very long turns may exceed the window, in
+  # which case Ollama shifts out middle context (the persona comes first,
+  # so it is kept).
+  num_ctx: 4096
   # Verbatim user/assistant pairs sent to the chat API for long-conversation
   # continuity (exact words, pronoun resolution, callbacks). Older pairs keep
-  # living in summarized working memory. 0 = default 10 pairs.
-  chat_history_turns: 10
+  # living in summarized working memory. With the 4k window, very long
+  # histories may be trimmed by the context shift. 0 = default 6 pairs.
+  chat_history_turns: 6
   # Note: keep_alive is intentionally NOT set here — Ollama manages model
   # residency itself (its default 5 min unload); Mai pins it per-request.
   # CLOUD provider — used when hybrid_mode=true for non-sensitive queries

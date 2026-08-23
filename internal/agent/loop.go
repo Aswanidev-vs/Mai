@@ -625,12 +625,12 @@ func (o *Orchestrator) storeResponse(text string, userTurn ...string) {
 }
 
 // SetChatHistoryTurns sets how many verbatim user/assistant pairs are kept and
-// sent to the chat API. <=0 keeps the default (10).
+// sent to the chat API. <=0 keeps the default (6 — sized for an 8k window).
 func (o *Orchestrator) SetChatHistoryTurns(pairs int) {
 	o.chatMu.Lock()
 	defer o.chatMu.Unlock()
 	if pairs <= 0 {
-		pairs = 10
+		pairs = 6
 	}
 	o.chatHistoryMax = pairs
 }

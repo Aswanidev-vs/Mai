@@ -1370,12 +1370,6 @@ func main() {
 				lookbackIdx = (lookbackIdx + 1) % lookbackSize
 			}
 
-			// Energy gate: skip the wake-word spotter on near-silence so ambient
-			// noise (rms below BargeInThreshold) can't false-fire a greeting.
-			if rms < cfg.Audio.BargeInThreshold {
-				return
-			}
-
 			kwsStream.AcceptWaveform(16000, samples)
 			if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
 				asrStream.AcceptWaveform(16000, samples)
