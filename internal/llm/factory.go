@@ -55,11 +55,7 @@ func (f *Factory) TestCloudProvider() error {
 	url := f.config.LLM.Cloud.URL
 	apiKey := f.config.LLM.Cloud.APIKey
 
-	apiKeyStatus := "(not set)"
-	if apiKey != "" {
-		apiKeyStatus = "(set)"
-	}
-	log.Printf("[TEST] Provider: %s, Model: %s, URL: %s, APIKey: %s", provider, model, url, apiKeyStatus)
+	log.Printf("[TEST] Provider: %s, Model: %s, URL: %s", provider, model, url)
 
 	cloud, err := f.createCloudProvider(provider, model, url, apiKey)
 	if err != nil {
