@@ -84,6 +84,25 @@ func (p *OllamaProvider) applyTokenOptions(options map[string]interface{}) map[s
 // llama-server reuses the KV cache of the identical prefix. That is what keeps
 // long conversations as fast as turn two.
 func (p *OllamaProvider) StreamChat(ctx context.Context, messages []interfaces.ChatMessage, opts interfaces.GenerationOptions, callback func(chunk string)) error {
+	// Graceful degradation: if the pinned num_ctx is larger than the model
+	// supports (or the KV cache doesn't fit), Ollama fails the load with an
+	// allocation error instead of clamping. As long as nothing has streamed
+	// yet, retry once without the pin so Ollama auto-sizes the window and the
+	// conversation still works — instead of erroring mid-session on a model
+	// swap.
+	streamed := false
+	err := p.streamChatOnce(ctx, messages, opts, func(chunk string) {
+		streamed = true
+		callback(chunk)
+	}, true)
+	if err != nil && !streamed && ctx.Err() == nil && p.numCtx > 0 && isContextAllocError(err) {
+		log.Printf("[OLLAMA] Context allocation failed with num_ctx=%d (%v); retrying with Ollama's auto-sized context", p.numCtx, err)
+		return p.streamChatOnce(ctx, messages, opts, callback, false)
+	}
+	return err
+}
+
+func (p *OllamaProvider) streamChatOnce(ctx context.Context, messages []interfaces.ChatMessage, opts interfaces.GenerationOptions, callback func(chunk string), pinCtx bool) error {
 	options := p.applyTokenOptions(map[string]interface{}{
 		"temperature": opts.Temperature,
 	})
@@ -92,6 +111,10 @@ func (p *OllamaProvider) StreamChat(ctx context.Context, messages []interfaces.C
 	}
 	if opts.MaxTokens > 0 {
 		options["num_predict"] = opts.MaxTokens
+	}
+	if !pinCtx {
+		delete(options, "num_ctx")
+		delete(options, "num_keep")
 	}
 
 	chatURL := p.url
@@ -157,6 +180,24 @@ func (p *OllamaProvider) StreamChat(ctx context.Context, messages []interfaces.C
 	}
 
 	return nil
+}
+
+// isContextAllocError reports whether err looks like Ollama failing to
+// allocate the pinned context window (model max < num_ctx, or insufficient
+// memory for the KV cache). Failure shapes observed empirically:
+// "llama-server reported out-of-memory during startup" and
+// "failed to allocate buffer of size ...".
+func isContextAllocError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	for _, marker := range []string{"out of memory", "out-of-memory", "failed to allocate", "insufficient memory"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *OllamaProvider) Generate(ctx context.Context, prompt string, opts interfaces.GenerationOptions) (string, error) {
