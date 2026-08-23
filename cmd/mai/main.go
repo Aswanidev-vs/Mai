@@ -741,6 +741,7 @@ func main() {
 		})
 		registry.Register(&adapters.YouTubeTool{})
 		registry.Register(adapters.NewDeepSearchTool())
+		registry.Register(adapters.NewWebResearchTool())
 		registry.Register(&adapters.FileWriteTool{})
 		registry.Register(&adapters.ClockTool{})
 		registry.Register(&adapters.WhatsAppTool{
