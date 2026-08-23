@@ -14,6 +14,7 @@ audio:
   barge_in_warmup_ms: 400   # AEC convergence wait before barge-in detection arms
   barge_in_sustain_ms: 150  # Sustained loud residual required to confirm a real interruption
   thinking_chime: true      # Play a subtle tone during LLM processing
+  tts_play_local_always: true  # Voice always on local speakers, even with companion open (no browser autoplay silence)
 
 kws:
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
@@ -25,7 +26,7 @@ kws:
   joiner: "joiner-epoch-12-avg-2-chunk-16-left-64.onnx"
   tokens: "tokens.txt"
   keywords: "▁MA I @mai, ▁MY @mai, ▁HE Y ▁MA I @mai"  # Subword token version
-  confidence_threshold: 0.02
+  confidence_threshold: 0.55
   cooldown_ms: 1500
 
 vad:
@@ -44,7 +45,7 @@ vad:
 
 asr:
   # Active model: "qwen3" | "nemotron" | "omnilingual" | "transducer"
-  active_model: "nemotron"
+  active_model: "qwen3"
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
@@ -74,7 +75,7 @@ asr:
     decoder: "decoder.int8.onnx"
     joiner: "joiner.int8.onnx"
     tokens: "tokens.txt"
-    language: "auto"  # or "auto" for auto-detection
+    language: "en"  # or "auto" for auto-detection
     decoding_method: "greedy_search"
     max_active_paths: 4
     enable_endpoint: 1

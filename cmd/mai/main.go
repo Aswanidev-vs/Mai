@@ -591,36 +591,40 @@ func main() {
 		defer atomic.StoreInt32(&ttsPlaying, 0)
 		log.Printf("[TTS-PLAY] Starting synthesis: speed=%.2f, text=%.80s...", speed, text)
 
-		if bus != nil && cfg.Server.Enabled && companionHasClient() {
-			// ── Browser companion: stream chunks, stop on barge-in ──
+		if cfg.Audio.TTSPlayLocalAlways || !companionHasClient() {
+			// Always render to the local speaker so Mai is audible regardless
+			// of the companion tab's autoplay state. The playback callback
+			// feeds the echo reference (audio.go), so barge-in AEC still
+			// cancels Mai's own voice. Browser audio publishing is skipped to
+			// avoid doubled output; the tab keeps getting text/visual events.
+			_ = playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
+				synthesize(text, speed, func(samples []float32) bool {
+					if atomic.LoadInt32(&stopPlayback) != 0 {
+						return false
+					}
+					ch <- ttsToBrowserResampler.resample(samples)
+					return true
+				})
+			})
+		} else {
+			// Opt-in browser-only path (tts_play_local_always: false): stream
+			// chunks to the companion tab. Echo reference is fed manually
+			// since the local speaker isn't used here.
 			synthStart := time.Now()
 			var publishedSamples int64
 			synthesize(text, speed, func(samples []float32) bool {
 				if atomic.LoadInt32(&stopPlayback) != 0 {
 					return false
 				}
-				// Feed the synthesized samples into the echo reference so the
-				// AEC can subtract Mai's own voice (echoed through the browser
-				// mic) — otherwise barge-in detection would misread her echo as
-				// a user interruption and cut her off.
 				if len(samples) > 0 {
 					publishedSamples += int64(len(samples))
-					resampledForEcho := ttsToEchoResampler.resample(samples)
-					refBuffer.Push(resampledForEcho)
-					// Resample to 44.1k for browser playback.
-					resampledForBrowser := ttsToBrowserResampler.resample(samples)
-					publishTTSAudioChunk(bus, resampledForBrowser, 44100, false)
+					refBuffer.Push(ttsToEchoResampler.resample(samples))
+					publishTTSAudioChunk(bus, ttsToBrowserResampler.resample(samples), 44100, false)
 				}
 				return true
 			})
 			publishTTSAudioChunk(bus, nil, 44100, true)
 
-			// Browser playback lags publishing by the audio duration plus
-			// network/decode latency. Keep ttsPlaying asserted until the
-			// estimated playback end: clearing it at publish time opens a
-			// window where Mai's own voice (browser speakers → browser mic)
-			// reaches the barge-in detector mid-sentence and she interrupts
-			// herself. A genuine barge-in (stopPlayback) exits early.
 			if ttsSampleRate > 0 {
 				estEnd := synthStart.Add(time.Duration(float64(publishedSamples)/float64(ttsSampleRate)*float64(time.Second)) + 400*time.Millisecond)
 				for time.Now().Before(estEnd) {
@@ -634,18 +638,6 @@ func main() {
 					}
 				}
 			}
-		} else {
-			// ── Local-only path: streaming playback ──
-			_ = playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
-				synthesize(text, speed, func(samples []float32) bool {
-					if atomic.LoadInt32(&stopPlayback) != 0 {
-						return false
-					}
-					resampled := ttsToBrowserResampler.resample(samples)
-					ch <- resampled
-					return true
-				})
-			})
 		}
 
 		lastResponseMu.Lock()
@@ -1047,6 +1039,26 @@ func main() {
 		lastText = ""
 	}
 
+	// updateLiveASR decodes one frame already pushed to asrStream, returns the
+	// partial transcript, and logs it. Shared by the listening and wake-word
+	// states so the user sees live captions in real time in either state.
+	// Uses log (stderr) rather than fmt.Printf("\r") so the line isn't clobbered
+	// by the timestamped stderr logs.
+	updateLiveASR := func() string {
+		if asrStream == nil {
+			return ""
+		}
+		for recognizer.IsReady(asrStream) {
+			recognizer.Decode(asrStream)
+		}
+		text := recognizer.GetResult(asrStream).Text
+		if text != "" && text != lastText {
+			lastText = text
+			log.Printf("[ASR] Live: %s%s", sessionText, text)
+		}
+		return text
+	}
+
 	// Audio callback
 	// runListening: the VAD + ASR + segment-end detection pipeline.
 	// Shared by local mic (in listening state) and browser mic.
@@ -1069,14 +1081,7 @@ func main() {
 
 		if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
 			asrStream.AcceptWaveform(16000, samples)
-			for recognizer.IsReady(asrStream) {
-				recognizer.Decode(asrStream)
-			}
-			text := recognizer.GetResult(asrStream).Text
-			if text != "" && text != lastText {
-				lastText = text
-				fmt.Printf("\r[ASR] Live: %s%s", sessionText, text)
-			}
+			text := updateLiveASR()
 			// Finalize when the recognizer's own endpoint rules fire (e.g.
 			// rule1/rule2 trailing silence). Silero VAD alone is unreliable as
 			// the sole end-of-turn signal — with streaming ASR live text keeps
@@ -1315,6 +1320,7 @@ func main() {
 			if time.Since(lastResponseTime) < 15*time.Second {
 				if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
 					asrStream.AcceptWaveform(16000, samples)
+					updateLiveASR()
 				}
 
 				vadBuffer.Push(samples)
@@ -1361,9 +1367,16 @@ func main() {
 				lookbackIdx = (lookbackIdx + 1) % lookbackSize
 			}
 
+			// Energy gate: skip the wake-word spotter on near-silence so ambient
+			// noise (rms below BargeInThreshold) can't false-fire a greeting.
+			if rms < cfg.Audio.BargeInThreshold {
+				return
+			}
+
 			kwsStream.AcceptWaveform(16000, samples)
 			if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
 				asrStream.AcceptWaveform(16000, samples)
+				updateLiveASR()
 			}
 
 			fmt.Printf("\r[AUDIO] Level: %.4f ", rms)

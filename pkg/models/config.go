@@ -9,7 +9,8 @@ type Config struct {
 		BargeInThreshold float64 `yaml:"barge_in_threshold"`
 		BargeInWarmupMs  int     `yaml:"barge_in_warmup_ms"`  // AEC convergence wait before barge-in arms; <=0 = 400ms
 		BargeInSustainMs int     `yaml:"barge_in_sustain_ms"` // Sustained speech required to trigger; <=0 = 150ms
-		ThinkingChime    bool    `yaml:"thinking_chime"`
+		ThinkingChime      bool `yaml:"thinking_chime"`
+		TTSPlayLocalAlways bool `yaml:"tts_play_local_always"` // Play voice on local speakers even when the companion UI is open; avoids browser autoplay-silence
 	} `yaml:"audio"`
 	KWS struct {
 		Provider   string  `yaml:"provider"` // "cpu", "cuda", "coreml", "opencl"
