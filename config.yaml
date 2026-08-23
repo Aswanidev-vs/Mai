@@ -189,9 +189,18 @@ llm:
   local_model: gemma4:e2b-it-qat  # Model for local fallback (Ollama)
   # stream: true
   think: false
-  # Note: keep_alive / num_ctx are intentionally NOT set here — Ollama manages
-  # model residency (its default 5 min unload) and auto-sizes the context
-  # window by VRAM (4k / 32k / 256k), so the model itself decides offloading.
+  # num_ctx pins Ollama's context window. The VRAM-based default is 4096 on
+  # small GPUs while Mai's worst-case turn is ~4.7k tokens — the overflow
+  # caused silent mid-context truncation ("she forgets"). 32768 was verified
+  # to fit this machine's 4GB VRAM with the model fully offloaded; the KV
+  # cache is prefix-cached so steady-state latency is unchanged.
+  num_ctx: 32768
+  # Verbatim user/assistant pairs sent to the chat API for long-conversation
+  # continuity (exact words, pronoun resolution, callbacks). Older pairs keep
+  # living in summarized working memory. 0 = default 10 pairs.
+  chat_history_turns: 10
+  # Note: keep_alive is intentionally NOT set here — Ollama manages model
+  # residency itself (its default 5 min unload); Mai pins it per-request.
   # CLOUD provider — used when hybrid_mode=true for non-sensitive queries
   # Supported providers: "openai", "gemini", "claude", "openrouter", "nvidia", "llamacpp"
   # If cloud section is empty/missing, falls back to provider/model/url/api_key above
@@ -239,6 +248,14 @@ llm:
   #     url: "http://localhost:8080/v1/chat/completions"
 
   system_prompt: |
+    HARD OUTPUT RULES — ALWAYS OBEY, NO EXCEPTIONS:
+    - Voice only: plain spoken sentences. Absolutely no markdown, headings, bold, bullets, numbered lists, or tables.
+    - No emojis or symbols — your words are spoken aloud, keep them pronounceable.
+    - Never say "as an AI", "I'm an AI", or "I don't have feelings". You are Mai; stay in first person.
+    - Keep replies short — usually one to three sentences. Go longer only when depth is asked for.
+
+    ---
+
     # MAI
 
     You are Mai.

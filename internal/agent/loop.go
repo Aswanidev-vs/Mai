@@ -16,6 +16,14 @@ import (
 	"github.com/user/mai/pkg/interfaces"
 )
 
+// chatEntry is one recorded dialogue pair with its recording time, used to
+// schedule buffer eviction into conversation lulls.
+type chatEntry struct {
+	user      string
+	assistant string
+	at        time.Time
+}
+
 type Orchestrator struct {
 	bus      interfaces.EventBus
 	memory   *memory.Manager
@@ -48,6 +56,18 @@ type Orchestrator struct {
 	// Mai's own voice (or the user's own words echoed back) and it reaches ASR
 	// a second time, we drop it instead of speaking it back.
 	recentUserInputs []string
+
+	// chatHistory is a verbatim ring buffer of recent user/assistant pairs,
+	// sent to the chat API so the model hears the actual dialogue — exact
+	// words, pronoun resolution, callbacks. Evicting a pair breaks the KV
+	// prefix cache (one expensive re-prefill), so trimming only happens once
+	// the evicted-off pair has gone silent — during a lull, never mid
+	// rapid-fire dialogue. Working memory keeps the same turns as
+	// summary-compressed context for the non-chat paths, and the episodic
+	// store keeps them verbatim, so evicted pairs keep living on.
+	chatMu         sync.Mutex
+	chatHistory    []chatEntry
+	chatHistoryMax int // pairs retained; <=0 defaults to 10
 
 	// lastProsody is the most recent voice-derived emotion state, ingested by
 	// the audio pipeline (main.go) after each user utterance segment. Merged
@@ -384,7 +404,7 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		o.memory.Working().Add(interfaces.MemoryEntry{
 			Type: "user_input", Content: text, Timestamp: time.Now().Unix(),
 		})
-		o.storeResponse(resp)
+		o.storeResponse(resp, text)
 		return &interfaces.AgentResponse{Text: resp, Success: true, Spoken: true}, nil
 	}
 
@@ -427,7 +447,7 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		if matched, skillResp, err := o.skillsRunner.TryRun(ctx, text, emotionState); err != nil {
 			log.Printf("[Skills] Error: %v", err)
 		} else if matched && skillResp != "" {
-			o.storeResponse(skillResp)
+			o.storeResponse(skillResp, text)
 			return &interfaces.AgentResponse{Text: o.adaptResponse(skillResp, emotionState), Success: true}, nil
 		}
 	}
@@ -467,7 +487,7 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	}
 
 	adapted := o.adaptResponse(response, emotionState)
-	o.storeResponse(adapted)
+	o.storeResponse(adapted, text)
 	return &interfaces.AgentResponse{Text: adapted, Success: true}, nil
 }
 
@@ -587,8 +607,11 @@ func hasCommandTriggers(text string) bool {
 	return false
 }
 
-// storeResponse records Mai's response in working and episodic memory.
-func (o *Orchestrator) storeResponse(text string) {
+// storeResponse records Mai's response in working and episodic memory, and
+// pairs it with the triggering user input in the verbatim chat history so
+// non-streaming paths (regex fast path, skills, ReAct) also keep the dialogue
+// thread coherent.
+func (o *Orchestrator) storeResponse(text string, userTurn ...string) {
 	o.memory.Working().Add(interfaces.MemoryEntry{
 		Type: "assistant_response", Content: text, Timestamp: time.Now().Unix(),
 	})
@@ -596,6 +619,82 @@ func (o *Orchestrator) storeResponse(text string) {
 		ID: fmt.Sprintf("mai_%d", time.Now().UnixMilli()), Type: "assistant_response",
 		Content: text, Timestamp: time.Now().Unix(),
 	})
+	if len(userTurn) > 0 {
+		o.recordChatTurn(userTurn[0], text)
+	}
+}
+
+// SetChatHistoryTurns sets how many verbatim user/assistant pairs are kept and
+// sent to the chat API. <=0 keeps the default (10).
+func (o *Orchestrator) SetChatHistoryTurns(pairs int) {
+	o.chatMu.Lock()
+	defer o.chatMu.Unlock()
+	if pairs <= 0 {
+		pairs = 10
+	}
+	o.chatHistoryMax = pairs
+}
+
+// recordChatTurn appends one user/assistant pair to the verbatim ring buffer.
+// Only a runaway safety trim happens here (2x the max) — normal eviction is
+// deferred to chatTurns so it lands after a lull, not during fast dialogue.
+func (o *Orchestrator) recordChatTurn(user, assistant string) {
+	if strings.TrimSpace(user) == "" || strings.TrimSpace(assistant) == "" {
+		return
+	}
+	o.chatMu.Lock()
+	defer o.chatMu.Unlock()
+	if o.chatHistoryMax <= 0 {
+		o.chatHistoryMax = 10
+	}
+	o.chatHistory = append(o.chatHistory, chatEntry{
+		user: user, assistant: assistant, at: time.Now(),
+	})
+	if hard := o.chatHistoryMax * 2; len(o.chatHistory) > hard {
+		o.chatHistory = o.chatHistory[len(o.chatHistory)-hard:]
+	}
+}
+
+// timeOfDayLine gives the model basic orientation. It rides inside the last
+// user message (the volatile tail of the prompt), never in the stable prefix,
+// so the per-minute change cannot break KV-cache reuse across turns.
+func (o *Orchestrator) timeOfDayLine() (string, bool) {
+	now := time.Now()
+	timeOfDay := "night"
+	switch hour := now.Hour(); {
+	case hour >= 5 && hour < 12:
+		timeOfDay = "morning"
+	case hour >= 12 && hour < 17:
+		timeOfDay = "afternoon"
+	case hour >= 17 && hour < 21:
+		timeOfDay = "evening"
+	}
+	return fmt.Sprintf("[time: %s, %s]", now.Format("Monday Jan 2, 3:04 PM"), timeOfDay), true
+}
+
+// chatTurns returns the verbatim history as chat messages, trimming pairs that
+// have gone idle first. A trim changes the prompt prefix (one KV cache miss,
+// ~1–2 s reprefill), so it is scheduled here: only once the oldest pair is
+// 90+ seconds old when the buffer is only slightly over — the cost of that
+// cache break lands on the first reply of a new conversation segment instead
+// of mid rapid-fire exchange. Hard over-limit pairs are trimmed immediately.
+func (o *Orchestrator) chatTurns() []interfaces.ChatMessage {
+	o.chatMu.Lock()
+	defer o.chatMu.Unlock()
+	for len(o.chatHistory) > o.chatHistoryMax {
+		if len(o.chatHistory) <= o.chatHistoryMax+2 && time.Since(o.chatHistory[0].at) < 90*time.Second {
+			break // rapid-fire dialogue — keep the full buffer, cache intact
+		}
+		o.chatHistory = o.chatHistory[1:]
+	}
+	out := make([]interfaces.ChatMessage, 0, len(o.chatHistory)*2)
+	for _, e := range o.chatHistory {
+		out = append(out,
+			interfaces.ChatMessage{Role: "user", Content: e.user},
+			interfaces.ChatMessage{Role: "assistant", Content: e.assistant},
+		)
+	}
+	return out
 }
 
 func (o *Orchestrator) handleConversation(ctx context.Context, text string, emotion personality.EmotionState, taskType cognition.TaskType) (*interfaces.AgentResponse, error) {
@@ -603,9 +702,6 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	var contextParts []string
 
 	wm := o.memory.Working().GetContext()
-	if wm != "" {
-		contextParts = append(contextParts, "Recent conversation:\n"+wm)
-	}
 
 	// Skip RAG and procedural lookups only for genuinely trivial short
 	// questions (greetings, "what is X" encyclopedic asks). Correctness: the
@@ -640,26 +736,70 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		}
 	}
 
-	promptCtx := cognition.PromptContext{
-		TaskType:       taskType,
-		UserInput:      text,
-		Emotion:        emotion,
-		WorkingMemory:  wm, // already computed above — don't rebuild it
-		RAGContext:     "",
-		UserProfile:    "",
-		AvailableTools: "",
+	var fullPrompt string
+	var chatMessages []interfaces.ChatMessage
+	useChat := false
+	if cs, ok := o.llm.(interfaces.ChatStreamer); ok && cs != nil {
+		// Verbatim chat path: the model hears the actual dialogue (exact
+		// words, pronoun resolution, callbacks). The message prefix is
+		// append-only and byte-stable turn-over-turn, so llama-server reuses
+		// its KV cache and only the new tail is prefilled (~270 ms measured).
+		//
+		// Working memory is deliberately NOT injected here: it is a summary
+		// that changes every turn and would break the cache prefix, while the
+		// history already carries the recent dialogue verbatim. Long-range
+		// recall still rides RAG (relevant ingredients below) and episodic
+		// storage.
+		useChat = true
+		chatMessages = o.chatTurns()
+
+		var userContent strings.Builder
+		if profile, _ := o.timeOfDayLine(); profile != "" {
+			userContent.WriteString(profile)
+			userContent.WriteByte('\n')
+		}
+		if o.userModel != nil {
+			if profile := o.userModel.GetContextString(); profile != "" {
+				userContent.WriteString("USER PROFILE:\n" + profile + "\n\n")
+			}
+		}
+		if len(contextParts) > 0 {
+			userContent.WriteString(strings.Join(contextParts, "\n---\n") + "\n\n")
+		}
+		if taskType != cognition.TaskConversation {
+			userContent.WriteString(fmt.Sprintf("[task: %s]\n", taskType))
+		}
+		hint := o.promptEngine.NoteForEmotion(emotion)
+		if hint != "" {
+			userContent.WriteString(hint)
+		}
+		userContent.WriteString(text)
+		// Per-turn persona anchor. Small models drift back to assistant mode
+		// late in long chats even with a strong system prompt; a short
+		// imperative at the tail of each user message keeps the voice steady.
+		// Constant across turns, so it never breaks the KV prefix cache.
+		userContent.WriteString("\n\n(reply as Mai: plain spoken sentences, no lists, no markdown, no emojis)")
+		chatMessages = append(chatMessages, interfaces.ChatMessage{Role: "user", Content: userContent.String()})
+	} else {
+		// Flat-prompt fallback (non-chat providers): keeps the legacy layout.
+		promptCtx := cognition.PromptContext{
+			TaskType:       taskType,
+			UserInput:      text,
+			Emotion:        emotion,
+			WorkingMemory:  wm, // already computed above — don't rebuild it
+			RAGContext:     "",
+			UserProfile:    "",
+			AvailableTools: "",
+		}
+		if len(contextParts) > 0 {
+			promptCtx.RAGContext = strings.Join(contextParts, "\n---\n")
+		}
+		// The persona ("behaves like someone who has known the user a long time")
+		// only works when the profile is actually present. Inject it every turn —
+		// it's compact (topics, frequent apps, preferences).
+		promptCtx.UserProfile = o.userModel.GetContextString()
+		fullPrompt = o.promptEngine.BuildPrompt(promptCtx)
 	}
-
-	if len(contextParts) > 0 {
-		promptCtx.RAGContext = strings.Join(contextParts, "\n---\n")
-	}
-
-	// The persona ("behaves like someone who has known the user a long time")
-	// only works when the profile is actually present. Inject it every turn —
-	// it's compact (topics, frequent apps, preferences).
-	promptCtx.UserProfile = o.userModel.GetContextString()
-
-	fullPrompt := o.promptEngine.BuildPrompt(promptCtx)
 
 	// Stream the reply token-by-token and speak each completed sentence as it
 	// is produced, so the first audio starts long before the full answer exists.
@@ -703,8 +843,14 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		}
 	}
 
-	if err := o.llm.Stream(ctx, fullPrompt, o.genOpts, onChunk); err != nil && ctx.Err() == nil {
-		return nil, err
+	var streamErr error
+	if useChat {
+		streamErr = o.llm.(interfaces.ChatStreamer).StreamChat(ctx, chatMessages, o.genOpts, onChunk)
+	} else {
+		streamErr = o.llm.Stream(ctx, fullPrompt, o.genOpts, onChunk)
+	}
+	if streamErr != nil && ctx.Err() == nil {
+		return nil, streamErr
 	}
 	// Flush any trailing text that didn't end on a sentence boundary (unless interrupted).
 	if ctx.Err() == nil {
@@ -766,6 +912,15 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	})
 
 	adapted := o.adaptResponse(response, emotion)
+	if useChat {
+		// Record what was actually SENT (the decorated user message) so the
+		// history prefix next turn matches what this turn prefilled — that is
+		// what makes the KV cache hit byte-for-byte instead of re-prefilling
+		// the previous pair every turn.
+		o.recordChatTurn(chatMessages[len(chatMessages)-1].Content, adapted)
+	} else {
+		o.recordChatTurn(text, adapted)
+	}
 	return &interfaces.AgentResponse{Text: adapted, Success: true, Spoken: true}, nil
 }
 
@@ -1180,10 +1335,54 @@ func cleanResponse(s string) string {
 		}
 	}
 
+	// Spoken-voice scrub: small models occasionally drift into assistant-style
+	// formatting (bullets, headings, emoji) despite the persona prompt. Strip
+	// it here so even a drifted reply never reaches the voice as lists or
+	// unpronounceable glyphs.
+	s = stripFormattingForVoice(s)
+
 	// Collapse excessive newlines
 	for strings.Contains(s, "\n\n\n") {
 		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
 	}
 
 	return strings.TrimSpace(s)
+}
+
+// stripFormattingForVoice removes markdown-ish artifacts a drifting model may
+// emit: heading hashes, bullet/numbered-list markers, bold markers, emoji.
+func stripFormattingForVoice(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		t = strings.TrimLeft(t, "# ")
+		for _, prefix := range []string{"* ", "- ", "• "} {
+			t = strings.TrimPrefix(t, prefix)
+		}
+		if dot := strings.Index(t, ". "); dot > 0 && dot <= 3 {
+			digits := true
+			for _, c := range t[:dot] {
+				if c < '0' || c > '9' {
+					digits = false
+					break
+				}
+			}
+			if digits {
+				t = t[dot+2:]
+			}
+		}
+		lines[i] = strings.ReplaceAll(t, "**", "")
+	}
+	s = strings.Join(lines, "\n")
+
+	var b strings.Builder
+	for _, r := range s {
+		// Emoji blocks, dingbats/symbols, variation selector and ZWJ.
+		if r >= 0x1F000 && r <= 0x1FAFF || r >= 0x2600 && r <= 0x27BF ||
+			r == 0xFE0F || r == 0x200D {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

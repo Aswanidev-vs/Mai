@@ -85,7 +85,8 @@ func (f *Factory) TestCloudProvider() error {
 
 func (f *Factory) ollamaOpts() OllamaOptions {
 	return OllamaOptions{
-		MinP: f.config.LLM.Sampling.MinP,
+		MinP:   f.config.LLM.Sampling.MinP,
+		NumCtx: f.config.LLM.NumCtx,
 	}
 }
 

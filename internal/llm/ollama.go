@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/user/mai/pkg/interfaces"
@@ -19,6 +20,13 @@ type OllamaOptions struct {
 	// MinP is the minimum token probability (0-1) — keeps low-end/local model
 	// sampling from wandering into irrelevant tokens. 0 disables.
 	MinP float64
+
+	// NumCtx pins the context window. Ollama's VRAM-based default is 4096 on
+	// small GPUs — below Mai's worst-case turn (~4.7k tokens) — which causes
+	// silent mid-context truncation. Pinning 32768 removes the wall; on this
+	// project's 4GB VRAM it was verified to fit with the model fully offloaded.
+	// 0 disables pinning.
+	NumCtx int
 }
 
 // OllamaProvider implements interfaces.LLMProvider using the Ollama API
@@ -28,6 +36,7 @@ type OllamaProvider struct {
 	systemPrompt string
 	think        *bool // nil = use model default, false = disable thinking
 	minP         float64
+	numCtx       int
 	client       *http.Client
 }
 
@@ -38,6 +47,7 @@ func NewOllamaProvider(model, url, systemPrompt string, think *bool, opts Ollama
 		systemPrompt: systemPrompt,
 		think:        think,
 		minP:         opts.MinP,
+		numCtx:       opts.NumCtx,
 		client:       &http.Client{Timeout: 5 * time.Minute},
 	}
 }
@@ -47,16 +57,106 @@ func NewOllamaProvider(model, url, systemPrompt string, think *bool, opts Ollama
 // fatal for voice latency.
 const ollamaKeepAlive = "10m"
 
-// applyTokenOptions adds min_p to an options map (creating it if nil).
-// num_ctx is intentionally NOT set: Ollama auto-sizes context by VRAM.
+// applyTokenOptions adds min_p and num_ctx to an options map (creating it if
+// nil). num_keep = 0 makes Ollama's context-shift protect everything before
+// the shift point — combined with the system field pinning the persona, the
+// character survives even under overflow instead of being silently dropped.
 func (p *OllamaProvider) applyTokenOptions(options map[string]interface{}) map[string]interface{} {
-	if p.minP > 0 {
+	if p.minP > 0 || p.numCtx > 0 {
 		if options == nil {
-			options = make(map[string]interface{}, 1)
+			options = make(map[string]interface{}, 2)
 		}
+	}
+	if p.minP > 0 {
 		options["min_p"] = p.minP
 	}
+	if p.numCtx > 0 {
+		options["num_ctx"] = p.numCtx
+		options["num_keep"] = 25
+	}
 	return options
+}
+
+// StreamChat implements interfaces.ChatStreamer via Ollama's /api/chat
+// endpoint. The system prompt rides the dedicated "system" field (cached as a
+// stable prefix), and prior turns are sent verbatim as messages — measured on
+// a GTX 1650: a later turn prefills only the new tail tokens (~270 ms) because
+// llama-server reuses the KV cache of the identical prefix. That is what keeps
+// long conversations as fast as turn two.
+func (p *OllamaProvider) StreamChat(ctx context.Context, messages []interfaces.ChatMessage, opts interfaces.GenerationOptions, callback func(chunk string)) error {
+	options := p.applyTokenOptions(map[string]interface{}{
+		"temperature": opts.Temperature,
+	})
+	if opts.TopP > 0 {
+		options["top_p"] = opts.TopP
+	}
+	if opts.MaxTokens > 0 {
+		options["num_predict"] = opts.MaxTokens
+	}
+
+	chatURL := p.url
+	if strings.HasSuffix(chatURL, "/api/generate") {
+		chatURL = strings.TrimSuffix(chatURL, "/api/generate") + "/api/chat"
+	}
+
+	reqBody := map[string]interface{}{
+		"model":      p.model,
+		"messages":   messages,
+		"stream":     true,
+		"keep_alive": ollamaKeepAlive,
+		"options":    options,
+	}
+	if p.systemPrompt != "" {
+		reqBody["system"] = p.systemPrompt
+	}
+	if p.think != nil {
+		reqBody["think"] = *p.think
+	}
+	requestBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", chatURL, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("ollama chat error status: %d %s", resp.StatusCode, body)
+	}
+
+	decoder := json.NewDecoder(resp.Body)
+	for {
+		var chunk struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			Done bool `json:"done"`
+		}
+		if err := decoder.Decode(&chunk); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		if chunk.Message.Content != "" {
+			callback(chunk.Message.Content)
+		}
+		if chunk.Done {
+			break
+		}
+	}
+
+	return nil
 }
 
 func (p *OllamaProvider) Generate(ctx context.Context, prompt string, opts interfaces.GenerationOptions) (string, error) {
