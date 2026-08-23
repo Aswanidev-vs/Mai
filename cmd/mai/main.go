@@ -81,7 +81,7 @@ func main() {
 		cfg.LLM.Sampling.TopP = 0.85
 	}
 	if cfg.LLM.Sampling.MaxTokens == 0 {
-		cfg.LLM.Sampling.MaxTokens = 400
+		cfg.LLM.Sampling.MaxTokens = 250
 	}
 
 	// Test cloud provider if requested
