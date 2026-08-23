@@ -774,6 +774,11 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 			userContent.WriteString(hint)
 		}
 		userContent.WriteString(text)
+		// Per-turn persona anchor. Small models drift back to assistant mode
+		// late in long chats even with a strong system prompt; a short
+		// imperative at the tail of each user message keeps the voice steady.
+		// Constant across turns, so it never breaks the KV prefix cache.
+		userContent.WriteString("\n\n(reply as Mai: plain spoken sentences, no lists, no markdown, no emojis)")
 		chatMessages = append(chatMessages, interfaces.ChatMessage{Role: "user", Content: userContent.String()})
 	} else {
 		// Flat-prompt fallback (non-chat providers): keeps the legacy layout.
@@ -1330,10 +1335,54 @@ func cleanResponse(s string) string {
 		}
 	}
 
+	// Spoken-voice scrub: small models occasionally drift into assistant-style
+	// formatting (bullets, headings, emoji) despite the persona prompt. Strip
+	// it here so even a drifted reply never reaches the voice as lists or
+	// unpronounceable glyphs.
+	s = stripFormattingForVoice(s)
+
 	// Collapse excessive newlines
 	for strings.Contains(s, "\n\n\n") {
 		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
 	}
 
 	return strings.TrimSpace(s)
+}
+
+// stripFormattingForVoice removes markdown-ish artifacts a drifting model may
+// emit: heading hashes, bullet/numbered-list markers, bold markers, emoji.
+func stripFormattingForVoice(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		t = strings.TrimLeft(t, "# ")
+		for _, prefix := range []string{"* ", "- ", "• "} {
+			t = strings.TrimPrefix(t, prefix)
+		}
+		if dot := strings.Index(t, ". "); dot > 0 && dot <= 3 {
+			digits := true
+			for _, c := range t[:dot] {
+				if c < '0' || c > '9' {
+					digits = false
+					break
+				}
+			}
+			if digits {
+				t = t[dot+2:]
+			}
+		}
+		lines[i] = strings.ReplaceAll(t, "**", "")
+	}
+	s = strings.Join(lines, "\n")
+
+	var b strings.Builder
+	for _, r := range s {
+		// Emoji blocks, dingbats/symbols, variation selector and ZWJ.
+		if r >= 0x1F000 && r <= 0x1FAFF || r >= 0x2600 && r <= 0x27BF ||
+			r == 0xFE0F || r == 0x200D {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
