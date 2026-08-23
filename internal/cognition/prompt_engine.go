@@ -120,20 +120,30 @@ func (pe *PromptEngine) appendEmotionContext(b *strings.Builder, ctx PromptConte
 	if ctx.Emotion.Type == personality.EmotionNeutral || ctx.Emotion.Confidence < 0.5 {
 		return
 	}
+	b.WriteString(pe.NoteForEmotion(ctx.Emotion))
+}
 
-	// Subtle hint — don't override personality, just adjust energy
-	switch ctx.Emotion.Type {
-	case personality.EmotionStressed:
-		b.WriteString("USER NOTE: They seem stressed. Keep it simple and practical.\n")
-	case personality.EmotionFrustrated:
-		b.WriteString("USER NOTE: They seem frustrated. Be direct and solution-focused.\n")
-	case personality.EmotionSad:
-		b.WriteString("USER NOTE: They seem down. Be present and gentle, don't rush to fix.\n")
-	case personality.EmotionExcited:
-		b.WriteString("USER NOTE: They're excited. Match their energy naturally.\n")
-	case personality.EmotionHappy:
-		b.WriteString("USER NOTE: They're in a good mood. Be warm and engaged.\n")
+// NoteForEmotion returns the subtle mood hint for a high-confidence emotion
+// state, or "" when none applies. Extracted so the chat path (verbatim
+// messages) and the flat-prompt path share one definition.
+func (pe *PromptEngine) NoteForEmotion(em personality.EmotionState) string {
+	if em.Type == personality.EmotionNeutral || em.Confidence < 0.5 {
+		return ""
 	}
+	// Subtle hint — don't override personality, just adjust energy
+	switch em.Type {
+	case personality.EmotionStressed:
+		return "USER NOTE: They seem stressed. Keep it simple and practical.\n"
+	case personality.EmotionFrustrated:
+		return "USER NOTE: They seem frustrated. Be direct and solution-focused.\n"
+	case personality.EmotionSad:
+		return "USER NOTE: They seem down. Be present and gentle, don't rush to fix.\n"
+	case personality.EmotionExcited:
+		return "USER NOTE: They're excited. Match their energy naturally.\n"
+	case personality.EmotionHappy:
+		return "USER NOTE: They're in a good mood. Be warm and engaged.\n"
+	}
+	return ""
 }
 
 func (pe *PromptEngine) appendMemoryContext(b *strings.Builder, ctx PromptContext) {

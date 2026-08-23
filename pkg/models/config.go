@@ -169,6 +169,8 @@ type Config struct {
 		HybridMode   bool   `yaml:"hybrid_mode"`
 		LocalModel   string `yaml:"local_model"` // Model for local provider (Ollama)
 		Think        *bool  `yaml:"think"`       // Ollama think mode: false disables reasoning, nil = use model default
+		NumCtx       int    `yaml:"num_ctx"`     // Ollama context window; 0 = Ollama default (4096 on small GPUs)
+		ChatHistoryTurns int `yaml:"chat_history_turns"` // Verbatim user/assistant pairs sent to the chat API; 0 = 10
 
 		// Sampling controls generation behavior (temperature, top_p, max_tokens).
 		Sampling struct {

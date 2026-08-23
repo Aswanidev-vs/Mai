@@ -804,6 +804,9 @@ func main() {
 		}
 		// Baseline speech rate (warmth) — applied after style so it wins.
 		orch.SetTTSBaseSpeed(cfg.TTS.BaseSpeed)
+		// Verbatim chat history depth for long-conversation continuity
+		// (0 = provider default 10 pairs).
+		orch.SetChatHistoryTurns(cfg.LLM.ChatHistoryTurns)
 
 		go orch.Start(ctx)
 
@@ -1521,6 +1524,9 @@ func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt strin
 	}
 	if cfg.LLM.Sampling.MinP > 0 {
 		body["options"].(map[string]interface{})["min_p"] = cfg.LLM.Sampling.MinP
+	}
+	if cfg.LLM.NumCtx > 0 {
+		body["options"].(map[string]interface{})["num_ctx"] = cfg.LLM.NumCtx
 	}
 	if cfg.LLM.Think != nil {
 		body["think"] = *cfg.LLM.Think
