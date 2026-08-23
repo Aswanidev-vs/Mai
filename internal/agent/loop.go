@@ -697,6 +697,54 @@ func (o *Orchestrator) chatTurns() []interfaces.ChatMessage {
 	return out
 }
 
+// clampLen returns n clamped into [0, max].
+func clampLen(n, max int) int {
+	if n < 0 {
+		return 0
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
+// firstN returns the first n runes of s for log lines.
+func firstN(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// recordTruncatedTurn stores an interrupted turn: the user message as sent,
+// and the assistant reply truncated to what was actually spoken. Working
+// memory, episodic storage, and verbatim chat history all get the truncated
+// version, so the next turn's context reflects reality ("she got cut off
+// mid-sentence here") instead of a missing turn.
+func (o *Orchestrator) recordTruncatedTurn(user string, heard string, chatMessages []interfaces.ChatMessage) {
+	o.memory.Working().Add(interfaces.MemoryEntry{
+		Type:      "assistant_response",
+		Content:   heard,
+		Timestamp: time.Now().Unix(),
+		Metadata:  map[string]interface{}{"interrupted": true},
+	})
+	o.memory.Episodic().StoreEvent(interfaces.MemoryEntry{
+		ID:        fmt.Sprintf("mai_%d", time.Now().UnixMilli()),
+		Type:      "assistant_response",
+		Content:   heard,
+		Timestamp: time.Now().Unix(),
+		Metadata:  map[string]interface{}{"interrupted": true},
+	})
+	if len(chatMessages) > 0 {
+		// The last element is this turn's decorated user message — record the
+		// exact bytes the model prefilled so the next turn's prefix still hits
+		// the KV cache.
+		o.recordChatTurn(chatMessages[len(chatMessages)-1].Content, heard)
+	} else {
+		o.recordChatTurn(user, heard)
+	}
+}
+
 func (o *Orchestrator) handleConversation(ctx context.Context, text string, emotion personality.EmotionState, taskType cognition.TaskType) (*interfaces.AgentResponse, error) {
 	lowerText := strings.ToLower(text)
 	var contextParts []string
@@ -812,6 +860,12 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 
 	var full strings.Builder
 	var pending strings.Builder
+	var flushedSentences []string // complete sentences already sent to TTS
+	// spokenChars tracks text already handed to TTS — approximates what the
+	// user will actually hear. On barge-in it drives truncation: only what
+	// was spoken is kept in conversation history, like OpenAI realtime's
+	// conversation.item.truncate.
+	var spokenChars int
 
 	onChunk := func(chunk string) {
 		full.WriteString(chunk)
@@ -835,10 +889,12 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 			}
 			sentence := cleanResponse(seg)
 			if strings.TrimSpace(sentence) != "" {
-				// Speak the same cleaned text that gets stored — strip hedging
-				// BEFORE the audio is generated so what she says matches the
+				// Strip hedging BEFORE TTS so what she says matches the
 				// transcript ("I'm not sure, but..." never reaches the mic).
-				o.publishTTS(stripHallucinationHedging(sentence))
+				spoken := stripHallucinationHedging(sentence)
+				spokenChars += len(spoken)
+				flushedSentences = append(flushedSentences, spoken)
+				o.publishTTS(spoken)
 			}
 		}
 	}
@@ -852,22 +908,36 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	if streamErr != nil && ctx.Err() == nil {
 		return nil, streamErr
 	}
-	// Flush any trailing text that didn't end on a sentence boundary (unless interrupted).
-	if ctx.Err() == nil {
-		if rem := cleanResponse(pending.String()); strings.TrimSpace(rem) != "" {
-			o.publishTTS(stripHallucinationHedging(rem))
+	if ctx.Err() != nil {
+		// Interrupted mid-answer (barge-in). ChatGPT-Voice semantics: the
+		// assistant turn still enters history, truncated to what was actually
+		// heard. That keeps her context coherent — she "remembers" saying the
+		// first part and continues naturally, instead of the turn silently
+		// vanishing as if she never started.
+		heard := strings.TrimSpace(full.String()[:clampLen(spokenChars, full.Len())])
+		if heard == "" {
+			heard = strings.TrimSpace(strings.Join(flushedSentences, " "))
 		}
-		// Signal stream completion so the browser companion finalizes the transcript.
-		if o.bus != nil {
-			o.bus.Publish(interfaces.Event{
-				Type:   "chat.response",
-				Source: "agent.orchestrator",
-				Payload: map[string]interface{}{
-					"text": "",
-					"done": true,
-				},
-			})
+		if heard != "" {
+			o.recordTruncatedTurn(text, heard, chatMessages)
+			log.Printf("[Agent] Interrupted after %q — history keeps the heard portion", firstN(heard, 60))
 		}
+		return &interfaces.AgentResponse{Text: strings.TrimSpace(full.String()), Success: true, Spoken: false}, nil
+	}
+	// Flush any trailing text that didn't end on a sentence boundary.
+	if rem := cleanResponse(pending.String()); strings.TrimSpace(rem) != "" {
+		o.publishTTS(stripHallucinationHedging(rem))
+	}
+	// Signal stream completion so the browser companion finalizes the transcript.
+	if o.bus != nil {
+		o.bus.Publish(interfaces.Event{
+			Type:   "chat.response",
+			Source: "agent.orchestrator",
+			Payload: map[string]interface{}{
+				"text": "",
+				"done": true,
+			},
+		})
 	}
 
 	response := full.String()
