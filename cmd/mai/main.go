@@ -741,6 +741,7 @@ func main() {
 		})
 		registry.Register(&adapters.YouTubeTool{})
 		registry.Register(adapters.NewDeepSearchTool())
+		registry.Register(adapters.NewWebResearchTool())
 		registry.Register(&adapters.FileWriteTool{})
 		registry.Register(&adapters.ClockTool{})
 		registry.Register(&adapters.WhatsAppTool{
@@ -1368,12 +1369,6 @@ func main() {
 			for _, s := range samples {
 				lookbackBuffer[lookbackIdx] = s
 				lookbackIdx = (lookbackIdx + 1) % lookbackSize
-			}
-
-			// Energy gate: skip the wake-word spotter on near-silence so ambient
-			// noise (rms below BargeInThreshold) can't false-fire a greeting.
-			if rms < cfg.Audio.BargeInThreshold {
-				return
 			}
 
 			kwsStream.AcceptWaveform(16000, samples)

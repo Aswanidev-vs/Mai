@@ -58,13 +58,14 @@ func NewOllamaProvider(model, url, systemPrompt string, think *bool, opts Ollama
 const ollamaKeepAlive = "10m"
 
 // applyTokenOptions adds min_p and num_ctx to an options map (creating it if
-// nil). num_keep = 0 makes Ollama's context-shift protect everything before
-// the shift point — combined with the system field pinning the persona, the
-// character survives even under overflow instead of being silently dropped.
+// nil). num_keep is deliberately not set: when a prompt exceeds the 4k
+// window, Ollama's context shift protects the leading tokens by default —
+// the persona in the system field — so the character survives shifts even
+// when middle context is dropped.
 func (p *OllamaProvider) applyTokenOptions(options map[string]interface{}) map[string]interface{} {
 	if p.minP > 0 || p.numCtx > 0 {
 		if options == nil {
-			options = make(map[string]interface{}, 2)
+			options = make(map[string]interface{}, 1)
 		}
 	}
 	if p.minP > 0 {
@@ -72,7 +73,6 @@ func (p *OllamaProvider) applyTokenOptions(options map[string]interface{}) map[s
 	}
 	if p.numCtx > 0 {
 		options["num_ctx"] = p.numCtx
-		options["num_keep"] = 25
 	}
 	return options
 }

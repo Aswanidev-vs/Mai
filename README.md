@@ -576,12 +576,15 @@ Mai's agentic mode includes a universal tool registry with category-based discov
 | `shell_execute` | system | Run shell commands | `"List files in current directory"` |
 | `open_application` | system | Launch apps by name | `"Open Chrome"` |
 | `web_search` | web | Open browser search | `"Search for Go programming"` |
-| `deep_search` | web | Research with results | `"Research quantum computing"` |
+| `deep_search` | web | Snippet-only web search results | `"Research quantum computing"` |
+| `web_research` | web | Search + fetch + condense into a cited Markdown dossier | `"Research who is Mai Sakurajima"` |
 | `youtube_play` | media | Play YouTube videos | `"Play Perfect on YouTube"` |
 | `whatsapp_send` | communication | Send WhatsApp messages | `"Send hello to Manu on WhatsApp"` |
 | `get_system_time` | query | Get current time/date | `"What time is it?"` |
 | `file_write` | file | Write to files | `"Save this note to todo.txt"` |
 | `ui_automation` | automation | UI control (click, type) | `"Press Ctrl+F"` |
+
+**`web_research`** is Mai's deep-research tool — free, no API keys. It runs a web search, then fetches and reads the top result pages via [retrieval-go](https://github.com/free-llms-foundation/retrieval-go) (DuckDuckGo + readability extraction), condenses the most query-relevant passages, and returns a Markdown dossier with sources numbered `[1]…[n]` and their URLs. It over-fetches (~2× the requested `num_sources`) so blocked pages (robots/403/rate-limit) don't shrink the result, and notes how many pages were unreadable. The dossier is capped to fit Mai's `num_ctx` context window — bump `num_ctx` (and the tool's cap) for richer research. Cite sources as `[n]` in text replies; in spoken replies, attribute naturally without bracket markers (see the system-prompt citation block).
 
 ---
 
