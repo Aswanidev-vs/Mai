@@ -145,9 +145,20 @@ class CharacterRenderer {
         this.lipSyncRelease = { remainingMs: 0, lastForcedValue: 0 };
 
         // Mouse tracking for eye/head follow
+        this.mouseX = 0;
+        this.mouseY = 0;
         this._onMouseMove = (e) => {
-            this.mouseX = (e.clientX / window.innerWidth) * 2 - 1;
-            this.mouseY = -(e.clientY / window.innerHeight) * 2 + 1;
+            // Three.js expects normalized coordinates relative to its own
+            // viewport. The character canvas starts below the app header, so
+            // using window dimensions here shifts the gaze vertically.
+            const rect = this.renderer?.domElement?.getBoundingClientRect();
+            if (rect && rect.width > 0 && rect.height > 0) {
+                this.mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+                this.mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+            } else {
+                this.mouseX = (e.clientX / window.innerWidth) * 2 - 1;
+                this.mouseY = -(e.clientY / window.innerHeight) * 2 + 1;
+            }
             this.userPresent = true;
             this.lastInteraction = performance.now();
         };
@@ -516,6 +527,8 @@ class CharacterRenderer {
         let lastMouseY = 0;
 
         this.renderer.domElement.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
+            e.preventDefault();
             isDragging = true;
             lastMouseX = e.clientX;
             lastMouseY = e.clientY;
@@ -529,10 +542,19 @@ class CharacterRenderer {
             if (!isDragging) return;
             const deltaX = e.clientX - lastMouseX;
             const deltaY = e.clientY - lastMouseY;
-            
-            const moveSpeed = 0.002;
-            this.cameraOffsetX -= deltaX * moveSpeed;
-            this.cameraOffsetY += deltaY * moveSpeed;
+
+            // Convert CSS pixels to world units at the current camera depth.
+            // A fixed world-unit speed makes the character drift relative to
+            // the cursor whenever the viewport or zoom level changes.
+            const rect = this.renderer.domElement.getBoundingClientRect();
+            const distance = Math.abs(this.camera.position.z - this.baseLookAt.z);
+            const fovRadians = THREE.MathUtils.degToRad(this.camera.fov);
+            const worldUnitsPerPixel = rect.height > 0 && distance > 0
+                ? (2 * distance * Math.tan(fovRadians / 2)) / rect.height
+                : 0;
+
+            this.cameraOffsetX -= deltaX * worldUnitsPerPixel;
+            this.cameraOffsetY += deltaY * worldUnitsPerPixel;
             
             lastMouseX = e.clientX;
             lastMouseY = e.clientY;
@@ -570,8 +592,10 @@ class CharacterRenderer {
     _updateCameraPosition() {
         if (!this.baseCameraPosition.length()) return;
         
-        // Apply distance multiplier to Z
-        const newZ = this.baseCameraPosition.z * this.cameraDistance + this.cameraOffsetZ;
+        // Apply distance multiplier to the camera-to-target distance, rather
+        // than scaling the camera's absolute world Z coordinate.
+        const baseDistance = this.baseCameraPosition.z - this.baseLookAt.z;
+        const newZ = this.baseLookAt.z + baseDistance * this.cameraDistance + this.cameraOffsetZ;
         
         // Apply X,Y offsets
         const newX = this.baseCameraPosition.x + this.cameraOffsetX;
