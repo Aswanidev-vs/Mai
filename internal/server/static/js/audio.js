@@ -55,12 +55,6 @@ class AudioPlayer {
     async queueChunk(base64Audio, sampleRate, done) {
         if (!this.audioContext) this.init();
         await this.resume();
-
-        // Track cumulative duration of the current utterance (for viseme timing)
-        const bytes = base64Audio ? atob(base64Audio).length : 0;
-        const sr = sampleRate || 24000;
-        this._knownDuration += (bytes / 2) / sr;
-
         this.queue.push({ base64Audio, sampleRate, done });
         if (!this._draining) {
             this._drainQueue();
@@ -78,6 +72,10 @@ class AudioPlayer {
                 this._utteranceStartCtx = this.audioContext.currentTime;
                 this._nextStartTime = this.audioContext.currentTime;
             }
+            // New utterance: restart the viseme clock so getKnownDuration()
+            // matches only what this utterance will play (it used to grow
+            // forever across turns, desyncing lip sync after the first reply).
+            this._knownDuration = 0;
             if (this.onSpeakingStart) this.onSpeakingStart();
         }
 
@@ -134,6 +132,9 @@ class AudioPlayer {
                 const sr = sampleRate || 24000;
                 const audioBuffer = this.audioContext.createBuffer(1, float32Array.length, sr);
                 audioBuffer.getChannelData(0).set(float32Array);
+                // Grows as chunks are actually scheduled, staying in lockstep
+                // with getPlayhead() for viseme timing
+                this._knownDuration += float32Array.length / sr;
 
                 const source = this.audioContext.createBufferSource();
                 source.buffer = audioBuffer;

@@ -46,7 +46,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.59.1 // indirect
+	github.com/quic-go/quic-go v0.57.1 // indirect
 	github.com/refraction-networking/utls v1.8.2 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.2 // indirect
 	github.com/tailscale/win v0.0.0-20250627215312-f4da2b8ee071 // indirect

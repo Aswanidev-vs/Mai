@@ -77,6 +77,12 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		})
 	})
 
+	// Dance request from the orchestrator → browser tells the avatar to dance.
+	bus.Subscribe("companion.dance", func(event interfaces.Event) {
+		log.Println("[BRIDGE] Dance request → browser")
+		b.hub.BroadcastNotification(NotifDance, struct{}{})
+	})
+
 	log.Println("[BRIDGE] Event bus bridge active")
 }
 

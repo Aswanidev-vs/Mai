@@ -560,6 +560,12 @@ func main() {
 		seq   int64 // turn sequence from the orchestrator; used to drop stale audio
 	}
 	ttsSentCh := make(chan ttsItem, 64)
+	// ttsShutdown stops the TTS player; ttsWG tracks every goroutine that can
+	// be inside sherpa's GenerateWithConfig. Both are joined during shutdown
+	// BEFORE the deferred DeleteOfflineTts frees the engine — destroying it
+	// mid-generation is an access violation.
+	var ttsWG sync.WaitGroup
+	ttsShutdown := make(chan struct{})
 
 	log.Printf("[TTS] Synthesizer ready (%s)", cfg.TTS.ActiveModel)
 
@@ -652,41 +658,52 @@ func main() {
 	// turn. This is what makes interruption production-grade: the previous
 	// answer's tail is discarded instead of playing after the user takes
 	// over, while the NEW reply (the highest seq) is always preserved.
+	ttsWG.Add(1)
 	go func() {
+		defer ttsWG.Done()
 		var playingSeq int64
-		for item := range ttsSentCh {
-			// Stale audio from a turn the user already interrupted: drop it.
-			if item.seq > 0 && item.seq <= playingSeq {
-				log.Printf("[TTS-PLAYER] Dropping stale sentence (turn %d <= %d): %.60s...", item.seq, playingSeq, item.text)
+		for {
+			select {
+			case <-ttsShutdown:
+				atomic.StoreInt32(&isSpeaking, 0)
+				lastTTSEndNano.Store(time.Now().UnixNano())
+				return
+			case item, ok := <-ttsSentCh:
+				if !ok {
+					return
+				}
+				// Stale audio from a turn the user already interrupted: drop it.
+				if item.seq > 0 && item.seq <= playingSeq {
+					log.Printf("[TTS-PLAYER] Dropping stale sentence (turn %d <= %d): %.60s...", item.seq, playingSeq, item.text)
+					if len(ttsSentCh) == 0 {
+						atomic.StoreInt32(&isSpeaking, 0)
+						atomic.StoreInt32(&stopPlayback, 0)
+						lastTTSEndNano.Store(time.Now().UnixNano())
+					}
+					continue
+				}
+				// A newer turn started: halt the sentence currently being spoken
+				// so the new reply begins promptly. playSentence resets
+				// stopPlayback at its own start, so this never blocks the new turn.
+				if item.seq > playingSeq {
+					atomic.StoreInt32(&stopPlayback, 1)
+					playingSeq = item.seq
+				}
+				log.Printf("[TTS-PLAYER] Playing sentence (len=%d, turn=%d): %.80s...", len(item.text), item.seq, item.text)
+				playSentence(item.text, item.speed)
+				log.Printf("[TTS-PLAYER] Finished playing sentence, queue_depth=%d", len(ttsSentCh))
 				if len(ttsSentCh) == 0 {
 					atomic.StoreInt32(&isSpeaking, 0)
-					atomic.StoreInt32(&stopPlayback, 0)
+					atomic.StoreInt32(&stopPlayback, 0) // ensure clean state for next response
 					lastTTSEndNano.Store(time.Now().UnixNano())
 				}
-				continue
-			}
-			// A newer turn started: halt the sentence currently being spoken
-			// so the new reply begins promptly. playSentence resets
-			// stopPlayback at its own start, so this never blocks the new turn.
-			if item.seq > playingSeq {
-				atomic.StoreInt32(&stopPlayback, 1)
-				playingSeq = item.seq
-			}
-			log.Printf("[TTS-PLAYER] Playing sentence (len=%d, turn=%d): %.80s...", len(item.text), item.seq, item.text)
-			playSentence(item.text, item.speed)
-			log.Printf("[TTS-PLAYER] Finished playing sentence, queue_depth=%d", len(ttsSentCh))
-			if len(ttsSentCh) == 0 {
-				atomic.StoreInt32(&isSpeaking, 0)
-				atomic.StoreInt32(&stopPlayback, 0) // ensure clean state for next response
-				lastTTSEndNano.Store(time.Now().UnixNano())
 			}
 		}
-		atomic.StoreInt32(&isSpeaking, 0)
-		atomic.StoreInt32(&stopPlayback, 0)
-		lastTTSEndNano.Store(time.Now().UnixNano())
 	}()
 	// Test TTS on startup
+	ttsWG.Add(1)
 	go func() {
+		defer ttsWG.Done()
 		if voiceCloneEnabled {
 			log.Printf("[TTS] Voice cloning active (model: %s)", cfg.TTS.ActiveModel)
 		}
@@ -1433,6 +1450,17 @@ func main() {
 	cancel() // Cancel the background context (stops Ollama requests, etc.)
 	capture.Stop()
 	close(workerChan)
+
+	// Stop speech and join every goroutine that may be inside sherpa's
+	// GenerateWithConfig BEFORE main returns — the deferred DeleteOfflineTts
+	// would otherwise free the engine mid-generation (0xc0000005 crash).
+	close(ttsShutdown)
+	go func() {
+		for range ttsSentCh {
+		}
+	}() // unblock any blocked senders
+	atomic.StoreInt32(&stopPlayback, 1)
+	ttsWG.Wait()
 
 	// Wait briefly for cleanup, then force exit
 	done := make(chan struct{})

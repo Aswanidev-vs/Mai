@@ -33,11 +33,6 @@ const emotionLabel = document.getElementById('emotionLabel');
 // Wire chat input to WS
 chat.onSend = (text) => {
     ws.send('chat.input', { text });
-    // Check for dance command — simple contains check, covers all phrasings
-    const lower = text.toLowerCase();
-    if (lower.includes('dance')) {
-        setTimeout(() => character.dance(), 200);
-    }
 };
 
 // WS event handlers
@@ -56,7 +51,6 @@ ws.onDisconnect = () => {
 let streamingActive = false;
 let ttsTextBuffer = '';
 let gazeAvoidBuffer = '';
-let danceTriggered = false;
 
 // Uncertainty markers that trigger gaze avoidance (embarrassment/shyness)
 const UNCERTAINTY_MARKERS = [
@@ -87,24 +81,17 @@ ws.on('chat.response', (params) => {
             streamingActive = true;
             ttsTextBuffer = '';
             gazeAvoidBuffer = '';
-            danceTriggered = false;
         }
         chat.streamToken(params.text);
         ttsTextBuffer += params.text;
         gazeAvoidBuffer += params.text;
-        // Trigger dance if AI response mentions dancing and user asked for it
-        if (!danceTriggered && /dance/i.test(params.text)) {
-            danceTriggered = true;
-            character.dance();
-        }
+        // Rebuild the viseme schedule as spoken sentences arrive, so it is
+        // ready before/during audio playback instead of only at stream end.
+        character.prepareVisemes(ttsTextBuffer);
     }
     if (params.done) {
         chat.finalizeMessage();
         streamingActive = false;
-        // Build the viseme timeline from the full utterance Mai is about to speak
-        if (ttsTextBuffer.trim().length > 0) {
-            character.prepareVisemes(ttsTextBuffer);
-        }
         // Check for uncertainty markers and trigger gaze avoidance
         const lower = gazeAvoidBuffer.toLowerCase();
         for (const marker of UNCERTAINTY_MARKERS) {
@@ -169,6 +156,12 @@ ws.on('emotion.detected', (params) => {
 
 ws.on('config.changed', (params) => {
     console.log('[Config]', params.key, '=', params.value);
+});
+
+// Dance request from the backend — fires for both voice and chat turns
+// (intent detection happens in the orchestrator's HandleInput).
+ws.on('companion.dance', () => {
+    character.dance();
 });
 
 ws.on('state.request', (params) => {

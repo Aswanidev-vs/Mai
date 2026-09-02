@@ -112,6 +112,12 @@ class CharacterRenderer {
         this.timeData = null;
         this.speaking = false;
 
+        // Dance mode (procedural bone animation on the VRM humanoid)
+        this.dancing = false;
+        this.danceTime = 0;
+        this.danceDuration = 8;
+        this.danceHipsBaseY = null;
+
         // Viseme schedule (word-accurate lip sync)
         this.visemeSchedule = null;
         this.visemeDuration = 0;
@@ -1414,23 +1420,74 @@ class CharacterRenderer {
     }
 
     // ── Dance Mode ──
-    dance() {
-        if (!this.motionClips || this.motionClips.length === 0) {
-            console.warn('[VRM] No motion clips loaded');
+    // Drives the 3D humanoid bones rhythmically. The bundled .motion3.json is a
+    // Live2D parameter file — applied to VRM blendshapes it produces no visible
+    // body motion, so we dance procedurally to guarantee she actually moves.
+    dance(duration) {
+        if (!this.vrm?.humanoid) {
+            console.warn('[VRM] Cannot dance: model not loaded');
             return false;
         }
-        const danceClip = this.motionClips.find(c => c.name === 'dance_show' || c.name.includes('dance'));
-        if (!danceClip) {
-            console.warn('[VRM] Dance clip not found. Available clips:', this.motionClips.map(c => c.name));
-            return false;
-        }
-        this.currentMotion = danceClip;
-        this.motionTime = 0;
-        this.motionPlaying = true;
-        this._setEmotion('excited', 0.8);
+        this.dancing = true;
+        this.danceTime = 0;
+        this.danceDuration = duration || 8; // seconds
+        this.danceHipsBaseY = null;
+        this._setEmotion('excited', 0.9);
         this.lastInteraction = performance.now();
-        console.log('[VRM] Playing dance motion:', danceClip.name, 'duration:', danceClip.duration);
         return true;
+    }
+
+    _updateDance(elapsed, delta) {
+        if (!this.dancing || !this.vrm?.humanoid) return;
+        this.danceTime += delta;
+        const h = this.vrm.humanoid;
+        const beat = this.danceTime * 6 * Math.PI * 2; // 6 beats/sec
+        const bone = (name) => h.getNormalizedBoneNode(name);
+
+        // Hips: bounce + sway
+        const hips = bone('hips');
+        if (hips) {
+            if (this.danceHipsBaseY === null) this.danceHipsBaseY = hips.position.y;
+            hips.position.y = this.danceHipsBaseY + Math.abs(Math.sin(beat / 2)) * 0.03
+                + Math.sin(beat / 4) * 0.008;
+            hips.rotation.z = Math.sin(beat / 2) * 0.09;
+            hips.rotation.y = Math.sin(beat / 4) * 0.05;
+        }
+        // Spine & chest sway opposite the hips
+        const spine = bone('spine');
+        if (spine) spine.rotation.z = -Math.sin(beat / 2) * 0.06;
+        const chest = bone('chest');
+        if (chest) chest.rotation.z = Math.sin(beat / 2) * 0.03;
+
+        // Arms pump on the beat
+        const lu = bone('leftUpperArm');
+        if (lu) {
+            lu.rotation.z = -1.15 + Math.sin(beat) * 0.35;
+            lu.rotation.x = Math.sin(beat / 2) * 0.2;
+        }
+        const ru = bone('rightUpperArm');
+        if (ru) {
+            ru.rotation.z = 1.15 + Math.sin(beat + Math.PI) * 0.35;
+            ru.rotation.x = Math.sin(beat / 2 + Math.PI) * 0.2;
+        }
+        const ll = bone('leftLowerArm');
+        if (ll) ll.rotation.x = -0.5 + Math.sin(beat + Math.PI / 2) * 0.35;
+        const rl = bone('rightLowerArm');
+        if (rl) rl.rotation.x = -0.5 + Math.sin(beat + Math.PI * 1.5) * 0.35;
+
+        // Head bob
+        const head = bone('head');
+        if (head) {
+            head.rotation.z = Math.sin(beat / 2) * 0.05;
+            head.rotation.x = Math.sin(beat) * 0.03;
+        }
+
+        // End of dance — return to idle
+        if (this.danceTime >= this.danceDuration) {
+            this.dancing = false;
+            this.danceHipsBaseY = null;
+            this._setEmotion('neutral', 1);
+        }
     }
 
     // ── Enhanced Organic Idle Animation (Airi-style natural movement) ──
@@ -1812,6 +1869,7 @@ class CharacterRenderer {
             this._updateLife(delta, elapsed);     // emotion posture + idle + rest (after idle)
             this._updateGaze(delta);              // gaze last so it owns the lookAt target
             this._updateGazeAvoidance(delta);     // gaze avoidance (embarrassment)
+            this._updateDance(elapsed, delta);      // dance overwrites idle/life pose while active
 
             this.vrm.humanoid?.update();
             // Update spring bones every frame for smooth hair physics
