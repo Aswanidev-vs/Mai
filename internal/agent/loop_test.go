@@ -1,11 +1,25 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/goleak"
 )
+
+func TestTakeSentenceKeepsEllipsisTogether(t *testing.T) {
+	var buf strings.Builder
+	buf.WriteString("Hmm... That makes sense.")
+
+	first, ok := takeSentence(&buf)
+	assert.True(t, ok)
+	assert.Equal(t, "Hmm...", first)
+
+	second, ok := takeSentence(&buf)
+	assert.True(t, ok)
+	assert.Equal(t, "That makes sense.", second)
+}
 
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)

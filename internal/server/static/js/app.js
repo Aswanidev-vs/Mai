@@ -9,6 +9,48 @@ const audio = new AudioPlayer();
 const character = new CharacterRenderer('characterContainer');
 const settings = new SettingsPanel(ws);
 
+// Small, deterministic cues keep the avatar responsive without asking the
+// language model for brittle JSON or exposing internal emotion labels to the
+// user. These are intentionally conservative: a technical answer should not
+// make Mai look angry just because it mentions an error.
+const ASSISTANT_EXPRESSION_CUES = [
+    { pattern: /\b(we did it|you got it|that's amazing|excellent|congratulations|nice work)\b/i, emotion: 'excited', intensity: 0.62 },
+    { pattern: /\b(oh|wow|whoa|no way|really|seriously)\b/i, emotion: 'surprised', intensity: 0.48 },
+    { pattern: /\b(i'm sorry|that sounds hard|that sounds painful|take your time|i'm here with you)\b/i, emotion: 'sad', intensity: 0.38 },
+    { pattern: /\b(glad for you|happy for you|proud of you|wonderful|love that|good news)\b/i, emotion: 'happy', intensity: 0.48 },
+    { pattern: /\b(hmm|let me think|probably|maybe|i'd say|the reason is|because)\b|\?/i, emotion: 'think', intensity: 0.34 },
+];
+
+const USER_MOOD_TO_RESPONSE = {
+    sad: 'sad',
+    stressed: 'calm',
+    frustrated: 'calm',
+    excited: 'happy',
+    happy: 'happy',
+    calm: 'calm',
+    neutral: 'calm',
+};
+
+let responseInProgress = false;
+let activeAssistantEmotion = '';
+
+function updateAssistantExpression(text) {
+    if (!text) return;
+    if (!responseInProgress) {
+        responseInProgress = true;
+        activeAssistantEmotion = 'calm';
+        character.setEmotion('calm', 0.25);
+    }
+
+    for (const cue of ASSISTANT_EXPRESSION_CUES) {
+        if (cue.pattern.test(text) && cue.emotion !== activeAssistantEmotion) {
+            activeAssistantEmotion = cue.emotion;
+            character.setEmotion(cue.emotion, cue.intensity);
+            break;
+        }
+    }
+}
+
 // Wire audio analyser to character for lip sync
 audio.init();
 if (audio.analyser) {
@@ -76,6 +118,7 @@ const UNCERTAINTY_MARKERS = [
 
 ws.on('chat.response', (params) => {
     if (params.text) {
+        updateAssistantExpression(params.text);
         if (!streamingActive) {
             chat.startAgentMessage();
             streamingActive = true;
@@ -92,6 +135,8 @@ ws.on('chat.response', (params) => {
     if (params.done) {
         chat.finalizeMessage();
         streamingActive = false;
+        responseInProgress = false;
+        activeAssistantEmotion = '';
         // Check for uncertainty markers and trigger gaze avoidance
         const lower = gazeAvoidBuffer.toLowerCase();
         for (const marker of UNCERTAINTY_MARKERS) {
@@ -138,7 +183,9 @@ ws.on('tts.chunk', (params) => {
 
 // Emotion detection
 ws.on('emotion.detected', (params) => {
-    character.setEmotion(params.emotion, params.intensity);
+    const emotion = USER_MOOD_TO_RESPONSE[params.emotion] || 'calm';
+    const intensity = Math.min(0.55, Math.max(0.22, Number(params.intensity) || 0.35));
+    character.setEmotion(emotion, intensity);
 
     const emotionNames = {
         calm: 'Calm', happy: 'Happy', sad: 'Sad',

@@ -58,6 +58,18 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		b.hub.BroadcastNotification(NotifChatResponse, ChatResponseChunk{Text: text, Done: done})
 	})
 
+	// User emotion → companion avatar response. The browser turns this into a
+	// gentle, context-appropriate expression rather than exposing the label in
+	// the chat transcript.
+	bus.Subscribe("emotion.detected", func(event interfaces.Event) {
+		emotion, _ := event.Payload["emotion"].(string)
+		intensity, _ := event.Payload["intensity"].(float64)
+		b.hub.BroadcastNotification(NotifEmotionDetect, EmotionDetectedParams{
+			Emotion:   emotion,
+			Intensity: intensity,
+		})
+	})
+
 	// TTS audio chunks → WS clients (for browser-side lip sync)
 	bus.Subscribe("tts.audio.chunk", func(event interfaces.Event) {
 		audio, _ := event.Payload["audio"].(string)

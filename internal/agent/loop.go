@@ -415,7 +415,10 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 			Type: "user_input", Content: text, Timestamp: time.Now().Unix(),
 		})
 		o.storeResponse(resp, text)
-		return &interfaces.AgentResponse{Text: resp, Success: true, Spoken: true}, nil
+		// Let the normal transcription path publish this response to TTS and
+		// the companion UI exactly once. Marking it spoken here made greetings
+		// disappear because no audio event was emitted.
+		return &interfaces.AgentResponse{Text: resp, Success: true}, nil
 	}
 
 	o.status = interfaces.StatusThinking
@@ -433,6 +436,7 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	if ps, ok := o.recentProsody(); ok {
 		emotionState = o.emotion.MergeProsody(emotionState, ps)
 	}
+	o.publishEmotion(emotionState)
 	o.userModel.RecordInteraction(text, "")
 	o.memory.Working().Add(interfaces.MemoryEntry{
 		Type: "user_input", Content: text, Timestamp: time.Now().Unix(),
@@ -847,7 +851,7 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		// late in long chats even with a strong system prompt; a short
 		// imperative at the tail of each user message keeps the voice steady.
 		// Constant across turns, so it never breaks the KV prefix cache.
-		userContent.WriteString("\n\n(reply as Mai: plain spoken sentences, no lists, no markdown, no emojis)")
+		userContent.WriteString("\n\n(reply as Mai: plain spoken sentences, no lists, no markdown, no emojis; vary your rhythm, use contractions, and add a brief spoken reaction like 'hmm' or 'oh' only when it genuinely fits; never use stage directions)")
 		userContent.WriteString("\nAnswer only what's being asked right now. Never invent names, titles, or facts; if you're unsure, say so briefly.")
 		chatMessages = append(chatMessages, interfaces.ChatMessage{Role: "user", Content: userContent.String()})
 	} else {
@@ -1116,6 +1120,11 @@ func takeSentence(buf *strings.Builder) (string, bool) {
 			return consumeSentence(buf, s, i+1)
 		}
 		if c == '.' {
+			// Keep ellipses together so a thoughtful pause is one spoken chunk,
+			// rather than three tiny sentences sent to TTS separately.
+			if i+1 < len(s) && s[i+1] == '.' {
+				continue
+			}
 			// Don't split on common abbreviations like "Dr." or "e.g.".
 			if i > 0 && i+1 < len(s) && isLowerByte(s[i-1]) && s[i+1] == ' ' {
 				continue
@@ -1284,6 +1293,23 @@ func (o *Orchestrator) GetProactiveEngine() *ProactiveEngine {
 
 func (o *Orchestrator) GetInterruptManager() *InterruptManager {
 	return o.interrupts
+}
+
+// publishEmotion lets the companion choose an empathetic response expression
+// from the user's current mood. The browser maps user frustration/stress to a
+// calm face instead of mirroring it as anger.
+func (o *Orchestrator) publishEmotion(state personality.EmotionState) {
+	if o.bus == nil {
+		return
+	}
+	_ = o.bus.Publish(interfaces.Event{
+		Type:   "emotion.detected",
+		Source: "agent.orchestrator",
+		Payload: map[string]interface{}{
+			"emotion":   string(state.Type),
+			"intensity": state.Confidence,
+		},
+	})
 }
 
 func (o *Orchestrator) publishTTS(text string) {
