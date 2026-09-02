@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -34,16 +35,16 @@ type Orchestrator struct {
 	emotion  *personality.EmotionDetector
 	meta     *MetaCognition
 
-	promptEngine   *cognition.PromptEngine
-	userModel      *UserModel
-	proactive      *ProactiveEngine
-	interrupts     *InterruptManager
-	prosody        *personality.ProsodyAnalyzer
-	ttsAdapter     *personality.TTSAdapter
+	promptEngine *cognition.PromptEngine
+	userModel    *UserModel
+	proactive    *ProactiveEngine
+	interrupts   *InterruptManager
+	prosody      *personality.ProsodyAnalyzer
+	ttsAdapter   *personality.TTSAdapter
 
 	genOpts interfaces.GenerationOptions
 
-	turnMu       sync.Mutex
+	turnMu        sync.Mutex
 	currentCancel context.CancelFunc // cancels the in-flight LLM stream (barge-in)
 
 	status       interfaces.AgentStatus
@@ -72,8 +73,8 @@ type Orchestrator struct {
 	// lastProsody is the most recent voice-derived emotion state, ingested by
 	// the audio pipeline (main.go) after each user utterance segment. Merged
 	// over text keywords in HandleInput — the voice is the stronger signal.
-	prosodyMu    sync.Mutex
-	lastProsody  personality.EmotionState
+	prosodyMu     sync.Mutex
+	lastProsody   personality.EmotionState
 	lastProsodyAt time.Time
 
 	DirectAction func(text string) (bool, string, error)
@@ -102,23 +103,23 @@ func NewOrchestrator(
 	skillsRunner := skills.NewRunner(skillRegistry, reactLoop, llm, mem)
 
 	o := &Orchestrator{
-		bus:            bus,
-		memory:         mem,
-		llm:            llm,
-		registry:       registry,
-		react:          reactLoop,
-		goals:          NewGoalManager(),
-		emotion:        personality.NewEmotionDetector(),
-		meta:           NewMetaCognition(),
-		promptEngine:   cognition.NewPromptEngine(),
-		userModel:      userModel,
-		proactive:      proactive,
-		interrupts:     NewInterruptManager(),
-		prosody:        personality.NewProsodyAnalyzer(),
-		ttsAdapter:     personality.NewTTSAdapter(1.25, 1.0, 1.0),
-		status:         interfaces.StatusIdle,
-		skillsRunner:   skillsRunner,
-		genOpts:        genOpts,
+		bus:          bus,
+		memory:       mem,
+		llm:          llm,
+		registry:     registry,
+		react:        reactLoop,
+		goals:        NewGoalManager(),
+		emotion:      personality.NewEmotionDetector(),
+		meta:         NewMetaCognition(),
+		promptEngine: cognition.NewPromptEngine(),
+		userModel:    userModel,
+		proactive:    proactive,
+		interrupts:   NewInterruptManager(),
+		prosody:      personality.NewProsodyAnalyzer(),
+		ttsAdapter:   personality.NewTTSAdapter(1.25, 1.0, 1.0),
+		status:       interfaces.StatusIdle,
+		skillsRunner: skillsRunner,
+		genOpts:      genOpts,
 	}
 
 	// Real context compression: when working memory drops old entries, the
@@ -396,6 +397,15 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		o.recentUserInputs = o.recentUserInputs[1:]
 	}
 
+	// --- Dance request: fire her body motion alongside the normal reply ---
+	// Covers both voice and chat, since every turn funnels through HandleInput.
+	if wantsDance(inputLower) && o.bus != nil {
+		o.bus.Publish(interfaces.Event{
+			Type:   "companion.dance",
+			Source: "agent.orchestrator",
+		})
+	}
+
 	// --- Greeting fast-path: instant response, no RAG/LLM ---
 	if isGreeting(inputLower) {
 		resp := pickGreetingResponse(inputLower)
@@ -405,7 +415,10 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 			Type: "user_input", Content: text, Timestamp: time.Now().Unix(),
 		})
 		o.storeResponse(resp, text)
-		return &interfaces.AgentResponse{Text: resp, Success: true, Spoken: true}, nil
+		// Let the normal transcription path publish this response to TTS and
+		// the companion UI exactly once. Marking it spoken here made greetings
+		// disappear because no audio event was emitted.
+		return &interfaces.AgentResponse{Text: resp, Success: true}, nil
 	}
 
 	o.status = interfaces.StatusThinking
@@ -423,6 +436,7 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	if ps, ok := o.recentProsody(); ok {
 		emotionState = o.emotion.MergeProsody(emotionState, ps)
 	}
+	o.publishEmotion(emotionState)
 	o.userModel.RecordInteraction(text, "")
 	o.memory.Working().Add(interfaces.MemoryEntry{
 		Type: "user_input", Content: text, Timestamp: time.Now().Unix(),
@@ -747,6 +761,9 @@ func (o *Orchestrator) recordTruncatedTurn(user string, heard string, chatMessag
 
 func (o *Orchestrator) handleConversation(ctx context.Context, text string, emotion personality.EmotionState, taskType cognition.TaskType) (*interfaces.AgentResponse, error) {
 	lowerText := strings.ToLower(text)
+	if strings.TrimSpace(text) == "" {
+		return &interfaces.AgentResponse{Text: "", Success: true}, nil
+	}
 	var contextParts []string
 
 	wm := o.memory.Working().GetContext()
@@ -782,6 +799,14 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 				contextParts = append(contextParts, "Learned pattern:\n"+pattern)
 			}
 		}
+	}
+
+	// Real-time/entity grounding: the user added web_research yesterday — use
+	// it whenever the turn needs external, up-to-date, or named-entity
+	// knowledge, so Mai answers from the web instead of confabulating.
+	if facts := o.lookupFacts(ctx, lowerText); facts != "" {
+		contextParts = append(contextParts,
+			"Web search results (answer from these; do not guess beyond them):\n"+facts)
 	}
 
 	var fullPrompt string
@@ -826,7 +851,8 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		// late in long chats even with a strong system prompt; a short
 		// imperative at the tail of each user message keeps the voice steady.
 		// Constant across turns, so it never breaks the KV prefix cache.
-		userContent.WriteString("\n\n(reply as Mai: plain spoken sentences, no lists, no markdown, no emojis)")
+		userContent.WriteString("\n\n(reply as Mai: plain spoken sentences, no lists, no markdown, no emojis; vary your rhythm, use contractions, and add a brief spoken reaction like 'hmm' or 'oh' only when it genuinely fits; never use stage directions)")
+		userContent.WriteString("\nAnswer only what's being asked right now. Never invent names, titles, or facts; if you're unsure, say so briefly.")
 		chatMessages = append(chatMessages, interfaces.ChatMessage{Role: "user", Content: userContent.String()})
 	} else {
 		// Flat-prompt fallback (non-chat providers): keeps the legacy layout.
@@ -870,18 +896,11 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	onChunk := func(chunk string) {
 		full.WriteString(chunk)
 		pending.WriteString(chunk)
-		// Publish the raw token to the event bus so the bridge can
-		// forward it to the browser for low-latency text streaming.
-		if o.bus != nil {
-			o.bus.Publish(interfaces.Event{
-				Type:   "chat.response",
-				Source: "agent.orchestrator",
-				Payload: map[string]interface{}{
-					"text": chunk,
-					"done": false,
-				},
-			})
-		}
+		// The spoken transcript is the single transcript source: publishTTS
+		// below emits each cleaned sentence, which is what the browser
+		// (and the lip-sync schedule) must match against the real audio.
+		// Publishing raw tokens here too would double every sentence in the
+		// transcript and make the viseme schedule 2x the true audio length.
 		for {
 			seg, ok := takeSentence(&pending)
 			if !ok {
@@ -906,6 +925,18 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		streamErr = o.llm.Stream(ctx, fullPrompt, o.genOpts, onChunk)
 	}
 	if streamErr != nil && ctx.Err() == nil {
+		// Finalize the browser transcript even on failure so the companion
+		// UI doesn't stay stuck in streaming state.
+		if o.bus != nil {
+			o.bus.Publish(interfaces.Event{
+				Type:   "chat.response",
+				Source: "agent.orchestrator",
+				Payload: map[string]interface{}{
+					"text": "",
+					"done": true,
+				},
+			})
+		}
 		return nil, streamErr
 	}
 	if ctx.Err() != nil {
@@ -921,6 +952,18 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		if heard != "" {
 			o.recordTruncatedTurn(text, heard, chatMessages)
 			log.Printf("[Agent] Interrupted after %q — history keeps the heard portion", firstN(heard, 60))
+		}
+		// Finalize the browser transcript so a barge-in doesn't leave the
+		// companion UI stuck in streaming state.
+		if o.bus != nil {
+			o.bus.Publish(interfaces.Event{
+				Type:   "chat.response",
+				Source: "agent.orchestrator",
+				Payload: map[string]interface{}{
+					"text": "",
+					"done": true,
+				},
+			})
 		}
 		return &interfaces.AgentResponse{Text: strings.TrimSpace(full.String()), Success: true, Spoken: false}, nil
 	}
@@ -994,6 +1037,75 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	return &interfaces.AgentResponse{Text: adapted, Success: true, Spoken: true}, nil
 }
 
+// lookupFacts runs the web_research tool for turns that need external,
+// up-to-date, or entity-specific knowledge, so Mai grounds her answer instead
+// of confabulating. Returns "" when the turn doesn't need a lookup, the tool
+// isn't registered, or the search produced nothing.
+func (o *Orchestrator) lookupFacts(ctx context.Context, lowerText string) string {
+	if o.registry == nil || !needsWebLookup(lowerText) {
+		return ""
+	}
+	params, err := json.Marshal(map[string]string{
+		"query": strings.TrimSpace(lowerText),
+	})
+	if err != nil {
+		return ""
+	}
+	result, err := o.registry.Execute(ctx, "web_research", params)
+	if err != nil || result.Error != nil || strings.TrimSpace(result.Output) == "" {
+		return ""
+	}
+	log.Printf("[Agent] web_research grounded the answer for: %.60s", lowerText)
+	return strings.TrimSpace(result.Output)
+}
+
+// needsWebLookup reports whether a turn should consult the web before answering:
+// factual entity questions and current/time-sensitive topics the small local
+// model can't verify. Social/personal questions are excluded so small talk
+// stays instant.
+func needsWebLookup(lower string) bool {
+	lower = strings.ToLower(strings.TrimSpace(lower))
+	for _, social := range []string{
+		"on your mind", "you thinking", "how are you", "what do you",
+		"you love", "you like", "are you", "do you like", "what about you",
+		"you feel", "you mad", "you sad", "you happy", "you doing",
+	} {
+		if strings.Contains(lower, social) {
+			return false
+		}
+	}
+	for _, kw := range []string{
+		"trending", "latest", "current", "right now", "as of", "today",
+		"news", "this week", "this month", "this year", "released",
+		"came out", "score", "weather", "top song", "popular in", "in vogue",
+	} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	for _, p := range []string{
+		"who is", "who's", "who was", "who played", "who plays",
+		"what is", "what's", "what are", "what does", "which ",
+		"where is", "when did", "when was", "tell me about",
+		"look up", "search for", "google ",
+	} {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// wantsDance reports whether the user asked Mai to dance.
+func wantsDance(lower string) bool {
+	for _, kw := range []string{"dance", "dancing", "bust a move", "do a jig", "groove"} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // takeSentence extracts the next complete sentence from buf, mutating buf to
 // remove what it took. A sentence ends at .!? or a newline; if the buffer grows
 // past maxLen without a boundary it cuts at the last clause break. Returns
@@ -1008,6 +1120,11 @@ func takeSentence(buf *strings.Builder) (string, bool) {
 			return consumeSentence(buf, s, i+1)
 		}
 		if c == '.' {
+			// Keep ellipses together so a thoughtful pause is one spoken chunk,
+			// rather than three tiny sentences sent to TTS separately.
+			if i+1 < len(s) && s[i+1] == '.' {
+				continue
+			}
 			// Don't split on common abbreviations like "Dr." or "e.g.".
 			if i > 0 && i+1 < len(s) && isLowerByte(s[i-1]) && s[i+1] == ' ' {
 				continue
@@ -1176,6 +1293,23 @@ func (o *Orchestrator) GetProactiveEngine() *ProactiveEngine {
 
 func (o *Orchestrator) GetInterruptManager() *InterruptManager {
 	return o.interrupts
+}
+
+// publishEmotion lets the companion choose an empathetic response expression
+// from the user's current mood. The browser maps user frustration/stress to a
+// calm face instead of mirroring it as anger.
+func (o *Orchestrator) publishEmotion(state personality.EmotionState) {
+	if o.bus == nil {
+		return
+	}
+	_ = o.bus.Publish(interfaces.Event{
+		Type:   "emotion.detected",
+		Source: "agent.orchestrator",
+		Payload: map[string]interface{}{
+			"emotion":   string(state.Type),
+			"intensity": state.Confidence,
+		},
+	})
 }
 
 func (o *Orchestrator) publishTTS(text string) {

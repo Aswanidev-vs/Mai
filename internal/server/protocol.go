@@ -35,6 +35,7 @@ const (
 	NotifEmotionDetect = "emotion.detected"
 	NotifConfigChanged = "config.changed"
 	NotifMemoryUpdate  = "memory.update"
+	NotifDance         = "companion.dance"
 )
 
 // ChatInputParams is the payload for chat.input.

@@ -84,6 +84,12 @@ function buildVisemeSchedule(text) {
 
         if (isSentenceEnd(raw)) {
             // Sentence-ending punctuation: longer pause (breath point)
+            // Treat an ellipsis as one pause rather than three consecutive
+            // breath points, which would make a natural "hmm..." sound oddly
+            // stretched during lip-sync.
+            if (raw === '.' && i + 1 < text.length && text[i + 1] === '.') {
+                while (i + 1 < text.length && text[i + 1] === '.') i++;
+            }
             units.push({ viseme: null, weight: jitter(1.8), open: 0.0 });
         } else if (isClauseEnd(raw)) {
             // Clause boundary: medium pause
