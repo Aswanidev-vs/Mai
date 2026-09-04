@@ -3,14 +3,14 @@ package models
 // Config holds all settings.
 type Config struct {
 	Audio struct {
-		SampleRate       int     `yaml:"sample_rate"`
-		CaptureBufferMs  int     `yaml:"capture_buffer_ms"`
-		BargeInEnabled   bool    `yaml:"barge_in_enabled"`
-		BargeInThreshold float64 `yaml:"barge_in_threshold"`
-		BargeInWarmupMs  int     `yaml:"barge_in_warmup_ms"`  // AEC convergence wait before barge-in arms; <=0 = 400ms
-		BargeInSustainMs int     `yaml:"barge_in_sustain_ms"` // Sustained speech required to trigger; <=0 = 150ms
-		ThinkingChime      bool `yaml:"thinking_chime"`
-		TTSPlayLocalAlways bool `yaml:"tts_play_local_always"` // Play voice on local speakers even when the companion UI is open; avoids browser autoplay-silence
+		SampleRate         int     `yaml:"sample_rate"`
+		CaptureBufferMs    int     `yaml:"capture_buffer_ms"`
+		BargeInEnabled     bool    `yaml:"barge_in_enabled"`
+		BargeInThreshold   float64 `yaml:"barge_in_threshold"`
+		BargeInWarmupMs    int     `yaml:"barge_in_warmup_ms"`  // AEC convergence wait before barge-in arms; <=0 = 400ms
+		BargeInSustainMs   int     `yaml:"barge_in_sustain_ms"` // Sustained speech required to trigger; <=0 = 150ms
+		ThinkingChime      bool    `yaml:"thinking_chime"`
+		TTSPlayLocalAlways bool    `yaml:"tts_play_local_always"` // Play voice on local speakers even when the companion UI is open; avoids browser autoplay-silence
 	} `yaml:"audio"`
 	KWS struct {
 		Provider   string  `yaml:"provider"` // "cpu", "cuda", "coreml", "opencl"
@@ -105,6 +105,7 @@ type Config struct {
 		Provider         string  `yaml:"provider"` // "cpu", "cuda", "coreml", "opencl"
 		ActiveModel      string  `yaml:"active_model"`
 		NumThreads       int     `yaml:"num_threads"`
+		Debug            int     `yaml:"debug"`
 		OutputSampleRate int     `yaml:"output_sample_rate"`
 		TTSVoiceStyle    string  `yaml:"voice_style"` // Optional: "calm", "warm", "energetic", "serious", "soft"
 		BaseSpeed        float32 `yaml:"base_speed"`  // Baseline speech rate; lower = warmer/calmer (supertonic only honors speed)
@@ -134,14 +135,22 @@ type Config struct {
 			LengthScale float32 `yaml:"length_scale"`
 		} `yaml:"kokoro"`
 		Pocket struct {
-			ModelDir        string `yaml:"model_dir"`
-			LmFlow          string `yaml:"lm_flow"`
-			LmMain          string `yaml:"lm_main"`
-			Encoder         string `yaml:"encoder"`
-			Decoder         string `yaml:"decoder"`
-			TextConditioner string `yaml:"text_conditioner"`
-			VocabJson       string `yaml:"vocab_json"`
-			TokenScoresJson string `yaml:"token_scores_json"`
+			ModelDir        string  `yaml:"model_dir"`
+			Streaming       bool    `yaml:"streaming"` // Deliver generated audio callbacks immediately when true
+			Bundle          string  `yaml:"bundle"`
+			Tokenizer       string  `yaml:"tokenizer"`
+			BosBeforeVoice  string  `yaml:"bos_before_voice"`
+			LmFlow          string  `yaml:"lm_flow"`
+			LmMain          string  `yaml:"lm_main"`
+			Encoder         string  `yaml:"encoder"`
+			Decoder         string  `yaml:"decoder"`
+			TextConditioner string  `yaml:"text_conditioner"`
+			VocabJson       string  `yaml:"vocab_json"`
+			TokenScoresJson string  `yaml:"token_scores_json"`
+			Precision       string  `yaml:"precision"`
+			Temperature     float32 `yaml:"temperature"`
+			LSDSteps        int     `yaml:"lsd_steps"`
+			Voice           string  `yaml:"voice"`
 		} `yaml:"pocket"`
 		ZipVoice struct {
 			ModelDir string `yaml:"model_dir"`
@@ -153,24 +162,25 @@ type Config struct {
 			Vocoder  string `yaml:"vocoder"`
 		} `yaml:"zipvoice"`
 		VoiceCloning struct {
-			Enabled        bool   `yaml:"enabled"`
-			Model          string `yaml:"model"`
-			ReferenceAudio string `yaml:"reference_audio"`
-			ReferenceText  string `yaml:"reference_text"`
+			Enabled              bool    `yaml:"enabled"`
+			Model                string  `yaml:"model"`
+			ReferenceAudio       string  `yaml:"reference_audio"`
+			ReferenceText        string  `yaml:"reference_text"`
+			MaxReferenceAudioLen float32 `yaml:"max_reference_audio_len"`
 		} `yaml:"voice_cloning"`
 	} `yaml:"tts"`
 	LLM struct {
-		Provider     string `yaml:"provider"` // Default provider: "ollama", "openai", "gemini", "claude", "openrouter", "llamacpp"
-		Model        string `yaml:"model"`
-		URL          string `yaml:"url"`
-		APIKey       string `yaml:"api_key"`
-		AutoStart    bool   `yaml:"auto_start"`
-		SystemPrompt string `yaml:"system_prompt"`
-		HybridMode   bool   `yaml:"hybrid_mode"`
-		LocalModel   string `yaml:"local_model"` // Model for local provider (Ollama)
-		Think        *bool  `yaml:"think"`       // Ollama think mode: false disables reasoning, nil = use model default
-		NumCtx       int    `yaml:"num_ctx"`     // Ollama context window; 0 = Ollama default (4096 on small GPUs)
-		ChatHistoryTurns int `yaml:"chat_history_turns"` // Verbatim user/assistant pairs sent to the chat API; 0 = 10
+		Provider         string `yaml:"provider"` // Default provider: "ollama", "openai", "gemini", "claude", "openrouter", "llamacpp"
+		Model            string `yaml:"model"`
+		URL              string `yaml:"url"`
+		APIKey           string `yaml:"api_key"`
+		AutoStart        bool   `yaml:"auto_start"`
+		SystemPrompt     string `yaml:"system_prompt"`
+		HybridMode       bool   `yaml:"hybrid_mode"`
+		LocalModel       string `yaml:"local_model"`        // Model for local provider (Ollama)
+		Think            *bool  `yaml:"think"`              // Ollama think mode: false disables reasoning, nil = use model default
+		NumCtx           int    `yaml:"num_ctx"`            // Ollama context window; 0 = Ollama default (4096 on small GPUs)
+		ChatHistoryTurns int    `yaml:"chat_history_turns"` // Verbatim user/assistant pairs sent to the chat API; 0 = 10
 
 		// Sampling controls generation behavior (temperature, top_p, max_tokens).
 		Sampling struct {

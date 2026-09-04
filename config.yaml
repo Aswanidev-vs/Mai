@@ -142,7 +142,11 @@ tts:
     length_scale: 1.0            # 1.0 = natural rate; >1 slower/robotic, <1 faster
 
   pocket:
+    # Official Sherpa Pocket TTS ONNX package.
+    # To switch back to the custom Colab bundle, set bundle: "bundle.json"
+    # and change model_dir to the custom package directory.
     model_dir: "sherpa-onnx-pocket-tts-2026-01-26"
+    streaming: true  # true = stream LLM sentences/audio; false = wait, then use sentence chunks
     lm_flow: "lm_flow.onnx"
     lm_main: "lm_main.onnx"
     encoder: "encoder.onnx"
@@ -165,9 +169,10 @@ tts:
     extra: '{"min_char_in_sentence": 10}'
 
   voice_cloning:
-    enabled: false
+    enabled: true
     model: "pocket"  # "pocket" or "zipvoice" (supertonic does NOT support cloning)
-    reference_audio: "./mai_san_v2.wav"
+    # Sherpa Pocket requires a standard PCM16 WAV reference.
+    reference_audio: "./mai-san-pcm.wav"
     reference_text: ""  # Only for ZipVoice. Empty = auto-detect
     max_reference_audio_len: 10.0
     seed: 42

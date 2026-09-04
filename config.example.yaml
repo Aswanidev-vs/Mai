@@ -127,7 +127,9 @@ tts:
     extra: '{"lang": "en"}'
 
   pocket:
+    # Official Sherpa Pocket package. Leave bundle empty for Sherpa's API.
     model_dir: "./sherpa-onnx-pocket-tts-2026-01-26"
+    streaming: true  # true = stream LLM sentences/audio; false = wait, then use sentence chunks
     lm_flow: "lm_flow.onnx"
     lm_main: "lm_main.onnx"
     encoder: "encoder.onnx"
@@ -136,6 +138,16 @@ tts:
     vocab_json: "vocab.json"
     token_scores_json: "token_scores.json"
     voice_embedding_cache_capacity: 50
+    # Custom Colab Pocket export example. Set bundle to enable Mai's direct
+    # bundle runtime and point model_dir at the custom package.
+    # model_dir: "./sherpa-onnx-pocket-tts-english_2026-04-2026-09-04"
+    # bundle: "bundle.json"
+    # tokenizer: "tokenizer.model"
+    # bos_before_voice: "bos_before_voice.npy"
+    # precision: "int8"
+    # temperature: 0.7
+    # lsd_steps: 1
+    # voice: "test_wavs/sample.wav"
 
   zipvoice:
     model_dir: "./sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"

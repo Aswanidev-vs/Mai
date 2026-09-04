@@ -79,6 +79,10 @@ type Orchestrator struct {
 
 	DirectAction func(text string) (bool, string, error)
 	TTSFunc      func(text string, speed float32, seq int64)
+	// ttsStreaming controls whether completed response sentences are handed
+	// to TTS while the LLM is still producing the answer. Pocket cannot accept
+	// incomplete token text, so streaming still uses safe sentence boundaries.
+	ttsStreaming atomic.Bool
 
 	// ttsSeq is a monotonic counter tagging every spoken sentence with the
 	// turn it belongs to. The TTS player uses it to drop audio from a turn
@@ -133,8 +137,16 @@ func NewOrchestrator(
 	// (recent conversation, user profile, emotion) on every step so the
 	// persona doesn't go blank between tool calls.
 	reactLoop.SetContextSnippet(o.sessionContextSnippet)
+	o.ttsStreaming.Store(true)
 
 	return o
+}
+
+// SetTTSStreaming enables low-latency sentence handoff from the LLM to TTS.
+// When disabled, the complete LLM response is collected first and then sent
+// through the existing sentence-chunk fallback.
+func (o *Orchestrator) SetTTSStreaming(enabled bool) {
+	o.ttsStreaming.Store(enabled)
 }
 
 // sessionContextSnippet builds the compact session context injected into
@@ -493,8 +505,9 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 
 	// --- PATH 2: Route by task type ---
 	// Conversational turns (small talk, greeting, storytelling) go through the
-	// streaming companion path: persona + memory + emotion in the prompt,
-	// sentence-by-sentence TTS so audio starts while the LLM is still talking.
+	// streaming companion path: persona + memory + emotion in the prompt.
+	// TTS can receive safe completed sentences while the LLM is still talking,
+	// or wait for the full response when compatibility mode is selected.
 	// Imperative/analytic turns keep using the ReAct tool loop.
 	taskType := o.promptEngine.ClassifyTask(text, hasCommandTriggers(text))
 
@@ -885,8 +898,9 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		fullPrompt = o.promptEngine.BuildPrompt(promptCtx)
 	}
 
-	// Stream the reply token-by-token and speak each completed sentence as it
-	// is produced, so the first audio starts long before the full answer exists.
+	// Stream the reply token-by-token. In TTS streaming mode, speak each
+	// completed sentence as it is produced, so audio starts before the full
+	// answer exists; compatibility mode defers TTS until the stream completes.
 	ctx, cancel := context.WithCancel(ctx)
 	o.setTurnCancel(cancel)
 	defer func() {
@@ -896,7 +910,7 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 
 	var full strings.Builder
 	var pending strings.Builder
-	var flushedSentences []string // complete sentences already sent to TTS
+	var flushedSentences []string // complete sentences ready for TTS delivery
 	// spokenChars tracks text already handed to TTS — approximates what the
 	// user will actually hear. On barge-in it drives truncation: only what
 	// was spoken is kept in conversation history, like OpenAI realtime's
@@ -921,9 +935,11 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 				// Strip hedging BEFORE TTS so what she says matches the
 				// transcript ("I'm not sure, but..." never reaches the mic).
 				spoken := stripHallucinationHedging(sentence)
-				spokenChars += len(spoken)
 				flushedSentences = append(flushedSentences, spoken)
-				o.publishTTS(spoken)
+				if o.ttsStreaming.Load() {
+					spokenChars += len(spoken)
+					o.publishTTS(spoken)
+				}
 			}
 		}
 	}
@@ -956,7 +972,7 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		// first part and continues naturally, instead of the turn silently
 		// vanishing as if she never started.
 		heard := strings.TrimSpace(full.String()[:clampLen(spokenChars, full.Len())])
-		if heard == "" {
+		if heard == "" && o.ttsStreaming.Load() {
 			heard = strings.TrimSpace(strings.Join(flushedSentences, " "))
 		}
 		if heard != "" {
@@ -979,7 +995,21 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	}
 	// Flush any trailing text that didn't end on a sentence boundary.
 	if rem := cleanResponse(pending.String()); strings.TrimSpace(rem) != "" {
-		o.publishTTS(stripHallucinationHedging(rem))
+		spoken := stripHallucinationHedging(rem)
+		flushedSentences = append(flushedSentences, spoken)
+		if o.ttsStreaming.Load() {
+			spokenChars += len(spoken)
+			o.publishTTS(spoken)
+		}
+	}
+
+	// Non-streaming TTS compatibility mode waits until the complete LLM
+	// response is available, then preserves the old sentence-chunk behavior.
+	if !o.ttsStreaming.Load() {
+		for _, spoken := range flushedSentences {
+			spokenChars += len(spoken)
+			o.publishTTS(spoken)
+		}
 	}
 	// Signal stream completion so the browser companion finalizes the transcript.
 	if o.bus != nil {
