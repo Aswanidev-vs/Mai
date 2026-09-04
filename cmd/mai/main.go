@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -41,6 +42,7 @@ import (
 	"github.com/user/mai/internal/tools"
 	"github.com/user/mai/internal/tools/adapters"
 	"github.com/user/mai/internal/tools/mcp"
+	pockettts "github.com/user/mai/internal/tts/pocket"
 	"github.com/user/mai/pkg/interfaces"
 	"github.com/user/mai/pkg/models"
 	"gopkg.in/yaml.v3"
@@ -411,64 +413,115 @@ func main() {
 	_ = fallbackOfflineRecognizer // used in dual-mode audio processing below
 
 	// 4. Initialize TTS
-	ttsConfig := sherpa.OfflineTtsConfig{}
-	ttsConfig.Model.NumThreads = cfg.TTS.NumThreads
-	ttsConfig.Model.Provider = cfg.TTS.Provider
+	usingCustomPocket := cfg.TTS.ActiveModel == "pocket" && cfg.TTS.Pocket.Bundle != ""
+	var tts *sherpa.OfflineTts
+	var pocketTTS *pockettts.Engine
+	ttsSampleRate := 0
 
-	switch cfg.TTS.ActiveModel {
-	case "supertonic":
-		ttsConfig.Model.Supertonic.DurationPredictor = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.DurationPredictor)
-		ttsConfig.Model.Supertonic.TextEncoder = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.TextEncoder)
-		ttsConfig.Model.Supertonic.VectorEstimator = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.VectorEstimator)
-		ttsConfig.Model.Supertonic.Vocoder = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.Vocoder)
-		ttsConfig.Model.Supertonic.TtsJson = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.TTSJson)
-		ttsConfig.Model.Supertonic.UnicodeIndexer = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.UnicodeIndexer)
-		ttsConfig.Model.Supertonic.VoiceStyle = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.VoiceStyle)
-	case "kokoro":
-		ttsConfig.Model.Kokoro.Model = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Model)
-		ttsConfig.Model.Kokoro.Voices = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Voices)
-		ttsConfig.Model.Kokoro.Tokens = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Tokens)
-		ttsConfig.Model.Kokoro.DataDir = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.DataDir)
-		if cfg.TTS.Kokoro.Lexicon != "" {
-			ttsConfig.Model.Kokoro.Lexicon = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Lexicon)
+	if usingCustomPocket {
+		voice := cfg.TTS.Pocket.Voice
+		if cfg.TTS.VoiceCloning.Enabled && cfg.TTS.VoiceCloning.ReferenceAudio != "" {
+			voice = cfg.TTS.VoiceCloning.ReferenceAudio
 		}
-		ttsConfig.Model.Kokoro.Lang = cfg.TTS.Kokoro.Lang
-		ttsConfig.Model.Kokoro.LengthScale = cfg.TTS.Kokoro.LengthScale
-	case "pocket":
-		ttsConfig.Model.Pocket.LmFlow = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.LmFlow)
-		ttsConfig.Model.Pocket.LmMain = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.LmMain)
-		ttsConfig.Model.Pocket.Encoder = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.Encoder)
-		ttsConfig.Model.Pocket.Decoder = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.Decoder)
-		ttsConfig.Model.Pocket.TextConditioner = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.TextConditioner)
-		ttsConfig.Model.Pocket.VocabJson = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.VocabJson)
-		ttsConfig.Model.Pocket.TokenScoresJson = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.TokenScoresJson)
-	case "zipvoice":
-		ttsConfig.Model.Zipvoice.Encoder = join(cfg.TTS.ZipVoice.ModelDir, cfg.TTS.ZipVoice.Encoder)
-		ttsConfig.Model.Zipvoice.Decoder = join(cfg.TTS.ZipVoice.ModelDir, cfg.TTS.ZipVoice.Decoder)
-		ttsConfig.Model.Zipvoice.DataDir = join(cfg.TTS.ZipVoice.ModelDir, cfg.TTS.ZipVoice.DataDir)
-		ttsConfig.Model.Zipvoice.Lexicon = join(cfg.TTS.ZipVoice.ModelDir, cfg.TTS.ZipVoice.Lexicon)
-		ttsConfig.Model.Zipvoice.Tokens = join(cfg.TTS.ZipVoice.ModelDir, cfg.TTS.ZipVoice.Tokens)
-		ttsConfig.Model.Zipvoice.Vocoder = cfg.TTS.ZipVoice.Vocoder
-	}
+		var err error
+		pocketTTS, err = pockettts.New(pockettts.Config{
+			ModelDir:        cfg.TTS.Pocket.ModelDir,
+			Bundle:          cfg.TTS.Pocket.Bundle,
+			Tokenizer:       cfg.TTS.Pocket.Tokenizer,
+			BosBeforeVoice:  cfg.TTS.Pocket.BosBeforeVoice,
+			LmFlow:          cfg.TTS.Pocket.LmFlow,
+			LmMain:          cfg.TTS.Pocket.LmMain,
+			Encoder:         cfg.TTS.Pocket.Encoder,
+			Decoder:         cfg.TTS.Pocket.Decoder,
+			TextConditioner: cfg.TTS.Pocket.TextConditioner,
+			Precision:       cfg.TTS.Pocket.Precision,
+			Temperature:     cfg.TTS.Pocket.Temperature,
+			LSDSteps:        cfg.TTS.Pocket.LSDSteps,
+			NumThreads:      cfg.TTS.NumThreads,
+			Voice:           voice,
+		})
+		if err != nil {
+			log.Fatalf("Failed to create custom Pocket TTS: %v", err)
+		}
+		defer pocketTTS.Close()
+		ttsSampleRate = pocketTTS.SampleRate()
+		log.Printf("[TTS] Custom Pocket bundle ready: %s (voice: %s)", cfg.TTS.Pocket.ModelDir, voice)
+	} else {
+		ttsConfig := sherpa.OfflineTtsConfig{}
+		ttsConfig.Model.NumThreads = cfg.TTS.NumThreads
+		ttsConfig.Model.Debug = cfg.TTS.Debug
+		ttsConfig.Model.Provider = cfg.TTS.Provider
 
-	tts := sherpa.NewOfflineTts(&ttsConfig)
-	if tts == nil {
-		log.Fatal("Failed to create TTS")
+		switch cfg.TTS.ActiveModel {
+		case "supertonic":
+			ttsConfig.Model.Supertonic.DurationPredictor = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.DurationPredictor)
+			ttsConfig.Model.Supertonic.TextEncoder = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.TextEncoder)
+			ttsConfig.Model.Supertonic.VectorEstimator = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.VectorEstimator)
+			ttsConfig.Model.Supertonic.Vocoder = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.Vocoder)
+			ttsConfig.Model.Supertonic.TtsJson = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.TTSJson)
+			ttsConfig.Model.Supertonic.UnicodeIndexer = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.UnicodeIndexer)
+			ttsConfig.Model.Supertonic.VoiceStyle = join(cfg.TTS.Supertonic.ModelDir, cfg.TTS.Supertonic.VoiceStyle)
+		case "kokoro":
+			ttsConfig.Model.Kokoro.Model = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Model)
+			ttsConfig.Model.Kokoro.Voices = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Voices)
+			ttsConfig.Model.Kokoro.Tokens = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Tokens)
+			ttsConfig.Model.Kokoro.DataDir = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.DataDir)
+			if cfg.TTS.Kokoro.Lexicon != "" {
+				ttsConfig.Model.Kokoro.Lexicon = join(cfg.TTS.Kokoro.ModelDir, cfg.TTS.Kokoro.Lexicon)
+			}
+			ttsConfig.Model.Kokoro.Lang = cfg.TTS.Kokoro.Lang
+			ttsConfig.Model.Kokoro.LengthScale = cfg.TTS.Kokoro.LengthScale
+		case "pocket":
+			ttsConfig.Model.Pocket.LmFlow = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.LmFlow)
+			ttsConfig.Model.Pocket.LmMain = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.LmMain)
+			ttsConfig.Model.Pocket.Encoder = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.Encoder)
+			ttsConfig.Model.Pocket.Decoder = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.Decoder)
+			ttsConfig.Model.Pocket.TextConditioner = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.TextConditioner)
+			ttsConfig.Model.Pocket.VocabJson = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.VocabJson)
+			ttsConfig.Model.Pocket.TokenScoresJson = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.TokenScoresJson)
+		case "zipvoice":
+			ttsConfig.Model.Zipvoice.Encoder = join(cfg.TTS.ZipVoice.ModelDir, cfg.TTS.ZipVoice.Encoder)
+			ttsConfig.Model.Zipvoice.Decoder = join(cfg.TTS.ZipVoice.ModelDir, cfg.TTS.ZipVoice.Decoder)
+			ttsConfig.Model.Zipvoice.DataDir = join(cfg.TTS.ZipVoice.ModelDir, cfg.TTS.ZipVoice.DataDir)
+			ttsConfig.Model.Zipvoice.Lexicon = join(cfg.TTS.ZipVoice.ModelDir, cfg.TTS.ZipVoice.Lexicon)
+			ttsConfig.Model.Zipvoice.Tokens = join(cfg.TTS.ZipVoice.ModelDir, cfg.TTS.ZipVoice.Tokens)
+			ttsConfig.Model.Zipvoice.Vocoder = cfg.TTS.ZipVoice.Vocoder
+		}
+
+		tts = sherpa.NewOfflineTts(&ttsConfig)
+		if tts == nil {
+			log.Fatal("Failed to create TTS")
+		}
+		defer sherpa.DeleteOfflineTts(tts)
+		ttsSampleRate = tts.SampleRate()
 	}
-	defer sherpa.DeleteOfflineTts(tts)
 
 	// Get TTS output sample rate and create resamplers for browser (44.1k)
 	// and echo reference (16k).
-	ttsSampleRate := tts.SampleRate()
 	log.Printf("[TTS] Engine sample rate: %d Hz", ttsSampleRate)
+	if cfg.TTS.ActiveModel == "pocket" {
+		mode := "buffered"
+		if cfg.TTS.Pocket.Streaming {
+			mode = "streaming"
+		}
+		log.Printf("[TTS] Pocket audio delivery: %s", mode)
+	}
 	ttsToBrowserResampler := newResampler(ttsSampleRate, 44100)
 	ttsToEchoResampler := newResampler(ttsSampleRate, 16000)
+	ttsDefaultSpeed := cfg.TTS.BaseSpeed
+	if ttsDefaultSpeed == 0 {
+		ttsDefaultSpeed = cfg.TTS.Supertonic.Speed
+	}
+	if ttsDefaultSpeed == 0 {
+		ttsDefaultSpeed = 1.0
+	}
 
-	// Voice cloning: load reference audio if enabled and active model supports it.
+	// Voice cloning: load reference audio if enabled and active Sherpa model
+	// supports it. The custom Pocket runtime loads its reference WAV directly.
 	var refAudio []float32
 	var refSampleRate int
 	voiceCloneEnabled := cfg.TTS.VoiceCloning.Enabled &&
-		(cfg.TTS.ActiveModel == "pocket" || cfg.TTS.ActiveModel == "zipvoice")
+		!usingCustomPocket && (cfg.TTS.ActiveModel == "pocket" || cfg.TTS.ActiveModel == "zipvoice")
 	if voiceCloneEnabled && cfg.TTS.VoiceCloning.ReferenceAudio != "" {
 		wav := sherpa.ReadWaveMultiChannel(cfg.TTS.VoiceCloning.ReferenceAudio)
 		if wav != nil && wav.SamplesPerChannel > 0 && wav.SampleRate > 0 {
@@ -488,6 +541,13 @@ func main() {
 				copy(refAudio, wav.Samples[:wav.SamplesPerChannel])
 			}
 			refSampleRate = wav.SampleRate
+			if maxSeconds := cfg.TTS.VoiceCloning.MaxReferenceAudioLen; maxSeconds > 0 {
+				maxSamples := int(float64(refSampleRate) * float64(maxSeconds))
+				if maxSamples > 0 && len(refAudio) > maxSamples {
+					refAudio = refAudio[:maxSamples]
+					log.Printf("[TTS] Voice cloning reference trimmed to %.1f seconds", maxSeconds)
+				}
+			}
 			wav.Release()
 			log.Printf("[TTS] Voice cloning loaded: %s (%d samples, %d Hz, %d ch)",
 				cfg.TTS.VoiceCloning.ReferenceAudio, len(refAudio), refSampleRate, wav.ChannelCount)
@@ -507,12 +567,37 @@ func main() {
 		}
 	}
 
-	// synthesize picks the right TTS method based on active model and voice cloning config.
-	// For supertonic or when cloning is off: uses GenerateWithCallback (fast, default voice).
-	// For pocket/zipvoice with cloning on: uses GenerateWithConfig with reference audio.
-	// For kokoro: uses GenerateWithConfig with speaker ID and language.
+	// synthesize picks the right TTS method based on active model and voice
+	// cloning config. Pocket audio delivery is controlled by pocket.streaming;
+	// other models continue through Sherpa's GenerationConfig API.
 	synthesize := func(text string, speed float32, cb func([]float32) bool) {
-		if voiceCloneEnabled && refAudio != nil {
+		// Sherpa exposes Pocket audio through a callback. Keep that callback
+		// streaming by default, but allow a config switch to collect the whole
+		// utterance before playback. The stop check is still honored while the
+		// model is generating so barge-in can interrupt buffered generation.
+		streamAudio := cfg.TTS.ActiveModel != "pocket" || cfg.TTS.Pocket.Streaming
+		deliver := cb
+		var buffered []float32
+		if !streamAudio {
+			deliver = func(samples []float32) bool {
+				if atomic.LoadInt32(&stopPlayback) != 0 {
+					return false
+				}
+				if len(samples) > 0 {
+					buffered = append(buffered, samples...)
+				}
+				return true
+			}
+		}
+
+		if pocketTTS != nil {
+			ttsMu.Lock()
+			err := pocketTTS.Generate(text, speed, deliver)
+			ttsMu.Unlock()
+			if err != nil && !errors.Is(err, pockettts.ErrGenerationStopped) {
+				log.Printf("[TTS] Custom Pocket generation failed: %v", err)
+			}
+		} else if voiceCloneEnabled && refAudio != nil {
 			ttsMu.Lock()
 			tts.GenerateWithConfig(text, &sherpa.GenerationConfig{
 				Speed:               speed,
@@ -520,7 +605,7 @@ func main() {
 				ReferenceSampleRate: refSampleRate,
 				ReferenceText:       cfg.TTS.VoiceCloning.ReferenceText,
 			}, func(samples []float32, _ float32) bool {
-				return cb(samples)
+				return deliver(samples)
 			})
 			ttsMu.Unlock()
 		} else {
@@ -545,9 +630,13 @@ func main() {
 			}
 			ttsMu.Lock()
 			tts.GenerateWithConfig(text, genCfg, func(samples []float32, _ float32) bool {
-				return cb(samples)
+				return deliver(samples)
 			})
 			ttsMu.Unlock()
+		}
+
+		if !streamAudio && atomic.LoadInt32(&stopPlayback) == 0 && len(buffered) > 0 {
+			cb(buffered)
 		}
 	}
 
@@ -574,7 +663,7 @@ func main() {
 	// TTS so sentences never overlap, and lets barge-in drain the queue.
 	speak := func(text string, speed float32, seq int64) {
 		if speed == 0 {
-			speed = cfg.TTS.Supertonic.Speed
+			speed = ttsDefaultSpeed
 		}
 		ttsSentCh <- ttsItem{text: text, speed: speed, seq: seq}
 	}
@@ -583,7 +672,7 @@ func main() {
 	// a barge-in sets stopPlayback mid-utterance.
 	playSentence := func(text string, speed float32) {
 		if speed == 0 {
-			speed = cfg.TTS.Supertonic.Speed
+			speed = ttsDefaultSpeed
 		}
 		atomic.StoreInt32(&isSpeaking, 1)
 		// Mark TTS as playing so handleAudioFrame's echo-cancel/drop guard runs
@@ -711,8 +800,8 @@ func main() {
 		if sr == 0 {
 			sr = 44100
 		}
-		synthesize("System ready.", cfg.TTS.Supertonic.Speed, func(samples []float32) bool {
-			playAudio(ctx, samples, sr, nil)
+		synthesize("System ready.", ttsDefaultSpeed, func(samples []float32) bool {
+			playAudio(ctx, ttsToBrowserResampler.resample(samples), sr, nil)
 			return true
 		})
 	}()
@@ -985,8 +1074,8 @@ func main() {
 			bargeStartNano.Store(0)
 			atomic.StoreInt32(&stopPlayback, 0)
 			playErr := playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
-				synthesize(response, cfg.TTS.Supertonic.Speed, func(samples []float32) bool {
-					ch <- samples
+				synthesize(response, ttsDefaultSpeed, func(samples []float32) bool {
+					ch <- ttsToBrowserResampler.resample(samples)
 					return true
 				})
 			})

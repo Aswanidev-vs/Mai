@@ -10,6 +10,8 @@ require (
 	github.com/k2-fsa/sherpa-onnx-go v1.13.5
 	github.com/mattn/go-sqlite3 v1.14.44
 	github.com/stretchr/testify v1.11.1
+	github.com/yalue/onnxruntime_go v1.27.0
+	github.com/tggo/goSentencePiece v1.1.0
 	go.uber.org/goleak v1.3.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -65,4 +67,5 @@ require (
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 )

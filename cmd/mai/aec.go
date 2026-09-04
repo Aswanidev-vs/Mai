@@ -50,38 +50,46 @@ func (r *speakerRef) recent(n int) []float32 {
 // resampler does linear-interpolation sample-rate conversion. It carries
 // fractional state between calls so it can be fed streaming chunks.
 type resampler struct {
-	ratio float64
-	pos   float64
+	// step is the number of input samples represented by one output sample.
+	// Keeping the phase in input-sample units avoids extrapolating when the
+	// output rate is higher than the input rate.
+	step  float64
+	phase float64
 	prev  float32
 	has   bool
 }
 
 func newResampler(inRate, outRate int) *resampler {
-	return &resampler{ratio: float64(outRate) / float64(inRate)}
+	return &resampler{step: float64(inRate) / float64(outRate)}
 }
 
 func (r *resampler) resample(in []float32) []float32 {
 	if len(in) == 0 {
 		return nil
 	}
-	if r.ratio == 1 {
+	if r.step == 1 {
 		out := make([]float32, len(in))
 		copy(out, in)
 		return out
 	}
-	out := make([]float32, 0, int(float64(len(in))*r.ratio)+2)
+	out := make([]float32, 0, int(float64(len(in))/r.step)+2)
+	start := 0
 	if !r.has {
 		r.prev = in[0]
 		r.has = true
+		start = 1
 	}
-	for i := 1; i < len(in); i++ {
-		r.pos += r.ratio
-		for r.pos >= 1 {
-			r.pos -= 1
-			t := float32(r.pos)
-			out = append(out, r.prev*(1-t)+in[i]*t)
+	for i := start; i < len(in); i++ {
+		curr := in[i]
+		for r.phase < 1 {
+			t := float32(r.phase)
+			out = append(out, r.prev*(1-t)+curr*t)
+			r.phase += r.step
 		}
-		r.prev = in[i]
+		// One input interval has been consumed. Any remaining phase carries
+		// into the next interval, including across streaming calls.
+		r.phase -= 1
+		r.prev = curr
 	}
 	return out
 }
