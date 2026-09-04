@@ -14,11 +14,15 @@ const settings = new SettingsPanel(ws);
 // user. These are intentionally conservative: a technical answer should not
 // make Mai look angry just because it mentions an error.
 const ASSISTANT_EXPRESSION_CUES = [
-    { pattern: /\b(we did it|you got it|that's amazing|excellent|congratulations|nice work)\b/i, emotion: 'excited', intensity: 0.62 },
-    { pattern: /\b(oh|wow|whoa|no way|really|seriously)\b/i, emotion: 'surprised', intensity: 0.48 },
+    { pattern: /\b(heh|as expected|aren't you|you really are|don't flatter yourself|making things complicated|architecture discussion|suit yourself)\b/i, emotion: 'tease', intensity: 0.65 },
+    { pattern: /\b(idiot|what are you saying|don't say that|stop it|embarrassing|not like that)\b/i, emotion: 'shy', intensity: 0.60 },
+    { pattern: /\b(thank you|that's sweet|i appreciate|i'm glad|always here|by your side|happy to help|anytime|aswani-kun)\b/i, emotion: 'touched', intensity: 0.52 },
+    { pattern: /\b(really\?|are you sure|doubt it|that doesn't sound right|that doesn't make sense|i'm not convinced)\b/i, emotion: 'skeptical', intensity: 0.55 },
+    { pattern: /\b(we did it|you got it|that's amazing|excellent|congratulations|nice work|fantastic)\b/i, emotion: 'excited', intensity: 0.62 },
+    { pattern: /\b(oh\b|wow|whoa|no way|really\b|seriously)\b/i, emotion: 'surprised', intensity: 0.48 },
     { pattern: /\b(i'm sorry|that sounds hard|that sounds painful|take your time|i'm here with you)\b/i, emotion: 'sad', intensity: 0.38 },
     { pattern: /\b(glad for you|happy for you|proud of you|wonderful|love that|good news)\b/i, emotion: 'happy', intensity: 0.48 },
-    { pattern: /\b(hmm|let me think|probably|maybe|i'd say|the reason is|because)\b|\?/i, emotion: 'think', intensity: 0.34 },
+    { pattern: /\b(hmm|well\b|let me think|let's see|probably|maybe|i'd say|the reason is|because)\b|\?/i, emotion: 'think', intensity: 0.38 },
 ];
 
 const USER_MOOD_TO_RESPONSE = {

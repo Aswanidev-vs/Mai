@@ -74,6 +74,10 @@ const EMOTION_MAP = {
     stressed:  { expression: [{ name: 'angry', value: 0.5 }], blendDuration: 0.35, facialKey: 'angry' },
     excited:   { expression: [{ name: 'surprised', value: 0.6 }, { name: 'happy', value: 0.3 }], blendDuration: 0.2, facialKey: 'happy' },
     frustrated:{ expression: [{ name: 'angry', value: 0.55 }], blendDuration: 0.35, facialKey: 'angry' },
+    tease:     { expression: [{ name: 'happy', value: 0.38 }], blendDuration: 0.3, facialKey: 'happy' },
+    shy:       { expression: [{ name: 'happy', value: 0.25 }, { name: 'blush', value: 0.5 }], blendDuration: 0.35, facialKey: 'happy' },
+    touched:   { expression: [{ name: 'happy', value: 0.45 }], blendDuration: 0.4, facialKey: 'happy' },
+    skeptical: { expression: [{ name: 'think', value: 0.45 }, { name: 'surprised', value: 0.2 }], blendDuration: 0.3, facialKey: null },
 };
 
 const VOWEL_MAP = { A: 'aa', E: 'ee', I: 'ih', O: 'oh', U: 'ou' };
@@ -1312,6 +1316,10 @@ class CharacterRenderer {
             case 'angry': tp = 0.03; tr = -0.06; ty = 0.01; break;
             case 'think': ty = 0.07; tp = -0.04; tr = 0.06; break;
             case 'calm': tp = 0.01; tr = 0.01; break;
+            case 'tease': tp = -0.04; tr = 0.06; ty = 0.03; break;
+            case 'shy': tp = 0.05; tr = -0.04; ty = -0.03; break;
+            case 'touched': tp = -0.03; tr = 0.03; ty = 0.01; break;
+            case 'skeptical': tp = -0.02; tr = -0.05; ty = 0.04; break;
         }
         if (this.agentStatus === 'thinking') { ty = 0.06; tp = -0.04; tr = 0.06; }
         if (this.restMode) { tp = lerp(tp, 0.06, 0.7); ty = lerp(ty, 0.02, 0.5); }
@@ -1399,7 +1407,9 @@ class CharacterRenderer {
     setEmotion(emotion, intensity) {
         this._setEmotion(emotion || 'calm', intensity || 0.5);
         clearTimeout(this.expressionResetTimer);
-        this.expressionResetTimer = setTimeout(() => this._setEmotion('neutral', 1), EXPRESSION_RESET_MS);
+        if (!this.speaking) {
+            this.expressionResetTimer = setTimeout(() => this._setEmotion('neutral', 1), EXPRESSION_RESET_MS);
+        }
         this.lastInteraction = performance.now();
     }
 
@@ -1425,6 +1435,10 @@ class CharacterRenderer {
             this.visemeSchedule = null;
             this.visemeDuration = 0;
             // Don't reset vowels immediately — let smoothstep release handle fade-out
+            if (this.currentEmotion && this.currentEmotion !== 'neutral') {
+                clearTimeout(this.expressionResetTimer);
+                this.expressionResetTimer = setTimeout(() => this._setEmotion('neutral', 1), EXPRESSION_RESET_MS);
+            }
         }
     }
 

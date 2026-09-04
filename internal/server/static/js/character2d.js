@@ -247,7 +247,7 @@ class Character2D {
             const gate = energyGate(rms, 0.012, 0.10);
             openAmount = seg ? seg.open * (0.1 + 0.9 * gate) : 0;
         } else if (this.emotionTarget) {
-            const mouthEmotions = { happy: 0.15, sad: 0.1, angry: 0.12, surprised: 0.25 };
+            const mouthEmotions = { happy: 0.15, sad: 0.1, angry: 0.12, surprised: 0.25, tease: 0.18, shy: 0.12, touched: 0.14, skeptical: 0.08 };
             openAmount = mouthEmotions[this.emotionTarget] || 0;
         }
 
