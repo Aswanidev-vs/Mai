@@ -215,6 +215,17 @@ ws.on('companion.dance', () => {
     character.dance();
 });
 
+// Explicit action request from backend (motion + expression together)
+ws.on('companion.action', (params) => {
+    if (!params || !params.action) return;
+    console.log('[Action] Triggered:', params.action, params.duration);
+    if (typeof character.performAction === 'function') {
+        character.performAction(params.action, params.duration);
+    } else if (params.action === 'dance' && typeof character.dance === 'function') {
+        character.dance(params.duration);
+    }
+});
+
 ws.on('state.request', (params) => {
     statusText.textContent = params.status || 'idle';
 });

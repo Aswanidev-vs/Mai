@@ -36,11 +36,18 @@ const (
 	NotifConfigChanged = "config.changed"
 	NotifMemoryUpdate  = "memory.update"
 	NotifDance         = "companion.dance"
+	NotifAction        = "companion.action"
 )
 
 // ChatInputParams is the payload for chat.input.
 type ChatInputParams struct {
 	Text string `json:"text"`
+}
+
+// ActionParams carries an explicit action/motion requested by the user.
+type ActionParams struct {
+	Action   string  `json:"action"`
+	Duration float64 `json:"duration,omitempty"`
 }
 
 // ChatResponseChunk is streamed back for chat.response.

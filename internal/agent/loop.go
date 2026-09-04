@@ -397,12 +397,22 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		o.recentUserInputs = o.recentUserInputs[1:]
 	}
 
-	// --- Dance request: fire her body motion alongside the normal reply ---
+	// --- Action & Motion request: fire matching body/face motion alongside reply ---
 	// Covers both voice and chat, since every turn funnels through HandleInput.
-	if wantsDance(inputLower) && o.bus != nil {
+	if act := detectAction(inputLower); act != "" && o.bus != nil {
+		if act == "dance" {
+			o.bus.Publish(interfaces.Event{
+				Type:   "companion.dance",
+				Source: "agent.orchestrator",
+			})
+		}
 		o.bus.Publish(interfaces.Event{
-			Type:   "companion.dance",
+			Type:   "companion.action",
 			Source: "agent.orchestrator",
+			Payload: map[string]interface{}{
+				"action":   act,
+				"duration": 4.0,
+			},
 		})
 	}
 
@@ -1104,6 +1114,109 @@ func wantsDance(lower string) bool {
 		}
 	}
 	return false
+}
+
+// detectAction checks whether the user explicitly requested an action/motion.
+// Returns the action key or empty string if no action intent is detected.
+func detectAction(lower string) string {
+	if wantsDance(lower) {
+		return "dance"
+	}
+
+	type actionRule struct {
+		name     string
+		keywords []string
+	}
+
+	rules := []actionRule{
+		{
+			name: "crying",
+			keywords: []string{
+				"cry", "crying", "shed a tear", "weep", "sob",
+			},
+		},
+		{
+			name: "pouting",
+			keywords: []string{
+				"pout", "pouting", "sulking",
+			},
+		},
+		{
+			name: "flustered",
+			keywords: []string{
+				"fluster", "flustered", "blush", "blushing", "get shy",
+			},
+		},
+		{
+			name: "depression",
+			keywords: []string{
+				"depress", "depressed", "depression", "slump", "despair", "look down",
+			},
+		},
+		{
+			name: "smile",
+			keywords: []string{
+				"smile", "smiling", "give me a smile", "show me a smile", "grin",
+			},
+		},
+		{
+			name: "happy",
+			keywords: []string{
+				"be happy", "look happy", "cheer up", "act happy", "show happiness",
+			},
+		},
+		{
+			name: "sad",
+			keywords: []string{
+				"be sad", "look sad", "frown", "act sad",
+			},
+		},
+		{
+			name: "angry",
+			keywords: []string{
+				"get angry", "be angry", "look angry", "act angry", "rage",
+			},
+		},
+		{
+			name: "surprised",
+			keywords: []string{
+				"look surprised", "be surprised", "act surprised", "gasp",
+			},
+		},
+		{
+			name: "thinking",
+			keywords: []string{
+				"think about it", "ponder", "hmm", "let me think", "wonder",
+			},
+		},
+		{
+			name: "wave",
+			keywords: []string{
+				"wave", "waving", "say bye", "wave goodbye", "wave hello", "wave at me",
+			},
+		},
+		{
+			name: "nod",
+			keywords: []string{
+				"nod", "nodding", "nod your head",
+			},
+		},
+		{
+			name: "headshake",
+			keywords: []string{
+				"shake your head", "shake head", "headshake",
+			},
+		},
+	}
+
+	for _, rule := range rules {
+		for _, kw := range rule.keywords {
+			if strings.Contains(lower, kw) {
+				return rule.name
+			}
+		}
+	}
+	return ""
 }
 
 // takeSentence extracts the next complete sentence from buf, mutating buf to

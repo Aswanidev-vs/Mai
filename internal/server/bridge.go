@@ -95,6 +95,24 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		b.hub.BroadcastNotification(NotifDance, struct{}{})
 	})
 
+	// Explicit action/motion request from orchestrator → browser plays matching motion & expression.
+	bus.Subscribe("companion.action", func(event interfaces.Event) {
+		var act string
+		var dur float64
+		if event.Payload != nil {
+			act, _ = event.Payload["action"].(string)
+			dur, _ = event.Payload["duration"].(float64)
+		}
+		if act == "" {
+			return
+		}
+		log.Printf("[BRIDGE] Action request → browser: %s (dur=%.1fs)", act, dur)
+		b.hub.BroadcastNotification(NotifAction, ActionParams{
+			Action:   act,
+			Duration: dur,
+		})
+	})
+
 	log.Println("[BRIDGE] Event bus bridge active")
 }
 

@@ -1,0 +1,86 @@
+{
+  "Version": 3,
+  "Meta": {
+    "Duration": 3.0,
+    "Fps": 30.0,
+    "Loop": false,
+    "AreBeziersRestricted": true,
+    "CurveCount": 7,
+    "TotalSegmentCount": 21,
+    "TotalPointCount": 21,
+    "UserDataCount": 0,
+    "TotalUserDataSize": 0
+  },
+  "Curves": [
+    {
+      "Target": "Parameter",
+      "Id": "ParamAngleX",
+      "Segments": [
+        0, 0, 0,
+        0.8, -12, 0,
+        2.2, -10, 0,
+        3.0, 0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "ParamAngleY",
+      "Segments": [
+        0, 0, 0,
+        0.8, 10, 0,
+        2.2, 8, 0,
+        3.0, 0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "ParamAngleZ",
+      "Segments": [
+        0, 0, 0,
+        0.8, -8, 0,
+        2.2, -6, 0,
+        3.0, 0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "ParamBodyAngleX",
+      "Segments": [
+        0, 0, 0,
+        0.8, -5, 0,
+        2.2, -4, 0,
+        3.0, 0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "ParamEyeLOpen",
+      "Segments": [
+        0, 1.0, 0,
+        0.8, 0.6, 0,
+        2.2, 0.7, 0,
+        3.0, 1.0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "ParamEyeROpen",
+      "Segments": [
+        0, 1.0, 0,
+        0.8, 0.6, 0,
+        2.2, 0.7, 0,
+        3.0, 1.0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "ParamMouthForm",
+      "Segments": [
+        0, 0, 0,
+        0.8, -0.2, 0,
+        2.2, -0.1, 0,
+        3.0, 0
+      ]
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+	"Version": 3,
+	"Meta": {
+		"Name": "Depression",
+		"Duration": 8.0,
+		"Fps": 30.0,
+		"Loop": true,
+		"AreBeziersRestricted": false,
+		"CurveCount": 10,
+		"TotalSegmentCount": 42,
+		"TotalPointCount": 126,
+		"UserDataCount": 0,
+		"TotalUserDataSize": 0
+	},
+	"Curves": [
+		{
+			"Target": "Parameter",
+			"Id": "ParamAngleX",
+			"Segments": [0, 0, 1, 2.0, -2, 1, 4.0, 1, 1, 6.0, -2, 1, 8.0, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamAngleY",
+			"Segments": [0, 0, 1, 1.5, -15, 1, 3.5, -18, 1, 5.5, -15, 1, 7.0, -12, 1, 8.0, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamAngleZ",
+			"Segments": [0, 0, 1, 2.0, 4, 1, 5.0, 6, 1, 7.0, 3, 1, 8.0, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamEyeLOpen",
+			"Segments": [0, 1, 1, 1.0, 0.4, 1, 3.0, 0.35, 1, 5.0, 0.4, 1, 7.0, 0.45, 1, 8.0, 1]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamEyeROpen",
+			"Segments": [0, 1, 1, 1.0, 0.4, 1, 3.0, 0.35, 1, 5.0, 0.4, 1, 7.0, 0.45, 1, 8.0, 1]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamMouthForm",
+			"Segments": [0, 0, 1, 1.0, -0.3, 1, 3.0, -0.4, 1, 5.0, -0.35, 1, 7.0, -0.2, 1, 8.0, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamBrowLForm",
+			"Segments": [0, 0, 1, 1.0, -0.5, 1, 4.0, -0.6, 1, 7.0, -0.4, 1, 8.0, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamBrowRForm",
+			"Segments": [0, 0, 1, 1.0, -0.5, 1, 4.0, -0.6, 1, 7.0, -0.4, 1, 8.0, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamBodyAngleY",
+			"Segments": [0, 0, 1, 1.5, -8, 1, 4.0, -10, 1, 6.0, -8, 1, 7.5, -5, 1, 8.0, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamBreath",
+			"Segments": [0, 0, 1, 2.0, 0.2, 1, 4.0, 0.1, 1, 6.0, 0.2, 1, 8.0, 0]
+		}
+	]
+}

@@ -182,6 +182,33 @@ class Character2D {
         this.lastInteraction = performance.now();
     }
 
+    performAction(action, duration) {
+        if (!action) return false;
+        const act = action.toLowerCase().trim();
+        const ACTION_EMOTIONS = {
+            dance: 'excited',
+            smile: 'happy',
+            happy: 'happy',
+            sad: 'sad',
+            flustered: 'shy',
+            pouting: 'angry',
+            crying: 'sad',
+            depression: 'sad',
+            angry: 'angry',
+            surprised: 'surprised',
+            thinking: 'skeptical',
+            wave: 'happy',
+            nod: 'calm',
+            headshake: 'skeptical',
+        };
+        const em = ACTION_EMOTIONS[act] || 'neutral';
+        this.setEmotion(em, 0.9);
+        if (duration && duration > 0) {
+            this.emotionTimer = duration * 1000;
+        }
+        return true;
+    }
+
     setStatus(status) {
         this.agentStatus = status;
         if (status !== 'idle') this.lastInteraction = performance.now();
