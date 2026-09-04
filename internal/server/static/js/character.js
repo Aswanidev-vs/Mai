@@ -727,7 +727,7 @@ class CharacterRenderer {
         console.log(`[VRM] Playing motion: ${this.currentMotion.name}`);
     }
 
-    playMotionByName(name) {
+    playMotionByName(name, loop = false) {
         if (!this.motionClips || !name) return false;
         const target = name.toLowerCase().trim();
         const clip = this.motionClips.find(c => c && c.name && c.name.toLowerCase() === target);
@@ -736,9 +736,10 @@ class CharacterRenderer {
             return false;
         }
         this.currentMotion = clip;
+        this.currentMotionLoop = loop;
         this.motionTime = 0;
         this.motionPlaying = true;
-        console.log(`[VRM] Playing motion by name: ${clip.name} (dur: ${clip.duration}s)`);
+        console.log(`[VRM] Playing motion by name: ${clip.name} (dur: ${clip.duration}s, loop: ${loop})`);
         return true;
     }
 
@@ -748,6 +749,12 @@ class CharacterRenderer {
         if (this.vrm?.expressionManager) {
             this.vrm.expressionManager.setValue('blinkLeft', 0);
             this.vrm.expressionManager.setValue('blinkRight', 0);
+            this.vrm.expressionManager.setValue('happy', 0);
+            this.vrm.expressionManager.setValue('sad', 0);
+            this.vrm.expressionManager.setValue('blush', 0);
+            if (!this.speaking) {
+                this.vrm.expressionManager.setValue('aa', 0);
+            }
         }
     }
 
@@ -846,8 +853,9 @@ class CharacterRenderer {
             }
         }
 
-        // Handle loop/stop
-        if (!clip.loop && this.motionTime >= clip.duration) {
+        // Handle loop/stop (action motions do not loop by default)
+        const isLooping = this.currentMotionLoop !== undefined ? this.currentMotionLoop : clip.loop;
+        if (!isLooping && this.motionTime >= clip.duration) {
             this.stopMotion();
         }
     }
@@ -1051,8 +1059,13 @@ class CharacterRenderer {
         const baseLeft = clamp01(this.vrm.expressionManager.getValue('eyeLOpen') ?? 1);
         const baseRight = clamp01(this.vrm.expressionManager.getValue('eyeROpen') ?? 1);
 
-        // Skip blink if eyes are already nearly closed
-        if (bs.phase === 'idle' && baseLeft <= BLINK_SKIP_THRESHOLD && baseRight <= BLINK_SKIP_THRESHOLD) {
+        // Skip blink if eyes are already nearly closed (including via blink, blinkLeft/Right, or smiling eyes)
+        const curBlink = this.vrm.expressionManager.getValue('blink') ?? 0;
+        const curBlinkL = this.vrm.expressionManager.getValue('blinkLeft') ?? 0;
+        const curBlinkR = this.vrm.expressionManager.getValue('blinkRight') ?? 0;
+        const curHappy = this.vrm.expressionManager.getValue('happy') ?? 0;
+        const eyesClosed = baseLeft <= BLINK_SKIP_THRESHOLD || curBlink > 0.4 || (curBlinkL > 0.4 && curBlinkR > 0.4) || curHappy > 0.6;
+        if (bs.phase === 'idle' && eyesClosed) {
             bs.delayMs = this._rand(BLINK_DELAY_MIN, BLINK_DELAY_MAX) * 1000;
             return;
         }
@@ -1583,7 +1596,7 @@ class CharacterRenderer {
         const cfg = ACTION_EMOTIONS[act] || { emotion: 'neutral', intensity: 0.7 };
         this._setEmotion(cfg.emotion, cfg.intensity);
 
-        const ok = this.playMotionByName(act);
+        const ok = this.playMotionByName(act, false);
         if (!ok) {
             console.log(`[VRM] Action ${act} mapped to emotion ${cfg.emotion} (no motion clip match)`);
         }

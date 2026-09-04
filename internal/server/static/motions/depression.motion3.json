@@ -4,7 +4,7 @@
 		"Name": "Depression",
 		"Duration": 8.0,
 		"Fps": 30.0,
-		"Loop": true,
+		"Loop": false,
 		"AreBeziersRestricted": false,
 		"CurveCount": 10,
 		"TotalSegmentCount": 42,
