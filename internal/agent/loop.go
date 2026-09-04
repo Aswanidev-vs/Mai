@@ -1142,9 +1142,15 @@ func detectAction(lower string) string {
 			},
 		},
 		{
+			name: "blushing",
+			keywords: []string{
+				"blush", "blushing", "turn red",
+			},
+		},
+		{
 			name: "flustered",
 			keywords: []string{
-				"fluster", "flustered", "blush", "blushing", "get shy",
+				"fluster", "flustered", "get shy", "act shy",
 			},
 		},
 		{

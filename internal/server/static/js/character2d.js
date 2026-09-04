@@ -191,6 +191,8 @@ class Character2D {
             happy: 'happy',
             sad: 'sad',
             flustered: 'shy',
+            blushing: 'shy',
+            blush: 'shy',
             pouting: 'angry',
             crying: 'sad',
             depression: 'sad',

@@ -64,6 +64,7 @@ const MOTION_FILES = [
     '/motions/happy.motion3.json',
     '/motions/sad.motion3.json',
     '/motions/flustered.motion3.json',
+    '/motions/blushing.motion3.json',
     '/motions/pouting.motion3.json',
     '/motions/crying.motion3.json',
     '/motions/depression.motion3.json',

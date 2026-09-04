@@ -678,11 +678,6 @@ class CharacterRenderer {
             this.motionPlaying = false;
             console.log(`[VRM] Loaded ${this.motionClips.length} motion clips`);
 
-            // Auto-play first motion for natural idle movement
-            if (this.motionClips.length > 0) {
-                this.playMotion(0);
-            }
-
             try {
                 const vrmaAnims = vrmaGltf?.userData?.vrmAnimations;
                 if (vrmaAnims && vrmaAnims.length > 0) {
@@ -750,6 +745,10 @@ class CharacterRenderer {
     stopMotion() {
         this.motionPlaying = false;
         this.currentMotion = null;
+        if (this.vrm?.expressionManager) {
+            this.vrm.expressionManager.setValue('blinkLeft', 0);
+            this.vrm.expressionManager.setValue('blinkRight', 0);
+        }
     }
 
     _updateMotion3(delta) {
@@ -1568,6 +1567,8 @@ class CharacterRenderer {
             happy: { emotion: 'happy', intensity: 1.0 },
             sad: { emotion: 'sad', intensity: 0.9 },
             flustered: { emotion: 'shy', intensity: 0.95 },
+            blushing: { emotion: 'shy', intensity: 1.0 },
+            blush: { emotion: 'shy', intensity: 1.0 },
             pouting: { emotion: 'frustrated', intensity: 0.9 },
             crying: { emotion: 'sad', intensity: 1.0 },
             depression: { emotion: 'sad', intensity: 0.8 },
