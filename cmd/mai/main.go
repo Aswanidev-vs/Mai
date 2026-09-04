@@ -887,8 +887,21 @@ func main() {
 				TopP:        cfg.LLM.Sampling.TopP,
 				MaxTokens:   cfg.LLM.Sampling.MaxTokens,
 			})
+		// Pocket can begin TTS as soon as the LLM finishes a safe sentence.
+		// Other models keep the existing compatibility behavior.
+		llmToTTSStreaming := cfg.TTS.ActiveModel != "pocket" || cfg.TTS.Pocket.Streaming
+		orch.SetTTSStreaming(llmToTTSStreaming)
+		if cfg.TTS.ActiveModel == "pocket" {
+			mode := "buffered"
+			if llmToTTSStreaming {
+				mode = "streaming"
+			}
+			log.Printf("[TTS] LLM-to-Pocket handoff: %s", mode)
+		}
 
-		// Stream generated sentences into the serialized TTS queue.
+		// Deliver generated sentences into the serialized TTS queue. The
+		// orchestrator decides whether this happens during LLM generation or
+		// after the complete response, based on pocket.streaming.
 		// The playSentence function handles routing: when a browser client
 		// is connected it publishes audio chunks via the event bus (bridge
 		// forwards them to the browser); when no client is connected it

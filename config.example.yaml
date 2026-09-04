@@ -129,7 +129,7 @@ tts:
   pocket:
     # Official Sherpa Pocket package. Leave bundle empty for Sherpa's API.
     model_dir: "./sherpa-onnx-pocket-tts-2026-01-26"
-    streaming: true  # true = play callback chunks immediately; false = buffer each utterance first
+    streaming: true  # true = stream LLM sentences/audio; false = wait, then use sentence chunks
     lm_flow: "lm_flow.onnx"
     lm_main: "lm_main.onnx"
     encoder: "encoder.onnx"
