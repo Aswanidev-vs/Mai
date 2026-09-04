@@ -182,6 +182,35 @@ class Character2D {
         this.lastInteraction = performance.now();
     }
 
+    performAction(action, duration) {
+        if (!action) return false;
+        const act = action.toLowerCase().trim();
+        const ACTION_EMOTIONS = {
+            dance: 'excited',
+            smile: 'happy',
+            happy: 'happy',
+            sad: 'sad',
+            flustered: 'shy',
+            blushing: 'shy',
+            blush: 'shy',
+            pouting: 'angry',
+            crying: 'sad',
+            depression: 'sad',
+            angry: 'angry',
+            surprised: 'surprised',
+            thinking: 'skeptical',
+            wave: 'happy',
+            nod: 'calm',
+            headshake: 'skeptical',
+        };
+        const em = ACTION_EMOTIONS[act] || 'neutral';
+        this.setEmotion(em, 0.9);
+        if (duration && duration > 0) {
+            this.emotionTimer = duration * 1000;
+        }
+        return true;
+    }
+
     setStatus(status) {
         this.agentStatus = status;
         if (status !== 'idle') this.lastInteraction = performance.now();
@@ -247,7 +276,7 @@ class Character2D {
             const gate = energyGate(rms, 0.012, 0.10);
             openAmount = seg ? seg.open * (0.1 + 0.9 * gate) : 0;
         } else if (this.emotionTarget) {
-            const mouthEmotions = { happy: 0.15, sad: 0.1, angry: 0.12, surprised: 0.25 };
+            const mouthEmotions = { happy: 0.15, sad: 0.1, angry: 0.12, surprised: 0.25, tease: 0.18, shy: 0.12, touched: 0.14, skeptical: 0.08 };
             openAmount = mouthEmotions[this.emotionTarget] || 0;
         }
 

@@ -60,6 +60,20 @@ const MOTION_FILES = [
     '/assets/hiyori_m07.motion3.json',
     '/assets/hiyori_m08.motion3.json',
     '/dance/dance_show.motion3.json',
+    '/motions/smile.motion3.json',
+    '/motions/happy.motion3.json',
+    '/motions/sad.motion3.json',
+    '/motions/flustered.motion3.json',
+    '/motions/blushing.motion3.json',
+    '/motions/pouting.motion3.json',
+    '/motions/crying.motion3.json',
+    '/motions/depression.motion3.json',
+    '/motions/angry.motion3.json',
+    '/motions/surprised.motion3.json',
+    '/motions/thinking.motion3.json',
+    '/motions/wave.motion3.json',
+    '/motions/nod.motion3.json',
+    '/motions/headshake.motion3.json',
 ];
 
 const PARAM_MAP = {
@@ -74,7 +88,15 @@ const PARAM_MAP = {
     ParamHairAhoge: 'ParamHairAhoge',
 };
 
+function getMotionByName(clips, name) {
+    if (!Array.isArray(clips) || !name) return null;
+    const target = name.toLowerCase().trim();
+    return clips.find(c => c && c.name && c.name.toLowerCase() === target) || null;
+}
+
 window.Motion3Clip = Motion3Clip;
 window.loadMotion3 = loadMotion3;
 window.MOTION_FILES = MOTION_FILES;
 window.PARAM_MAP = PARAM_MAP;
+window.getMotionByName = getMotionByName;
+

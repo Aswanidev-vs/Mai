@@ -1,0 +1,72 @@
+{
+	"Version": 3,
+	"Meta": {
+		"Name": "Angry",
+		"Duration": 3.5,
+		"Fps": 30.0,
+		"Loop": true,
+		"AreBeziersRestricted": false,
+		"CurveCount": 11,
+		"TotalSegmentCount": 56,
+		"TotalPointCount": 168,
+		"UserDataCount": 0,
+		"TotalUserDataSize": 0
+	},
+	"Curves": [
+		{
+			"Target": "Parameter",
+			"Id": "ParamAngleX",
+			"Segments": [0, 0, 1, 0.2, -5, 1, 0.5, 5, 1, 0.8, -3, 1, 1.5, 2, 1, 2.5, -2, 1, 3.5, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamAngleY",
+			"Segments": [0, 0, 1, 0.2, -5, 1, 0.5, -8, 1, 1.0, -6, 1, 2.0, -5, 1, 3.0, -3, 1, 3.5, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamAngleZ",
+			"Segments": [0, 0, 1, 0.3, -3, 1, 0.8, 3, 1, 1.5, -2, 1, 2.5, 2, 1, 3.5, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamEyeLOpen",
+			"Segments": [0, 1, 1, 0.2, 0.7, 1, 0.5, 0.8, 1, 1.5, 0.75, 1, 2.5, 0.8, 1, 3.5, 1]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamEyeROpen",
+			"Segments": [0, 1, 1, 0.2, 0.7, 1, 0.5, 0.8, 1, 1.5, 0.75, 1, 2.5, 0.8, 1, 3.5, 1]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamBrowLForm",
+			"Segments": [0, 0, 1, 0.2, -0.8, 1, 0.5, -0.9, 1, 1.5, -0.85, 1, 2.5, -0.7, 1, 3.5, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamBrowRForm",
+			"Segments": [0, 0, 1, 0.2, -0.8, 1, 0.5, -0.9, 1, 1.5, -0.85, 1, 2.5, -0.7, 1, 3.5, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamMouthForm",
+			"Segments": [0, 0, 1, 0.2, -0.5, 1, 0.5, -0.7, 1, 1.5, -0.6, 1, 2.5, -0.4, 1, 3.5, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamBodyAngleY",
+			"Segments": [0, 0, 1, 0.2, -4, 1, 0.5, -6, 1, 1.0, -5, 1, 2.0, -4, 1, 3.0, -2, 1, 3.5, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamBodyAngleX",
+			"Segments": [0, 0, 1, 0.3, -3, 1, 0.8, 3, 1, 1.5, -2, 1, 2.5, 2, 1, 3.5, 0]
+		},
+		{
+			"Target": "Parameter",
+			"Id": "ParamBreath",
+			"Segments": [0, 0, 1, 0.3, 0.6, 1, 0.8, 0.2, 1, 1.3, 0.6, 1, 1.8, 0.2, 1, 2.5, 0.4, 1, 3.0, 0.2, 1, 3.5, 0]
+		}
+	]
+}

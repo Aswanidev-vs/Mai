@@ -74,6 +74,10 @@ const EMOTION_MAP = {
     stressed:  { expression: [{ name: 'angry', value: 0.5 }], blendDuration: 0.35, facialKey: 'angry' },
     excited:   { expression: [{ name: 'surprised', value: 0.6 }, { name: 'happy', value: 0.3 }], blendDuration: 0.2, facialKey: 'happy' },
     frustrated:{ expression: [{ name: 'angry', value: 0.55 }], blendDuration: 0.35, facialKey: 'angry' },
+    tease:     { expression: [{ name: 'happy', value: 0.38 }], blendDuration: 0.3, facialKey: 'happy' },
+    shy:       { expression: [{ name: 'happy', value: 0.25 }, { name: 'blush', value: 0.5 }], blendDuration: 0.35, facialKey: 'happy' },
+    touched:   { expression: [{ name: 'happy', value: 0.45 }], blendDuration: 0.4, facialKey: 'happy' },
+    skeptical: { expression: [{ name: 'think', value: 0.45 }, { name: 'surprised', value: 0.2 }], blendDuration: 0.3, facialKey: null },
 };
 
 const VOWEL_MAP = { A: 'aa', E: 'ee', I: 'ih', O: 'oh', U: 'ou' };
@@ -674,11 +678,6 @@ class CharacterRenderer {
             this.motionPlaying = false;
             console.log(`[VRM] Loaded ${this.motionClips.length} motion clips`);
 
-            // Auto-play first motion for natural idle movement
-            if (this.motionClips.length > 0) {
-                this.playMotion(0);
-            }
-
             try {
                 const vrmaAnims = vrmaGltf?.userData?.vrmAnimations;
                 if (vrmaAnims && vrmaAnims.length > 0) {
@@ -728,26 +727,135 @@ class CharacterRenderer {
         console.log(`[VRM] Playing motion: ${this.currentMotion.name}`);
     }
 
+    playMotionByName(name, loop = false) {
+        if (!this.motionClips || !name) return false;
+        const target = name.toLowerCase().trim();
+        const clip = this.motionClips.find(c => c && c.name && c.name.toLowerCase() === target);
+        if (!clip) {
+            console.warn(`[VRM] Motion not found: ${name}`);
+            return false;
+        }
+        this.currentMotion = clip;
+        this.currentMotionLoop = loop;
+        this.motionTime = 0;
+        this.motionPlaying = true;
+        console.log(`[VRM] Playing motion by name: ${clip.name} (dur: ${clip.duration}s, loop: ${loop})`);
+        return true;
+    }
+
     stopMotion() {
         this.motionPlaying = false;
         this.currentMotion = null;
+        if (this.vrm?.expressionManager) {
+            this.vrm.expressionManager.setValue('blinkLeft', 0);
+            this.vrm.expressionManager.setValue('blinkRight', 0);
+            this.vrm.expressionManager.setValue('happy', 0);
+            this.vrm.expressionManager.setValue('sad', 0);
+            this.vrm.expressionManager.setValue('blush', 0);
+            if (!this.speaking) {
+                this.vrm.expressionManager.setValue('aa', 0);
+            }
+        }
     }
 
     _updateMotion3(delta) {
-        if (!this.motionPlaying || !this.currentMotion || !this.vrm?.expressionManager) return;
+        if (!this.motionPlaying || !this.currentMotion || !this.vrm) return;
 
         this.motionTime += delta;
+        const clip = this.currentMotion;
+        const em = this.vrm.expressionManager;
+        const h = this.vrm.humanoid;
 
-        // Apply parameter curves to VRM model
-        for (const paramId of Object.keys(PARAM_MAP)) {
-            const value = this.currentMotion.evaluate(paramId, this.motionTime);
-            if (value !== null) {
-                this.vrm.expressionManager.setValue(paramId, value);
+        // Evaluate all curves for current timestamp
+        const getVal = (paramId) => clip.evaluate(paramId, this.motionTime);
+
+        // 1. Head and body angles -> VRM humanoid bones (degrees to radians)
+        const angleX = getVal('ParamAngleX');
+        const angleY = getVal('ParamAngleY');
+        const angleZ = getVal('ParamAngleZ');
+        const bodyAngleX = getVal('ParamBodyAngleX');
+        const bodyAngleY = getVal('ParamBodyAngleY');
+        const bodyAngleZ = getVal('ParamBodyAngleZ');
+
+        const deg2rad = Math.PI / 180;
+        if (h) {
+            const head = h.getNormalizedBoneNode('head');
+            const neck = h.getNormalizedBoneNode('neck');
+            const spine = h.getNormalizedBoneNode('spine');
+
+            if (head) {
+                if (angleY !== null) head.rotation.x += -angleY * deg2rad * 0.7; // pitch
+                if (angleX !== null) head.rotation.y += angleX * deg2rad * 0.7;  // yaw
+                if (angleZ !== null) head.rotation.z += angleZ * deg2rad * 0.7;  // roll
+            }
+            if (neck) {
+                if (angleY !== null) neck.rotation.x += -angleY * deg2rad * 0.3;
+                if (angleX !== null) neck.rotation.y += angleX * deg2rad * 0.3;
+                if (angleZ !== null) neck.rotation.z += angleZ * deg2rad * 0.3;
+            }
+            if (spine) {
+                if (bodyAngleY !== null) spine.rotation.x += -bodyAngleY * deg2rad * 0.5;
+                if (bodyAngleX !== null) spine.rotation.y += bodyAngleX * deg2rad * 0.5;
+                if (bodyAngleZ !== null) spine.rotation.z += bodyAngleZ * deg2rad * 0.5;
             }
         }
 
-        // Handle loop/stop
-        if (!this.currentMotion.loop && this.motionTime >= this.currentMotion.duration) {
+        // 2. Map Live2D facial parameter curves directly to standard VRM blendshapes
+        if (em) {
+            const browL = getVal('ParamBrowLForm');
+            const browR = getVal('ParamBrowRForm');
+            const eyeL = getVal('ParamEyeLOpen');
+            const eyeR = getVal('ParamEyeROpen');
+            const eyeLSmile = getVal('ParamEyeLSmile');
+            const eyeRSmile = getVal('ParamEyeRSmile');
+            const mouthForm = getVal('ParamMouthForm');
+            const mouthOpen = getVal('ParamMouthOpenY');
+            const cheek = getVal('ParamCheek');
+
+            // Brow sad/angry: negative BrowForm -> sad blendshape
+            if (browL !== null && browL < -0.2) {
+                const sadVal = Math.min(1.0, -browL);
+                em.setValue('sad', Math.max(em.getValue('sad') || 0, sadVal));
+            } else if (browL !== null && browL > 0.3) {
+                const happyVal = Math.min(1.0, browL);
+                em.setValue('happy', Math.max(em.getValue('happy') || 0, happyVal));
+            }
+
+            // Eyes: squint / close
+            if (eyeL !== null && eyeL < 0.7) {
+                const blinkL = (1.0 - eyeL);
+                em.setValue('blinkLeft', Math.max(em.getValue('blinkLeft') || 0, blinkL));
+            }
+            if (eyeR !== null && eyeR < 0.7) {
+                const blinkR = (1.0 - eyeR);
+                em.setValue('blinkRight', Math.max(em.getValue('blinkRight') || 0, blinkR));
+            }
+
+            // Smile eyes
+            if ((eyeLSmile !== null && eyeLSmile > 0.3) || (eyeRSmile !== null && eyeRSmile > 0.3)) {
+                const smileVal = Math.max(eyeLSmile || 0, eyeRSmile || 0);
+                em.setValue('happy', Math.max(em.getValue('happy') || 0, smileVal));
+            }
+
+            // Mouth form: frown (negative) -> sad, smile (positive) -> happy
+            if (mouthForm !== null && mouthForm < -0.3) {
+                em.setValue('sad', Math.max(em.getValue('sad') || 0, -mouthForm * 0.8));
+            }
+
+            // Mouth open (sobbing, gasp, speaking)
+            if (mouthOpen !== null && mouthOpen > 0.05 && !this.speaking) {
+                em.setValue('aa', mouthOpen * 0.7);
+            }
+
+            // Blush / cheek
+            if (cheek !== null && cheek > 0.2) {
+                em.setValue('blush', Math.max(em.getValue('blush') || 0, cheek));
+            }
+        }
+
+        // Handle loop/stop (action motions do not loop by default)
+        const isLooping = this.currentMotionLoop !== undefined ? this.currentMotionLoop : clip.loop;
+        if (!isLooping && this.motionTime >= clip.duration) {
             this.stopMotion();
         }
     }
@@ -951,8 +1059,13 @@ class CharacterRenderer {
         const baseLeft = clamp01(this.vrm.expressionManager.getValue('eyeLOpen') ?? 1);
         const baseRight = clamp01(this.vrm.expressionManager.getValue('eyeROpen') ?? 1);
 
-        // Skip blink if eyes are already nearly closed
-        if (bs.phase === 'idle' && baseLeft <= BLINK_SKIP_THRESHOLD && baseRight <= BLINK_SKIP_THRESHOLD) {
+        // Skip blink if eyes are already nearly closed (including via blink, blinkLeft/Right, or smiling eyes)
+        const curBlink = this.vrm.expressionManager.getValue('blink') ?? 0;
+        const curBlinkL = this.vrm.expressionManager.getValue('blinkLeft') ?? 0;
+        const curBlinkR = this.vrm.expressionManager.getValue('blinkRight') ?? 0;
+        const curHappy = this.vrm.expressionManager.getValue('happy') ?? 0;
+        const eyesClosed = baseLeft <= BLINK_SKIP_THRESHOLD || curBlink > 0.4 || (curBlinkL > 0.4 && curBlinkR > 0.4) || curHappy > 0.6;
+        if (bs.phase === 'idle' && eyesClosed) {
             bs.delayMs = this._rand(BLINK_DELAY_MIN, BLINK_DELAY_MAX) * 1000;
             return;
         }
@@ -1312,6 +1425,10 @@ class CharacterRenderer {
             case 'angry': tp = 0.03; tr = -0.06; ty = 0.01; break;
             case 'think': ty = 0.07; tp = -0.04; tr = 0.06; break;
             case 'calm': tp = 0.01; tr = 0.01; break;
+            case 'tease': tp = -0.04; tr = 0.06; ty = 0.03; break;
+            case 'shy': tp = 0.05; tr = -0.04; ty = -0.03; break;
+            case 'touched': tp = -0.03; tr = 0.03; ty = 0.01; break;
+            case 'skeptical': tp = -0.02; tr = -0.05; ty = 0.04; break;
         }
         if (this.agentStatus === 'thinking') { ty = 0.06; tp = -0.04; tr = 0.06; }
         if (this.restMode) { tp = lerp(tp, 0.06, 0.7); ty = lerp(ty, 0.02, 0.5); }
@@ -1399,7 +1516,9 @@ class CharacterRenderer {
     setEmotion(emotion, intensity) {
         this._setEmotion(emotion || 'calm', intensity || 0.5);
         clearTimeout(this.expressionResetTimer);
-        this.expressionResetTimer = setTimeout(() => this._setEmotion('neutral', 1), EXPRESSION_RESET_MS);
+        if (!this.speaking) {
+            this.expressionResetTimer = setTimeout(() => this._setEmotion('neutral', 1), EXPRESSION_RESET_MS);
+        }
         this.lastInteraction = performance.now();
     }
 
@@ -1425,6 +1544,10 @@ class CharacterRenderer {
             this.visemeSchedule = null;
             this.visemeDuration = 0;
             // Don't reset vowels immediately — let smoothstep release handle fade-out
+            if (this.currentEmotion && this.currentEmotion !== 'neutral') {
+                clearTimeout(this.expressionResetTimer);
+                this.expressionResetTimer = setTimeout(() => this._setEmotion('neutral', 1), EXPRESSION_RESET_MS);
+            }
         }
     }
 
@@ -1441,6 +1564,54 @@ class CharacterRenderer {
     notifyUserPresent() {
         this.userPresent = true;
         this.lastInteraction = performance.now();
+    }
+
+    // ── Explicit Action Mode ──
+    // Triggers emotion expression + motion3 parameter animation together.
+    performAction(action, duration) {
+        if (!action) return false;
+        const act = action.toLowerCase().trim();
+        if (act === 'dance') {
+            return this.dance(duration);
+        }
+
+        const ACTION_EMOTIONS = {
+            smile: { emotion: 'happy', intensity: 0.85 },
+            happy: { emotion: 'happy', intensity: 1.0 },
+            sad: { emotion: 'sad', intensity: 0.9 },
+            flustered: { emotion: 'shy', intensity: 0.95 },
+            blushing: { emotion: 'shy', intensity: 1.0 },
+            blush: { emotion: 'shy', intensity: 1.0 },
+            pouting: { emotion: 'frustrated', intensity: 0.9 },
+            crying: { emotion: 'sad', intensity: 1.0 },
+            depression: { emotion: 'sad', intensity: 0.8 },
+            angry: { emotion: 'angry', intensity: 0.95 },
+            surprised: { emotion: 'surprised', intensity: 0.9 },
+            thinking: { emotion: 'think', intensity: 0.85 },
+            wave: { emotion: 'happy', intensity: 0.75 },
+            nod: { emotion: 'calm', intensity: 0.7 },
+            headshake: { emotion: 'skeptical', intensity: 0.75 },
+        };
+
+        const cfg = ACTION_EMOTIONS[act] || { emotion: 'neutral', intensity: 0.7 };
+        this._setEmotion(cfg.emotion, cfg.intensity);
+
+        const ok = this.playMotionByName(act, false);
+        if (!ok) {
+            console.log(`[VRM] Action ${act} mapped to emotion ${cfg.emotion} (no motion clip match)`);
+        }
+
+        const resetMs = (duration && duration > 0) ? (duration * 1000) : 4000;
+        clearTimeout(this.expressionResetTimer);
+        this.expressionResetTimer = setTimeout(() => {
+            if (!this.speaking) {
+                this._setEmotion('neutral', 1);
+            }
+            this.stopMotion();
+        }, resetMs);
+
+        this.lastInteraction = performance.now();
+        return true;
     }
 
     // ── Dance Mode ──
