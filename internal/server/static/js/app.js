@@ -14,15 +14,24 @@ const settings = new SettingsPanel(ws);
 // user. These are intentionally conservative: a technical answer should not
 // make Mai look angry just because it mentions an error.
 const ASSISTANT_EXPRESSION_CUES = [
-    { pattern: /\b(heh|as expected|aren't you|you really are|don't flatter yourself|making things complicated|architecture discussion|suit yourself)\b/i, emotion: 'tease', intensity: 0.65 },
-    { pattern: /\b(idiot|what are you saying|don't say that|stop it|embarrassing|not like that)\b/i, emotion: 'shy', intensity: 0.60 },
-    { pattern: /\b(thank you|that's sweet|i appreciate|i'm glad|always here|by your side|happy to help|anytime|aswani-kun)\b/i, emotion: 'touched', intensity: 0.52 },
-    { pattern: /\b(really\?|are you sure|doubt it|that doesn't sound right|that doesn't make sense|i'm not convinced)\b/i, emotion: 'skeptical', intensity: 0.55 },
-    { pattern: /\b(we did it|you got it|that's amazing|excellent|congratulations|nice work|fantastic)\b/i, emotion: 'excited', intensity: 0.62 },
-    { pattern: /\b(oh\b|wow|whoa|no way|really\b|seriously)\b/i, emotion: 'surprised', intensity: 0.48 },
-    { pattern: /\b(i'm sorry|that sounds hard|that sounds painful|take your time|i'm here with you)\b/i, emotion: 'sad', intensity: 0.38 },
-    { pattern: /\b(glad for you|happy for you|proud of you|wonderful|love that|good news)\b/i, emotion: 'happy', intensity: 0.48 },
-    { pattern: /\b(hmm|well\b|let me think|let's see|probably|maybe|i'd say|the reason is|because)\b|\?/i, emotion: 'think', intensity: 0.38 },
+    // tease
+    { pattern: /\b(heh|as expected|aren't you|you really are|don't flatter yourself|making things complicated|architecture discussion|suit yourself|you're such a|got me there|well played|as expected of you)\b/i, emotion: 'tease', intensity: 0.65 },
+    // shy
+    { pattern: /\b(idiot|what are you saying|don't say that|stop it|embarrassing|not like that|shut up|you're embarrassing me|i'm blushing|so forward)\b/i, emotion: 'shy', intensity: 0.60 },
+    // touched
+    { pattern: /\b(thank you|that's sweet|i appreciate|i'm glad|always here|by your side|happy to help|anytime|aswani-kun|you mean a lot|that means a lot|i care about you)\b/i, emotion: 'touched', intensity: 0.52 },
+    // skeptical
+    { pattern: /\b(really\?|are you sure|doubt it|that doesn't sound right|that doesn't make sense|i'm not convinced|seriously\?|you can't be serious|i'll believe it when i see it)\b/i, emotion: 'skeptical', intensity: 0.55 },
+    // excited
+    { pattern: /\b(we did it|you got it|that's amazing|excellent|congratulations|nice work|fantastic|that's incredible|so cool|love it|finally|im so excited|perfect)\b/i, emotion: 'excited', intensity: 0.62 },
+    // surprised
+    { pattern: /\b(oh\b|wow|whoa|no way|really\b|seriously|wait what|hold on|huh\?|wait, really)\b/i, emotion: 'surprised', intensity: 0.48 },
+    // sad
+    { pattern: /\b(i'm sorry|that sounds hard|that sounds painful|take your time|i'm here with you|that's rough|i feel for you|that's so sad|oh no)\b/i, emotion: 'sad', intensity: 0.38 },
+    // happy
+    { pattern: /\b(glad for you|happy for you|proud of you|wonderful|love that|good news|great to hear|i'm happy to|that's great)\b/i, emotion: 'happy', intensity: 0.48 },
+    // think (hesitation / reasoning)
+    { pattern: /\b(hmm|well\b|let me think|let's see|uhm|uhh|huh|let me check|give me a second|one moment|probably|maybe|i'd say|the reason is|because)\b|\?/i, emotion: 'think', intensity: 0.38 },
 ];
 
 const USER_MOOD_TO_RESPONSE = {
@@ -37,21 +46,44 @@ const USER_MOOD_TO_RESPONSE = {
 
 let responseInProgress = false;
 let activeAssistantEmotion = '';
+let activeAssistantIntensity = 0;
 
 function updateAssistantExpression(text) {
     if (!text) return;
     if (!responseInProgress) {
         responseInProgress = true;
         activeAssistantEmotion = 'calm';
+        activeAssistantIntensity = 0.25;
         character.setEmotion('calm', 0.25);
     }
 
+    // Score every cue instead of stopping at the first match: the emotional
+    // tone should follow the *strongest, most recent* cue, not whichever regex
+    // happens to be listed first. Recency is a small tiebreaker so a late
+    // "we did it!" outweighs an early "let me think".
+    let best = null;
+    let bestScore = -1;
     for (const cue of ASSISTANT_EXPRESSION_CUES) {
-        if (cue.pattern.test(text) && cue.emotion !== activeAssistantEmotion) {
-            activeAssistantEmotion = cue.emotion;
-            character.setEmotion(cue.emotion, cue.intensity);
-            break;
+        cue.pattern.lastIndex = 0;
+        const m = cue.pattern.exec(text);
+        if (!m) continue;
+        const recency = m.index / Math.max(text.length, 1);
+        const score = cue.intensity + recency * 0.25;
+        if (score > bestScore) {
+            bestScore = score;
+            best = cue;
         }
+    }
+    if (!best) return;
+
+    // Re-anchor when the emotion changes, or when a clearly stronger cue for
+    // the same emotion arrives — avoids flicker between subtle cues.
+    const changed = best.emotion !== activeAssistantEmotion;
+    const stronger = best.intensity > activeAssistantIntensity + 0.1;
+    if (changed || stronger) {
+        activeAssistantEmotion = best.emotion;
+        activeAssistantIntensity = best.intensity;
+        character.setEmotion(best.emotion, best.intensity);
     }
 }
 
@@ -141,6 +173,7 @@ ws.on('chat.response', (params) => {
         streamingActive = false;
         responseInProgress = false;
         activeAssistantEmotion = '';
+        activeAssistantIntensity = 0;
         // Check for uncertainty markers and trigger gaze avoidance
         const lower = gazeAvoidBuffer.toLowerCase();
         for (const marker of UNCERTAINTY_MARKERS) {

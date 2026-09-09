@@ -67,16 +67,16 @@ const EMOTION_MAP = {
     happy:     { expression: [{ name: 'happy', value: 0.7 }], blendDuration: 0.4, facialKey: 'happy' },
     sad:       { expression: [{ name: 'sad', value: 0.65 }], blendDuration: 0.5, facialKey: 'sad' },
     angry:     { expression: [{ name: 'angry', value: 0.65 }], blendDuration: 0.3, facialKey: 'angry' },
-    surprised: { expression: [{ name: 'surprised', value: 0.75 }], blendDuration: 0.15, facialKey: 'surprised' },
+    surprised: { expression: [{ name: 'surprised', value: 0.75 }, { name: 'aa', value: 0.12 }], blendDuration: 0.15, facialKey: 'surprised' },
     neutral:   { expression: [{ name: 'neutral', value: 1.0 }], blendDuration: 0.6, facialKey: null },
-    think:     { expression: [{ name: 'think', value: 0.6 }], blendDuration: 0.5, facialKey: null },
+    think:     { expression: [{ name: 'think', value: 0.6 }, { name: 'lookUp', value: 0.12 }], blendDuration: 0.5, facialKey: null },
     calm:      { expression: [{ name: 'neutral', value: 1.0 }], blendDuration: 0.7, facialKey: null },
-    stressed:  { expression: [{ name: 'angry', value: 0.5 }], blendDuration: 0.35, facialKey: 'angry' },
-    excited:   { expression: [{ name: 'surprised', value: 0.6 }, { name: 'happy', value: 0.3 }], blendDuration: 0.2, facialKey: 'happy' },
-    frustrated:{ expression: [{ name: 'angry', value: 0.55 }], blendDuration: 0.35, facialKey: 'angry' },
-    tease:     { expression: [{ name: 'happy', value: 0.38 }], blendDuration: 0.3, facialKey: 'happy' },
+    stressed:  { expression: [{ name: 'angry', value: 0.5 }, { name: 'think', value: 0.2 }], blendDuration: 0.35, facialKey: 'angry' },
+    excited:   { expression: [{ name: 'surprised', value: 0.6 }, { name: 'happy', value: 0.3 }, { name: 'aa', value: 0.12 }], blendDuration: 0.2, facialKey: 'happy' },
+    frustrated:{ expression: [{ name: 'angry', value: 0.55 }, { name: 'sad', value: 0.12 }], blendDuration: 0.35, facialKey: 'angry' },
+    tease:     { expression: [{ name: 'happy', value: 0.38 }, { name: 'think', value: 0.12 }], blendDuration: 0.3, facialKey: 'happy' },
     shy:       { expression: [{ name: 'happy', value: 0.25 }, { name: 'blush', value: 0.5 }], blendDuration: 0.35, facialKey: 'happy' },
-    touched:   { expression: [{ name: 'happy', value: 0.45 }], blendDuration: 0.4, facialKey: 'happy' },
+    touched:   { expression: [{ name: 'happy', value: 0.45 }, { name: 'relaxed', value: 0.2 }], blendDuration: 0.4, facialKey: 'happy' },
     skeptical: { expression: [{ name: 'think', value: 0.45 }, { name: 'surprised', value: 0.2 }], blendDuration: 0.3, facialKey: null },
 };
 
@@ -1307,6 +1307,8 @@ class CharacterRenderer {
             this.microExpressionProgress = 0;
             
             // Airi-style: varied micro-expressions with subtle intensity
+            // Layered, subtle flickers — a low breathe of expression that
+            // makes the face read as "alive" rather than a static mask.
             const microOptions = [
                 { expressions: { happy: 0.08 + secureRand() * 0.06 }, duration: 0.8 },
                 { expressions: { neutral: 0.90 + secureRand() * 0.08 }, duration: 1.0 },
@@ -1314,6 +1316,10 @@ class CharacterRenderer {
                 { expressions: { blink: 0.15 + secureRand() * 0.10 }, duration: 0.3 },
                 { expressions: { aa: 0.03 + secureRand() * 0.02 }, duration: 0.4 }, // Slight mouth movement
                 { expressions: { oh: 0.04 + secureRand() * 0.03 }, duration: 0.5 },
+                { expressions: { sad: 0.05 + secureRand() * 0.04 }, duration: 0.6 },     // faint frown flicker
+                { expressions: { angry: 0.04 + secureRand() * 0.04 }, duration: 0.5 },   // brow tension flicker
+                { expressions: { relaxed: 0.06 + secureRand() * 0.05 }, duration: 0.9 }, // soft calm loosening
+                { expressions: { think: 0.05 + secureRand() * 0.04 }, duration: 0.7 },   // fleeting "hm" brow
             ];
             const chosen = microOptions[Math.floor(secureRand() * microOptions.length)];
             this.microExpressionTargets = chosen.expressions;
@@ -1421,6 +1427,7 @@ class CharacterRenderer {
             case 'sad': tp = 0.07; tr = -0.03; ty = -0.02; break;
             case 'surprised': tp = -0.08; ty = 0.03; break;
             case 'excited': tp = -0.05; tr = 0.04; ty = 0.02; break;
+            case 'stressed': tp = 0.04; tr = -0.03; ty = 0.01; break; // tense, shoulders/chin slightly down
             case 'frustrated':
             case 'angry': tp = 0.03; tr = -0.06; ty = 0.01; break;
             case 'think': ty = 0.07; tp = -0.04; tr = 0.06; break;
