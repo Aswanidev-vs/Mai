@@ -17,7 +17,6 @@ const LIP_ATTACK = 50;
 const LIP_RELEASE = 30;
 const LIP_CAP = 0.7;
 const LIP_SILENCE_VOL = 0.04;
-const LIP_SILENCE_GAIN = 0.05;
 const LIP_IDLE_MS = 160;
 const LIP_RELEASE_DURATION_MS = 200; // Smooth crossfade when speech ends (Airi: RELEASE_DURATION_MS)
 const EXPRESSION_RESET_MS = 4000;
@@ -932,7 +931,9 @@ class CharacterRenderer {
                 // Crossfade from last forced value to zero (not motion value — that keeps mouth open)
                 const faded = this.lipSyncRelease.lastForcedValue * (1 - blend);
                 for (const bs of Object.values(VOWEL_MAP)) {
-                    this.vrm.expressionManager.setValue(bs, faded * 0.7);
+                    // lastForcedValue is already the post-scale param value, so
+                    // only fade it — no second 0.7 scale (avoids a mouth snap).
+                    this.vrm.expressionManager.setValue(bs, faded);
                 }
                 // Update smoothed vowels to match so next frame is consistent
                 for (const key of Object.keys(this.smoothedVowels)) {
@@ -944,6 +945,7 @@ class CharacterRenderer {
                     this.smoothedVowels[bs] = 0;
                     this.vrm.expressionManager.setValue(bs, 0);
                 }
+                this._lipEnv = 0;
             }
             return;
         }
@@ -951,53 +953,39 @@ class CharacterRenderer {
         // Track last forced value for smooth release
         this.lipSyncRelease.remainingMs = LIP_RELEASE_DURATION_MS;
 
+        // Live speech amplitude drives how wide the mouth opens. A fast
+        // attack/release envelope keeps the lips in sync with the actual sound,
+        // independent of the streaming viseme timeline.
+        const rms = this._computeRMS();
+        // 0.55 exponent: responsive at low volumes (whisper visible);
+        // 1.2 multiplier: compensates at high volumes for natural emphasis.
+        const amp = Math.pow(Math.min(rms * 1.2, 1), 0.55);
+        if (this._lipEnv === undefined) this._lipEnv = 0;
+        const envRate = amp > this._lipEnv ? LIP_ATTACK : LIP_RELEASE;
+        this._lipEnv += (amp - this._lipEnv) * (1 - Math.exp(-envRate * delta));
+        const openness = clamp(this._lipEnv * 1.2, 0, 1);
+
+        // Close the mouth during real silence or after a brief gap. LIP_SILENCE_VOL
+        // (0.04 post-curve) corresponds to near-digital-silence in raw RMS.
+        const now = performance.now();
+        if (amp >= LIP_SILENCE_VOL) this.lipSyncState.lastActiveAt = now;
+        const silent = amp < LIP_SILENCE_VOL || now - this.lipSyncState.lastActiveAt > LIP_IDLE_MS;
+
+        // The viseme schedule only picks WHICH vowel shape to show, not how open.
         const playhead = this.audioPlayer ? this.audioPlayer.getPlayhead() : 0;
         const phase = clamp(playhead / this.visemeDuration, 0, 1);
         const seg = visemeSegmentAt(this.visemeSchedule, phase);
-
-        // Real voice amplitude — non-linear perceptual response curve
-        const rms = this._computeRMS();
-        // 0.55 exponent: more responsive at low volumes (whisper visible),
-        // 1.2 multiplier: compensates at high volumes for natural emphasis
-        const amp = Math.pow(Math.min(rms * 1.2, 1), 0.55);
-        const gate = energyGate(rms, LIP_SILENCE_VOL, 0.10);
-
-        // Map current viseme to vowel
         const currentVowel = seg ? Object.keys(VOWEL_MAP).find(k => VOWEL_MAP[k] === seg.viseme) : null;
 
-        // Project all vowel weights based on current viseme and amplitude
-        const projected = { A: 0, E: 0, I: 0, O: 0, U: 0 };
-        if (currentVowel && seg) {
-            projected[currentVowel] = Math.max(projected[currentVowel], seg.open * amp);
-        }
-
-        // Winner + runner selection (only top 2 vowels, not all)
-        let winner = 'I', runner = 'E';
-        let winnerVal = -Infinity, runnerVal = -Infinity;
-        for (const key of ['A', 'E', 'I', 'O', 'U']) {
-            const val = projected[key];
-            if (val > winnerVal) {
-                runnerVal = winnerVal;
-                runner = winner;
-                winnerVal = val;
-                winner = key;
-            } else if (val > runnerVal) {
-                runnerVal = val;
-                runner = key;
-            }
-        }
-
-        // Detect silence/pause
-        const now = performance.now();
-        let silent = amp < LIP_SILENCE_VOL || winnerVal < LIP_SILENCE_GAIN;
-        if (!silent) this.lipSyncState.lastActiveAt = now;
-        if (now - this.lipSyncState.lastActiveAt > LIP_IDLE_MS) silent = true;
-
-        // Calculate target weights for winner and runner
+        // Distribute openness to the active vowel (small neutral opening on
+        // consonants so the mouth doesn't snap shut between every syllable).
         const target = { A: 0, E: 0, I: 0, O: 0, U: 0 };
         if (!silent) {
-            target[winner] = Math.min(LIP_CAP, winnerVal);
-            target[runner] = Math.min(LIP_CAP * 0.5, runnerVal * 0.6);
+            if (currentVowel) {
+                target[currentVowel] = Math.min(LIP_CAP, openness);
+            } else {
+                target.I = Math.min(LIP_CAP * 0.5, openness * 0.35);
+            }
         }
 
         // Smooth transitions with attack/release
