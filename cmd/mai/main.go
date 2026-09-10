@@ -644,9 +644,10 @@ func main() {
 	// time by a single player goroutine, so the first audio starts as soon as
 	// the first sentence is ready and playback never overlaps.
 	type ttsItem struct {
-		text  string
-		speed float32
-		seq   int64 // turn sequence from the orchestrator; used to drop stale audio
+		text   string
+		speed  float32
+		volume float32 // emotion-adaptive loudness; applied as a sample gain in playSentence
+		seq    int64   // turn sequence from the orchestrator; used to drop stale audio
 	}
 	ttsSentCh := make(chan ttsItem, 64)
 	// ttsShutdown stops the TTS player; ttsWG tracks every goroutine that can
@@ -661,18 +662,41 @@ func main() {
 	// speak enqueues a sentence for the streaming player (see playSentence +
 	// the player goroutine below). Keeping a single consumer serializes all
 	// TTS so sentences never overlap, and lets barge-in drain the queue.
-	speak := func(text string, speed float32, seq int64) {
+	speak := func(text string, speed, volume float32, seq int64) {
 		if speed == 0 {
 			speed = ttsDefaultSpeed
 		}
-		ttsSentCh <- ttsItem{text: text, speed: speed, seq: seq}
+		if volume == 0 {
+			volume = 1.0
+		}
+		ttsSentCh <- ttsItem{text: text, speed: speed, volume: volume, seq: seq}
 	}
 
 	// playSentence synthesizes and plays ONE sentence, halting immediately if
 	// a barge-in sets stopPlayback mid-utterance.
-	playSentence := func(text string, speed float32) {
+	playSentence := func(text string, speed, volume float32) {
 		if speed == 0 {
 			speed = ttsDefaultSpeed
+		}
+		// Clamp volume to a sane range to avoid clipping/distortion, then
+		// scale every sample so the emotion-adaptive Volume actually takes
+		// effect (louder for happy/excited, softer for sad/stressed/calm).
+		if volume == 0 {
+			volume = 1.0
+		}
+		volume = float32(math.Max(0.5, math.Min(1.2, float64(volume))))
+		// applyVolume scales the utterance's samples in place by the volume
+		// factor, clamping each to [-1, 1] to prevent clipping on playback.
+		applyVolume := func(samples []float32) {
+			for i := range samples {
+				s := samples[i] * volume
+				if s > 1 {
+					s = 1
+				} else if s < -1 {
+					s = -1
+				}
+				samples[i] = s
+			}
 		}
 		atomic.StoreInt32(&isSpeaking, 1)
 		// Mark TTS as playing so handleAudioFrame's echo-cancel/drop guard runs
@@ -697,6 +721,7 @@ func main() {
 					if atomic.LoadInt32(&stopPlayback) != 0 {
 						return false
 					}
+					applyVolume(samples)
 					ch <- ttsToBrowserResampler.resample(samples)
 					return true
 				})
@@ -712,6 +737,7 @@ func main() {
 					return false
 				}
 				if len(samples) > 0 {
+					applyVolume(samples)
 					publishedSamples += int64(len(samples))
 					refBuffer.Push(ttsToEchoResampler.resample(samples))
 					publishTTSAudioChunk(bus, ttsToBrowserResampler.resample(samples), 44100, false)
@@ -779,7 +805,7 @@ func main() {
 					playingSeq = item.seq
 				}
 				log.Printf("[TTS-PLAYER] Playing sentence (len=%d, turn=%d): %.80s...", len(item.text), item.seq, item.text)
-				playSentence(item.text, item.speed)
+				playSentence(item.text, item.speed, item.volume)
 				log.Printf("[TTS-PLAYER] Finished playing sentence, queue_depth=%d", len(ttsSentCh))
 				if len(ttsSentCh) == 0 {
 					atomic.StoreInt32(&isSpeaking, 0)
@@ -907,9 +933,9 @@ func main() {
 		// forwards them to the browser); when no client is connected it
 		// falls back to local audio playback.  The bus subscription added
 		// below covers the local-only fallback path as well.
-		orch.TTSFunc = func(text string, speed float32, seq int64) {
-			log.Printf("[TTS-FUNC] Enqueuing sentence (len=%d, speed=%.2f, turn=%d): %.80s...", len(text), speed, seq, text)
-			ttsSentCh <- ttsItem{text: text, speed: speed, seq: seq}
+		orch.TTSFunc = func(text string, params personality.TTSParams, seq int64) {
+			log.Printf("[TTS-FUNC] Enqueuing sentence (len=%d, speed=%.2f, volume=%.2f, turn=%d): %.80s...", len(text), params.Speed, params.Volume, seq, text)
+			ttsSentCh <- ttsItem{text: text, speed: params.Speed, volume: params.Volume, seq: seq}
 		}
 		interruptCurrent = orch.InterruptCurrent
 		orch.DirectAction = executor.ParseAndExecute // Wire up the legacy highly-reliable regex parser
@@ -984,7 +1010,7 @@ func main() {
 			speed, _ := event.Payload["speed"].(float32)
 			seq, _ := event.Payload["seq"].(int64)
 			log.Printf("[AGENT] Speaking (speed=%.2f, turn=%d): %s", speed, seq, text)
-			speak(text, speed, seq)
+			speak(text, speed, 1.0, seq)
 			log.Printf("[FOLLOW-UP] Listening for follow-up (15s window)...")
 		})
 

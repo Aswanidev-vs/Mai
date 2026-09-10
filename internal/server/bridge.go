@@ -70,6 +70,18 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		})
 	})
 
+	// Mai's OWN sentiment (detected from her response text by the orchestrator).
+	// Mirrors emotion.detected but drives her expression from what SHE is feeling,
+	// independent of the user's mood. Reuses EmotionDetectedParams (same shape).
+	bus.Subscribe("emotion.mai", func(event interfaces.Event) {
+		emotion, _ := event.Payload["emotion"].(string)
+		intensity, _ := event.Payload["intensity"].(float64)
+		b.hub.BroadcastNotification(NotifEmotionMai, EmotionDetectedParams{
+			Emotion:   emotion,
+			Intensity: intensity,
+		})
+	})
+
 	// TTS audio chunks → WS clients (for browser-side lip sync)
 	bus.Subscribe("tts.audio.chunk", func(event interfaces.Event) {
 		audio, _ := event.Payload["audio"].(string)

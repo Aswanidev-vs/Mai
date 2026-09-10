@@ -23,15 +23,15 @@ const ASSISTANT_EXPRESSION_CUES = [
     // skeptical
     { pattern: /\b(really\?|are you sure|doubt it|that doesn't sound right|that doesn't make sense|i'm not convinced|seriously\?|you can't be serious|i'll believe it when i see it)\b/i, emotion: 'skeptical', intensity: 0.55 },
     // excited
-    { pattern: /\b(we did it|you got it|that's amazing|excellent|congratulations|nice work|fantastic|that's incredible|so cool|love it|finally|im so excited|perfect)\b/i, emotion: 'excited', intensity: 0.62 },
+    { pattern: /\b(we did it|you got it|that's amazing|excellent|congratulations|nice work|fantastic|that's incredible|so cool|love it|finally|im so excited|perfect|i can't wait|can't wait|so fun|how fun|that's so fun|yay|woohoo|awesome|brilliant|i'm thrilled|so pumped)\b/i, emotion: 'excited', intensity: 0.62 },
     // surprised
-    { pattern: /\b(oh\b|wow|whoa|no way|really\b|seriously|wait what|hold on|huh\?|wait, really)\b/i, emotion: 'surprised', intensity: 0.48 },
+    { pattern: /\b(oh\b|wow|whoa|no way|really\b|seriously|wait what|hold on|huh\?|wait, really|that's surprising|i didn't expect that|unexpected|i'm shocked|what a surprise|oh my|that's unexpected)\b/i, emotion: 'surprised', intensity: 0.48 },
     // sad
-    { pattern: /\b(i'm sorry|that sounds hard|that sounds painful|take your time|i'm here with you|that's rough|i feel for you|that's so sad|oh no)\b/i, emotion: 'sad', intensity: 0.38 },
+    { pattern: /\b(i'm sorry|that sounds hard|that sounds painful|take your time|i'm here with you|that's rough|i feel for you|that's so sad|oh no|that's unfortunate|i'm sorry to hear|that's disappointing|sad to see|i wish i could help more|my heart goes out|i'm worried)\b/i, emotion: 'sad', intensity: 0.38 },
     // happy
-    { pattern: /\b(glad for you|happy for you|proud of you|wonderful|love that|good news|great to hear|i'm happy to|that's great)\b/i, emotion: 'happy', intensity: 0.48 },
+    { pattern: /\b(glad for you|happy for you|proud of you|wonderful|love that|good news|great to hear|i'm happy to|that's great|i'm so happy|that makes me happy|delighted|thrilled|so glad|how wonderful|lovely|that's wonderful|i love that|makes me smile)\b/i, emotion: 'happy', intensity: 0.48 },
     // think (hesitation / reasoning)
-    { pattern: /\b(hmm|well\b|let me think|let's see|uhm|uhh|huh|let me check|give me a second|one moment|probably|maybe|i'd say|the reason is|because)\b|\?/i, emotion: 'think', intensity: 0.38 },
+    { pattern: /\b(hmm|well\b|let me think|let's see|uhm|uhh|huh|let me check|give me a second|one moment|probably|maybe|i'd say|the reason is|because|let me think about that|i'm thinking|interesting question|good question|let me consider|hmm, let's see|i need a moment)\b|\?/i, emotion: 'think', intensity: 0.38 },
 ];
 
 const USER_MOOD_TO_RESPONSE = {
@@ -47,6 +47,7 @@ const USER_MOOD_TO_RESPONSE = {
 let responseInProgress = false;
 let activeAssistantEmotion = '';
 let activeAssistantIntensity = 0;
+let assistantDecayTimer = null;
 
 function updateAssistantExpression(text) {
     if (!text) return;
@@ -85,6 +86,27 @@ function updateAssistantExpression(text) {
         activeAssistantIntensity = best.intensity;
         character.setEmotion(best.emotion, best.intensity);
     }
+}
+
+// Gentle decay: after Mai finishes speaking her expression eases back toward
+// neutral over ~1.5s instead of snapping. Each step lowers the intensity and
+// re-applies the same emotion; character.setEmotion re-arms its own reset
+// timer each call, so the fade stays smooth until we settle on calm/neutral.
+function decayAssistantExpression() {
+    if (assistantDecayTimer) clearTimeout(assistantDecayTimer);
+    const step = () => {
+        if (responseInProgress) return; // still talking — don't fade mid-sentence
+        if (!activeAssistantEmotion || activeAssistantIntensity <= 0.05) {
+            activeAssistantEmotion = '';
+            activeAssistantIntensity = 0;
+            character.setEmotion('calm', 0.25);
+            return;
+        }
+        activeAssistantIntensity = Math.max(0, activeAssistantIntensity - 0.09);
+        character.setEmotion(activeAssistantEmotion, activeAssistantIntensity);
+        assistantDecayTimer = setTimeout(step, 300);
+    };
+    assistantDecayTimer = setTimeout(step, 450);
 }
 
 // Wire audio analyser to character for lip sync
@@ -172,8 +194,8 @@ ws.on('chat.response', (params) => {
         chat.finalizeMessage();
         streamingActive = false;
         responseInProgress = false;
-        activeAssistantEmotion = '';
-        activeAssistantIntensity = 0;
+        // Let the expression gently decay back toward neutral rather than snapping.
+        decayAssistantExpression();
         // Check for uncertainty markers and trigger gaze avoidance
         const lower = gazeAvoidBuffer.toLowerCase();
         for (const marker of UNCERTAINTY_MARKERS) {
@@ -236,6 +258,20 @@ ws.on('emotion.detected', (params) => {
     emotionIcon.textContent = emotionIcons[params.emotion] || '';
     emotionLabel.textContent = emotionNames[params.emotion] || params.emotion;
     emotionBadge.classList.add('active');
+});
+
+// Mai's own sentiment (published by the orchestrator from her response text).
+// This drives her expression from what SHE is feeling — independent of and
+// complementary to the user's mood. Backend labels (happy, sad, excited,
+// frustrated, stressed, calm, neutral) all map 1:1 to EMOTION_MAP keys.
+ws.on('emotion.mai', (params) => {
+    const emotion = params.emotion || 'neutral';
+    const intensity = Math.min(0.7, Math.max(0.2, Number(params.intensity) || 0.4));
+    // Track it so the same gentle decay applies once she finishes speaking.
+    if (assistantDecayTimer) clearTimeout(assistantDecayTimer);
+    activeAssistantEmotion = emotion;
+    activeAssistantIntensity = intensity;
+    character.setEmotion(emotion, intensity);
 });
 
 ws.on('config.changed', (params) => {
