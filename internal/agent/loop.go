@@ -78,7 +78,7 @@ type Orchestrator struct {
 	lastProsodyAt time.Time
 
 	DirectAction func(text string) (bool, string, error)
-	TTSFunc      func(text string, speed float32, seq int64)
+	TTSFunc      func(text string, params personality.TTSParams, seq int64)
 	// ttsStreaming controls whether completed response sentences are handed
 	// to TTS while the LLM is still producing the answer. Pocket cannot accept
 	// incomplete token text, so streaming still uses safe sentence boundaries.
@@ -452,6 +452,8 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	}()
 
 	// --- Emotion & memory recording ---
+	// Drift any stale emotion toward neutral before reading the fresh signal.
+	o.emotion.Decay()
 	emotionState := o.emotion.DetectFromText(text)
 	// The user's voice is a stronger emotional signal than their words
 	// ("I'm fine" + stressed prosody = stressed). Merge when it's fresh.
@@ -1105,6 +1107,19 @@ func (o *Orchestrator) lookupFacts(ctx context.Context, lowerText string) string
 // stays instant.
 func needsWebLookup(lower string) bool {
 	lower = strings.ToLower(strings.TrimSpace(lower))
+	// Self-referential questions about Mai herself are answered by the system
+	// prompt ("You are Mai.") — never search the web for her own name, identity,
+	// or personality. Without this, "what is your name?" triggers a lookup on
+	// "what is" and steers her to answer from web results instead of herself.
+	for _, self := range []string{
+		"your name", "what is your", "what's your", "who are you",
+		"who're you", "who is mai", "who's mai", "tell me about yourself",
+		"about you", "yourself", "what are you", "what do you do",
+	} {
+		if strings.Contains(lower, self) {
+			return false
+		}
+	}
 	for _, social := range []string{
 		"on your mind", "you thinking", "how are you", "what do you",
 		"you love", "you like", "are you", "do you like", "what about you",
@@ -1471,8 +1486,28 @@ func (o *Orchestrator) publishTTS(text string) {
 	// console output for the response.
 	log.Printf("[Mai] %s", text)
 
+	// Let the continuous emotion state drift toward neutral if the user has
+	// been quiet past decayTime, so a stale emotion doesn't linger forever.
+	o.emotion.Decay()
+
 	emotion := o.emotion.GetCurrent()
 	ttsParams := o.GetTTSParams(emotion, text)
+
+	// Publish Mai's OWN sentiment (detected from what she is saying) so the
+	// avatar expresses her feeling, independent of the user's mood. Uses the
+	// non-recording detector so her expression never overwrites the user's
+	// emotion state that drives empathetic response + TTS.
+	if o.bus != nil {
+		maiEmotion := o.emotion.DetectFromTextNoRecord(text)
+		o.bus.Publish(interfaces.Event{
+			Type:   "emotion.mai",
+			Source: "agent.orchestrator",
+			Payload: map[string]interface{}{
+				"emotion":   string(maiEmotion.Type),
+				"intensity": maiEmotion.Confidence,
+			},
+		})
+	}
 
 	// Always publish a transcript event so the browser companion gets
 	// progressive text even when TTSFunc is wired (bypassing the bus for audio).
@@ -1490,7 +1525,7 @@ func (o *Orchestrator) publishTTS(text string) {
 	// If a direct TTS sink is wired (streaming sentence queue), use it so the
 	// bus subscribers don't double-play. Otherwise fall back to the event bus.
 	if o.TTSFunc != nil {
-		o.TTSFunc(text, ttsParams.Speed, seq)
+		o.TTSFunc(text, ttsParams, seq)
 		return
 	}
 

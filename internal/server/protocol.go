@@ -33,6 +33,7 @@ const (
 	NotifStatusChanged = "status.changed"
 	NotifTTSChunk      = "tts.chunk"
 	NotifEmotionDetect = "emotion.detected"
+	NotifEmotionMai    = "emotion.mai"
 	NotifConfigChanged = "config.changed"
 	NotifMemoryUpdate  = "memory.update"
 	NotifDance         = "companion.dance"
