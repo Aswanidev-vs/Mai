@@ -73,7 +73,7 @@ func TestPublishTTSAudio_NoLeak(t *testing.T) {
 func TestPublishTTSAudioChunk_NoLeak(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		samples := make([]float32, 1024)
-		publishTTSAudioChunk(nil, samples, 44100, i%10 == 0)
+		publishTTSAudioChunk(nil, samples, 44100, i%10 == 0, false)
 	}
 }
 

@@ -133,14 +133,14 @@ func TestPlayAudioStreaming_ContextCancel(t *testing.T) {
 func TestPublishTTSAudioChunk_NilBus(t *testing.T) {
 	// Should not panic with nil bus
 	assert.NotPanics(t, func() {
-		publishTTSAudioChunk(nil, []float32{0.5}, 44100, false)
+		publishTTSAudioChunk(nil, []float32{0.5}, 44100, false, false)
 	})
 }
 
 func TestPublishTTSAudioChunk_EmptySamples(t *testing.T) {
 	// Should not panic with empty samples
 	assert.NotPanics(t, func() {
-		publishTTSAudioChunk(nil, nil, 44100, false)
+		publishTTSAudioChunk(nil, nil, 44100, false, false)
 	})
 }
 
@@ -148,7 +148,7 @@ func TestPublishTTSAudioChunk_Clipping(t *testing.T) {
 	// Samples outside [-1, 1] should be clipped
 	// We can't easily test the bus output, but we can verify no panic
 	assert.NotPanics(t, func() {
-		publishTTSAudioChunk(nil, []float32{-2.0, 0.0, 2.0}, 44100, false)
+		publishTTSAudioChunk(nil, []float32{-2.0, 0.0, 2.0}, 44100, false, false)
 	})
 }
 

@@ -1013,17 +1013,12 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 			o.publishTTS(spoken)
 		}
 	}
-	// Signal stream completion so the browser companion finalizes the transcript.
-	if o.bus != nil {
-		o.bus.Publish(interfaces.Event{
-			Type:   "chat.response",
-			Source: "agent.orchestrator",
-			Payload: map[string]interface{}{
-				"text": "",
-				"done": true,
-			},
-		})
-	}
+	// The stream itself is over, but the transcript's `done` is deliberately
+	// NOT published here when TTS is wired: the TTS player owns the transcript
+	// clock and signals completion once the last queued sentence has actually
+	// been spoken, so the browser text advances in step with the voice instead
+	// of seconds ahead of it (the TTS/LLM desync). The player also covers the
+	// error and interruption paths, so every turn still ends with a done.
 
 	response := full.String()
 	if strings.TrimSpace(response) == "" {
@@ -1511,7 +1506,10 @@ func (o *Orchestrator) publishTTS(text string) {
 
 	// Always publish a transcript event so the browser companion gets
 	// progressive text even when TTSFunc is wired (bypassing the bus for audio).
-	if o.bus != nil {
+	// The player (TTSFunc sink) owns the transcript clock when wired: it re-announces
+	// each sentence as its audio actually starts and publishes the turn's done
+	// once the queue drains, so the browser text can never outrun the voice.
+	if o.bus != nil && o.TTSFunc == nil {
 		o.bus.Publish(interfaces.Event{
 			Type:   "chat.response",
 			Source: "agent.orchestrator",

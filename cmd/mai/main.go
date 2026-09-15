@@ -714,18 +714,23 @@ func main() {
 			// Always render to the local speaker so Mai is audible regardless
 			// of the companion tab's autoplay state. The playback callback
 			// feeds the echo reference (audio.go), so barge-in AEC still
-			// cancels Mai's own voice. Browser audio publishing is skipped to
-			// avoid doubled output; the tab keeps getting text/visual events.
+			// cancels Mai's own voice. The same chunks are mirrored to the
+			// companion muted: the tab plays them at zero gain so its
+			// lip-sync clock, viseme schedule and speaking state follow the
+			// exact audio the user hears instead of the mouth staying frozen.
 			_ = playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
 				synthesize(text, speed, func(samples []float32) bool {
 					if atomic.LoadInt32(&stopPlayback) != 0 {
 						return false
 					}
 					applyVolume(samples)
-					ch <- ttsToBrowserResampler.resample(samples)
+					resampled := ttsToBrowserResampler.resample(samples)
+					publishTTSAudioChunk(bus, resampled, 44100, false, true)
+					ch <- resampled
 					return true
 				})
 			})
+			publishTTSAudioChunk(bus, nil, 44100, true, true)
 		} else {
 			// Opt-in browser-only path (tts_play_local_always: false): stream
 			// chunks to the companion tab. Echo reference is fed manually
@@ -740,11 +745,11 @@ func main() {
 					applyVolume(samples)
 					publishedSamples += int64(len(samples))
 					refBuffer.Push(ttsToEchoResampler.resample(samples))
-					publishTTSAudioChunk(bus, ttsToBrowserResampler.resample(samples), 44100, false)
+					publishTTSAudioChunk(bus, ttsToBrowserResampler.resample(samples), 44100, false, false)
 				}
 				return true
 			})
-			publishTTSAudioChunk(bus, nil, 44100, true)
+			publishTTSAudioChunk(bus, nil, 44100, true, false)
 
 			if ttsSampleRate > 0 {
 				estEnd := synthStart.Add(time.Duration(float64(publishedSamples)/float64(ttsSampleRate)*float64(time.Second)) + 400*time.Millisecond)
@@ -794,6 +799,9 @@ func main() {
 						atomic.StoreInt32(&isSpeaking, 0)
 						atomic.StoreInt32(&stopPlayback, 0)
 						lastTTSEndNano.Store(time.Now().UnixNano())
+						// Nothing left of the superseded turn: finalize the
+						// transcript so the browser is not left mid-stream.
+						publishTranscript(bus, "", true)
 					}
 					continue
 				}
@@ -805,12 +813,20 @@ func main() {
 					playingSeq = item.seq
 				}
 				log.Printf("[TTS-PLAYER] Playing sentence (len=%d, turn=%d): %.80s...", len(item.text), item.seq, item.text)
+				// Announce this sentence exactly when its audio starts, so
+				// transcript, voice and the browser's viseme schedule advance
+				// on the same timeline (TTS/LLM streaming sync).
+				publishTranscript(bus, item.text, false)
 				playSentence(item.text, item.speed, item.volume)
 				log.Printf("[TTS-PLAYER] Finished playing sentence, queue_depth=%d", len(ttsSentCh))
 				if len(ttsSentCh) == 0 {
 					atomic.StoreInt32(&isSpeaking, 0)
 					atomic.StoreInt32(&stopPlayback, 0) // ensure clean state for next response
 					lastTTSEndNano.Store(time.Now().UnixNano())
+					// Last sentence spoken: the player owns the transcript
+					// clock, so finalize the browser message here rather
+					// than when the LLM stream ended.
+					publishTranscript(bus, "", true)
 				}
 			}
 		}
@@ -1777,9 +1793,30 @@ func resolveEnv(val string) string {
 	return val
 }
 
+// publishTranscript pushes one streamed transcript segment to the companion
+// UI. The TTS player (not the orchestrator) owns this so the text advances in
+// lock-step with the voice: a sentence is announced when its playback starts,
+// and the turn is finalized once the queue drains.
+func publishTranscript(bus interfaces.EventBus, text string, done bool) {
+	if bus == nil {
+		return
+	}
+	bus.Publish(interfaces.Event{
+		Type:   "chat.response",
+		Source: "main.tts",
+		Payload: map[string]interface{}{
+			"text": text,
+			"done": done,
+		},
+	})
+}
+
 // publishTTSAudioChunk encodes a single callback chunk and pushes it onto the
-// event bus so the bridge can forward it to the browser in real time.
-func publishTTSAudioChunk(bus interfaces.EventBus, samples []float32, sampleRate int, done bool) {
+// event bus so the bridge can forward it to the browser in real time. Muted
+// marks audio the browser plays at zero gain: the sound comes from the local
+// speakers and the tab only needs the same timeline for lip sync and the
+// speaking state.
+func publishTTSAudioChunk(bus interfaces.EventBus, samples []float32, sampleRate int, done bool, muted bool) {
 	if bus == nil {
 		return
 	}
@@ -1805,6 +1842,7 @@ func publishTTSAudioChunk(bus interfaces.EventBus, samples []float32, sampleRate
 			"audio":       encoded,
 			"sample_rate": sampleRate,
 			"done":        done,
+			"muted":       muted,
 		},
 	})
 }

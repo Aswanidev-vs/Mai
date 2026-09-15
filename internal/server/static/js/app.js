@@ -194,6 +194,10 @@ ws.on('chat.response', (params) => {
         chat.finalizeMessage();
         streamingActive = false;
         responseInProgress = false;
+        // The send button is only disabled in _send(); re-enable it here so
+        // the user can queue a follow-up while Mai is still speaking (the
+        // transcript itself stays open until her voice ends).
+        if (chat.sendBtn) chat.sendBtn.disabled = false;
         // Let the expression gently decay back toward neutral rather than snapping.
         decayAssistantExpression();
         // Check for uncertainty markers and trigger gaze avoidance
@@ -233,7 +237,7 @@ ws.on('tts.chunk', (params) => {
     if (audio.analyser && !character.analyser) {
         character.setAnalyser(audio.analyser);
     }
-    audio.queueChunk(params.audio || '', params.sample_rate, !!params.done);
+    audio.queueChunk(params.audio || '', params.sample_rate, !!params.done, !!params.muted);
     // Feed the running audio duration so the viseme schedule stays scaled to reality
     if (params.audio) {
         character.setVisemeDuration(audio.getKnownDuration());
