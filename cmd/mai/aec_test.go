@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"math/rand"
 	"sync"
 	"testing"
 
@@ -200,6 +201,91 @@ func TestEchoCanceller_Process(t *testing.T) {
 	assert.False(t, math.IsNaN(float64(lastResidual)))
 	assert.False(t, math.IsInf(float64(lastResidual), 0))
 	_ = origRMS
+}
+
+// randomSignal builds a deterministic pseudo-random signal, standing in for
+// anything that is not a copy of the speaker reference (a fan, room tone, or a
+// different speaker).
+func randomSignal(n int, seed int64, level float32) []float32 {
+	rnd := rand.New(rand.NewSource(seed))
+	out := make([]float32, n)
+	for i := range out {
+		out[i] = float32(rnd.NormFloat64()) * level
+	}
+	return out
+}
+
+// TestEchoCoherence_DetectsDelayedCopyOfReference is the core of the barge-in
+// fix: her own voice leaking through an unconverged canceller is simply a
+// delayed, quieter copy of what she played, and must score as such.
+func TestEchoCoherence_DetectsDelayedCopyOfReference(t *testing.T) {
+	const n, L = 1600, 4096
+	win := randomSignal(L+n, 1, 0.3)
+	refBuffer.Push(win) // EchoCoherence reads the newest L+n samples
+
+	// Deliberately NOT a multiple of any stride: an echo path lands wherever it
+	// lands, and a stride-only scan misses it (measured: 0.17 vs 0.85).
+	const delay = 1030
+	residual := make([]float32, n)
+	for i := range residual {
+		residual[i] = 0.3 * win[delay+i] // her voice, delayed and quieter
+	}
+
+	assert.InDelta(t, 1.0, NewEchoCanceller(L).EchoCoherence(residual), 0.01,
+		"a delayed copy of the reference must be recognised as echo")
+}
+
+// TestEchoCoherence_IgnoresUnrelatedSignal is the other half: a fan drone or a
+// second speaker is not a copy of the reference, so a loud residual from them
+// must not be dismissed as echo.
+func TestEchoCoherence_IgnoresUnrelatedSignal(t *testing.T) {
+	const n, L = 1600, 4096
+	refBuffer.Push(randomSignal(L+n, 1, 0.3))
+
+	assert.Less(t, NewEchoCanceller(L).EchoCoherence(randomSignal(n, 2, 0.3)), 0.5,
+		"unrelated noise must not look like Mai's voice")
+}
+
+func TestEchoCoherence_Edges(t *testing.T) {
+	const n, L = 1600, 4096
+	refBuffer.Push(randomSignal(L+n, 1, 0.3))
+	ec := NewEchoCanceller(L)
+
+	assert.Zero(t, ec.EchoCoherence(nil), "an empty frame is not echo")
+	assert.Zero(t, ec.EchoCoherence(make([]float32, n)), "silence is not echo")
+}
+
+// TestEchoCoherence_FlagsUncancelledEcho runs the whole path: a fresh canceller
+// has not learned the echo path yet, so its residual is still mostly Mai's own
+// voice — exactly the case that used to trip barge-in.
+func TestEchoCoherence_FlagsUncancelledEcho(t *testing.T) {
+	const n, L = 1600, 4096
+
+	ref := randomSignal(L+n, 3, 0.3)
+	refBuffer.Push(ref)
+	mic := make([]float32, n)
+	for i := range mic {
+		mic[i] = 0.5 * ref[i] // the echo path: instant, half gain
+	}
+
+	ec := NewEchoCanceller(L) // fresh: the adaptive filter is still all zeros
+	residual := ec.Process(mic)
+	require.Len(t, residual, n)
+	assert.Greater(t, ec.EchoCoherence(residual), 0.7,
+		"uncancelled echo must be flagged so it cannot cut Mai off")
+
+	// Unrelated microphone content must not be flagged as her voice.
+	refBuffer.Push(randomSignal(L+n, 4, 0.3))
+	noise := randomSignal(n, 5, 0.05)
+	assert.Less(t, NewEchoCanceller(L).EchoCoherence(noise), 0.5)
+}
+
+// TestProcess_EmptyFrame keeps the plain residual API total: a nil or empty
+// frame must come back unchanged rather than panic on the reference window.
+func TestProcess_EmptyFrame(t *testing.T) {
+	ec := NewEchoCanceller(4096)
+	empty := []float32{}
+	assert.Equal(t, empty, ec.Process(empty))
 }
 
 func TestEchoCanceller_EmptyFrame(t *testing.T) {

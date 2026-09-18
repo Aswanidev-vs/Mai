@@ -60,6 +60,7 @@ Everything below **exists today** — verified against the codebase (branch `v1`
 | Mic stays open during TTS playback | `cmd/mai/main.go` `handleAudioFrame` (≈L1358) | ✅ |
 | Echo reference ring of played samples | `cmd/mai/aec.go` `speakerRef` / `refBuffer` (L5–48, L161) | ✅ |
 | NLMS acoustic echo cancellation | `cmd/mai/aec.go` `EchoCanceller.Process` (L97–159) | ✅ |
+| Echo-coherence guard on barge-in (rejects her own leaked voice) | `cmd/mai/aec.go` `EchoCanceller.EchoCoherence` + `barge_in_echo_max` in `cmd/mai/main.go` | ✅ |
 | Barge-in detection (warmup + sustained residual gate) | `cmd/mai/main.go` ≈L1380–1444 | ✅ |
 | Stop playback on barge-in | `atomic.StoreInt32(&stopPlayback, 1)` (≈L1410) | ✅ |
 | Cancel in-flight LLM turn | `orch.InterruptCurrent()` — wired `main.go:956`, called `main.go:1411`; impl `internal/agent/loop.go:1411` + `setTurnCancel` (loop.go:1404) | ✅ |

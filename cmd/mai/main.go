@@ -48,6 +48,17 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// bargeInEchoMaxDefault is the echo-coherence ceiling used when the config does
+// not set one: a residual whose correlation with Mai's own playback is at least
+// this strong is treated as her voice leaking through, not as the user.
+//
+// Chosen from measurement on a simulated room echo path with a fresh
+// (unconverged) canceller — Mai's own leaked voice scores 0.73-0.87 while a
+// normal interruption over her voice scores 0.45-0.67 — so 0.7 sits in the
+// middle of that gap. See
+// TestBargeIn_UncancelledEchoIsRejectedButInterruptionStillFires.
+const bargeInEchoMaxDefault = 0.7
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
@@ -140,6 +151,18 @@ func main() {
 	if bargeInSustain <= 0 {
 		bargeInSustain = 150 * time.Millisecond
 	}
+	// Echo-coherence guard: the strongest normalised correlation between the
+	// echo-cancelled residual and the speaker reference that still counts as
+	// someone interrupting. Mai's own voice leaking through a canceller that has
+	// not converged yet tracks the reference almost perfectly (~0.9) and is
+	// rejected; another speaker is uncorrelated with it. >= 1 disables the check.
+	// bargeInEchoMaxDefault is used when the config does not set one; see its
+	// package-level declaration for how 0.7 was chosen.
+	bargeInEchoMax := cfg.Audio.BargeInEchoMax
+	if bargeInEchoMax <= 0 {
+		bargeInEchoMax = bargeInEchoMaxDefault
+	}
+	var bargeLogNano atomic.Int64 // rate-limits the "why didn't it fire" diagnostics
 
 	// Shared across main scope so greeting / TTS / browser-mic paths can reach the bus.
 	var bus interfaces.EventBus
@@ -152,6 +175,15 @@ func main() {
 	// Echo cancellation for genuine barge-in: subtracts Mai's own TTS (echoed
 	// through the mic) so only a real second speaker survives in the residual.
 	echoCanceller := NewEchoCanceller(4096)
+
+	// Background-noise suppression: the mic is streamed through Sherpa-ONNX's
+	// DPDFNet speech enhancer so stationary noise (laptop fans, HVAC, mains
+	// hum) can no longer reach the wake-word spotter, the VAD or ASR as if it
+	// were a user utterance. nil when disabled or the model is unavailable —
+	// every call site then falls back to the raw-mic behaviour.
+	denoiser := newDenoiseGate(newNoiseSuppressor(&cfg))
+	defer denoiser.Close()
+
 	var bargeStartNano atomic.Int64 // when the residual first crossed the barge-in gate (0 = idle)
 	var ttsStartedNano atomic.Int64 // UnixNano when current TTS playback started
 
@@ -1493,6 +1525,29 @@ func main() {
 		lastMicRMS = rms
 		lastMicMu.Unlock()
 
+		playing := atomic.LoadInt32(&ttsPlaying) != 0
+		speaking := atomic.LoadInt32(&isSpeaking) != 0
+		postTTS := false
+		if nano := lastTTSEndNano.Load(); nano > 0 {
+			if time.Since(time.Unix(0, nano)) < postTTSAECWindow {
+				postTTS = true
+			} else {
+				lastTTSEndNano.Store(0)
+			}
+		}
+
+		// Ask the noise suppressor about this frame. It analyses on its own
+		// goroutine (the model costs ~0.6 of a core), so Feed only posts a copy
+		// and Speech reads back the latest verdict — the capture callback never
+		// waits for it. It is only fed while the frame is actually heading for
+		// the spotter/VAD/ASR: during playback and the AEC window that follows
+		// it those consumers are gated off anyway, which parks the analysis.
+		noiseFrame := false
+		if denoiser != nil && !playing && !speaking && !postTTS {
+			denoiser.Feed(samples, false)
+			noiseFrame = !denoiser.Speech()
+		}
+
 		// While Mai is speaking, echo-cancel her own voice against the speaker
 		// reference so it does not reach ASR. If a real (different) speaker shows
 		// up in the residual, that's a genuine barge-in — stop playback and hand
@@ -1504,28 +1559,57 @@ func main() {
 				// early is pure training (echo only) and it converges before
 				// detection arms.
 				clean := echoCanceller.Process(samples)
-				var csum float32
-				for _, s := range clean {
-					csum += s * s
-				}
-				crms := math.Sqrt(float64(csum / float32(len(clean))))
+				crms := rmsOf(clean)
 				lastMicMu.Lock()
 				lastMicRMS = crms
 				lastMicMu.Unlock()
 
+				// Let the enhancer judge the residual: a fan or HVAC drone that
+				// survives the echo canceller is noise, not an interruption.
+				if denoiser != nil {
+					denoiser.Feed(clean, true)
+				}
+
 				warm := time.Since(time.Unix(0, ttsStartedNano.Load())) > bargeInWarmup
 				loud := crms > cfg.Audio.BargeInThreshold*bargeInMargin
-				// Require sustained, clearly-louder-than-echo residual (not a
-				// one-frame echo leak or reverb spike), so Mai's own voice
-				// echoing through the mic doesn't get misread as a user
-				// interruption and fed back to ASR (which makes her "say back"
-				// what was said).
+				// The coherence scan costs ~1.6M multiply-adds, so it only runs
+				// once the cheap energy gate has already fired.
+				var coherence float64
 				if warm && loud {
+					coherence = echoCanceller.EchoCoherence(clean)
+				}
+				// Energy alone must not cut Mai off: her own voice is loud in the
+				// residual too. Two independent checks have to agree before this
+				// is treated as the user speaking.
+				//   * notEcho - the residual must not be a delayed copy of what
+				//     Mai just played. A 4096-tap canceller needs a couple of
+				//     seconds of echo to converge, so at the 400ms warmup her
+				//     leaked voice used to trip this gate at warmup+sustain,
+				//     every single time.
+				//   * voiced - the enhancer must have analysed the residual and
+				//     found speech in it, which rejects a stationary drone that
+				//     clears the energy gate and carries no words.
+				notEcho := coherence < bargeInEchoMax
+				voiced := denoiser.HaveVerdict() && denoiser.Speech()
+				switch {
+				case !warm || !loud:
+					bargeStartNano.Store(0)
+				case !notEcho:
+					bargeStartNano.Store(0)
+					if rateLimit(&bargeLogNano, time.Second) {
+						log.Printf("[BARGE-IN] Ignored a loud residual (RMS=%.4f): %.0f%% correlated with Mai's own playback, so it is her voice leaking through an echo canceller that has not converged yet.", crms, coherence*100)
+					}
+				case !voiced:
+					bargeStartNano.Store(0)
+					if rateLimit(&bargeLogNano, time.Second) {
+						log.Printf("[BARGE-IN] Ignored a loud residual (RMS=%.4f): the noise suppressor says it is stationary noise, not speech.", crms)
+					}
+				default:
 					start := bargeStartNano.Load()
 					if start == 0 {
 						bargeStartNano.Store(time.Now().UnixNano())
 					} else if held := time.Since(time.Unix(0, start)); held >= bargeInSustain {
-						log.Printf("[BARGE-IN] Real speech over TTS detected (residual RMS=%.4f, held %v). Stopping playback.", crms, held)
+						log.Printf("[BARGE-IN] Real speech over TTS detected (residual RMS=%.4f, mic RMS=%.4f, echo corr=%.2f, held %v). Stopping playback.", crms, rms, coherence, held)
 						bargeStartNano.Store(0)
 						atomic.StoreInt32(&stopPlayback, 1)
 						if interruptCurrent != nil {
@@ -1555,8 +1639,6 @@ func main() {
 						}
 						return
 					}
-				} else {
-					bargeStartNano.Store(0)
 				}
 			}
 			// No genuine interruption: her echo is not user input, so drop the frame.
@@ -1571,26 +1653,34 @@ func main() {
 		// postTTSAECWindow so room reverberation doesn't reach ASR. During the
 		// first ttsCooldown the echo canceller settles; after that, only
 		// genuine speech (residual above threshold) passes through.
-		if nano := lastTTSEndNano.Load(); nano > 0 {
-			elapsed := time.Since(time.Unix(0, nano))
-			if elapsed < postTTSAECWindow {
-				if echoCanceller != nil {
-					clean := echoCanceller.Process(samples)
-					var csum float32
-					for _, s := range clean {
-						csum += s * s
-					}
-					crms := math.Sqrt(float64(csum / float32(len(clean))))
-					if crms < cfg.Audio.BargeInThreshold {
-						return // just echo, drop it
-					}
-					// Residual above threshold — genuine speech, fall through
-				} else {
+		if postTTS {
+			if echoCanceller != nil {
+				clean := echoCanceller.Process(samples)
+				crms := rmsOf(clean)
+				if denoiser != nil {
+					denoiser.Feed(clean, true)
+				}
+				if crms < cfg.Audio.BargeInThreshold {
+					return // just echo, drop it
+				}
+				// Above the threshold, but a stationary drone clears the
+				// threshold while carrying no words — so the enhancer must also
+				// agree that this is speech before it reaches ASR.
+				if denoiser.HaveVerdict() && !denoiser.Speech() {
 					return
 				}
+				// Residual above threshold — genuine speech, fall through
 			} else {
-				lastTTSEndNano.Store(0)
+				return
 			}
+		}
+
+		// A frame the enhancer positively identified as stationary noise is not
+		// user input. Dropping it here is what stops a laptop fan or HVAC drone
+		// from reaching the wake-word spotter, the VAD or ASR — and from
+		// opening a turn of its own.
+		if noiseFrame {
+			return
 		}
 
 		if fromBrowser {
@@ -1794,6 +1884,18 @@ func startOllama() func() {
 }
 
 // generateOllamaResponse sends text to Ollama and returns the generated text.
+// rateLimit reports whether a diagnostic may be logged now, allowing at most one
+// message per interval per stamp. Used for the barge-in "why didn't it fire"
+// messages, which would otherwise repeat on every captured frame.
+func rateLimit(stamp *atomic.Int64, every time.Duration) bool {
+	now := time.Now().UnixNano()
+	prev := stamp.Load()
+	if now-prev < int64(every) {
+		return false
+	}
+	return stamp.CompareAndSwap(prev, now)
+}
+
 func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt string) (string, error) {
 	client := &http.Client{}
 

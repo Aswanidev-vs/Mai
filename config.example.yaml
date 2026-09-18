@@ -11,7 +11,19 @@ audio:
   playback_device: ""
   barge_in_enabled: true
   barge_in_threshold: 0.008
+  barge_in_echo_max: 0.7   # reject interruptions whose residual is this correlated with Mai's playback; 1 = off
   thinking_chime: true  # empty = default
+
+# Background-noise suppression for the microphone (Sherpa-ONNX streaming
+# DPDFNet). Stops stationary noise (fans, HVAC, hum) from reaching the
+# wake-word spotter, VAD and ASR as speech. Needs a streaming export with the
+# "dpdfnet_16khz" profile, e.g. dpdfnet8.onnx. Missing model = feature off.
+denoise:
+  enabled: true
+  model: "dpdfnet8.onnx"
+  provider: "cpu"
+  num_threads: 2
+  speech_ratio_min: 0.3  # denoised/raw energy ratio below which a frame is noise, not speech
 
 kws:
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"

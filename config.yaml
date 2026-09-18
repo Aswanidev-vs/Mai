@@ -13,8 +13,27 @@ audio:
   barge_in_threshold: 0.008 # Mic energy threshold for barge-in
   barge_in_warmup_ms: 400   # AEC convergence wait before barge-in detection arms
   barge_in_sustain_ms: 150  # Sustained loud residual required to confirm a real interruption
+  barge_in_echo_max: 0.7    # Reject an interruption whose residual is this correlated (0-1) with Mai's own
+                            # playback — i.e. her voice leaking through the echo canceller before it has
+                            # converged. Raise it if genuine interruptions get ignored while she is talking;
+                            # set to 1 to disable the check.
   thinking_chime: true      # Play a subtle tone during LLM processing
   tts_play_local_always: true  # Voice always on local speakers, even with companion open (no browser autoplay silence)
+
+# Background-noise suppression for the microphone. Stops stationary noise
+# (laptop fans, HVAC, mains hum) from reaching the wake-word spotter, the VAD
+# and ASR as if it were a user utterance. Requires a *streaming* DPDFNet export
+# (profile "dpdfnet_16khz"), e.g. dpdfnet8.onnx from
+# https://github.com/k2-fsa/sherpa-onnx/releases/tag/speech-enhancement-models
+# If the model is missing the assistant still runs, just without suppression.
+denoise:
+  enabled: true
+  model: "dpdfnet8.onnx"   # relative to the working directory
+  provider: "cpu"          # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
+  num_threads: 2
+  speech_ratio_min: 0.3    # Denoised/raw energy ratio below which a frame counts as noise, not speech.
+                           # Speech stays ~0.7-1.0, fan noise ~0.05-0.2. Raise it if noise still
+                           # triggers turns; lower it (e.g. 0.15) if quiet speech gets ignored.
 
 kws:
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
