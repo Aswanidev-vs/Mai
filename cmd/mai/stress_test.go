@@ -29,7 +29,7 @@ func TestStress_PublishTTSAudioChunk(t *testing.T) {
 		for j := range samples {
 			samples[j] = float32(math.Sin(2*math.Pi*0.01*float64(j+i*2048)))
 		}
-		publishTTSAudioChunk(nil, samples, 44100, i%50 == 0)
+		publishTTSAudioChunk(nil, samples, 44100, i%50 == 0, false)
 	}
 
 	runtime.GC()

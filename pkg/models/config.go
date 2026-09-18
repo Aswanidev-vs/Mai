@@ -9,9 +9,20 @@ type Config struct {
 		BargeInThreshold   float64 `yaml:"barge_in_threshold"`
 		BargeInWarmupMs    int     `yaml:"barge_in_warmup_ms"`  // AEC convergence wait before barge-in arms; <=0 = 400ms
 		BargeInSustainMs   int     `yaml:"barge_in_sustain_ms"` // Sustained speech required to trigger; <=0 = 150ms
+		BargeInEchoMax     float64 `yaml:"barge_in_echo_max"`   // Max correlation with Mai's own playback that still counts as an interruption; <=0 = 0.7, >=1 disables
 		ThinkingChime      bool    `yaml:"thinking_chime"`
 		TTSPlayLocalAlways bool    `yaml:"tts_play_local_always"` // Play voice on local speakers even when the companion UI is open; avoids browser autoplay-silence
 	} `yaml:"audio"`
+	// Denoise configures microphone background-noise suppression (Sherpa-ONNX
+	// streaming DPDFNet). It stops stationary noise — laptop fans, HVAC, mains
+	// hum — from reaching the wake-word spotter, VAD and ASR as speech.
+	Denoise struct {
+		Enabled        bool    `yaml:"enabled"`
+		Model          string  `yaml:"model"`      // Streaming DPDFNet ONNX export (profile dpdfnet_16khz)
+		Provider       string  `yaml:"provider"`   // "cpu", "cuda", "coreml", "opencl"
+		NumThreads     int     `yaml:"num_threads"`
+		SpeechRatioMin float64 `yaml:"speech_ratio_min"` // Denoised/raw energy ratio below which a frame is noise, not speech
+	} `yaml:"denoise"`
 	KWS struct {
 		Provider   string  `yaml:"provider"` // "cpu", "cuda", "coreml", "opencl"
 		ModelDir   string  `yaml:"model_dir"`

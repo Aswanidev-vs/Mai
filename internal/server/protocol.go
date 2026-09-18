@@ -64,9 +64,13 @@ type StatusChangedParams struct {
 
 // TTSChunkParams carries base64-encoded audio.
 type TTSChunkParams struct {
-	Audio     string `json:"audio"`
-	SampleRate int   `json:"sample_rate"`
-	Done      bool  `json:"done"`
+	Audio      string `json:"audio"`
+	SampleRate int    `json:"sample_rate"`
+	Done       bool   `json:"done"`
+	// Muted marks audio the companion must play silently: the speaker output
+	// comes from the local device, and the tab only needs the same timeline
+	// to drive lip sync and the speaking state.
+	Muted bool `json:"muted,omitempty"`
 }
 
 // EmotionDetectedParams carries the detected emotion state.

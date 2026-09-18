@@ -1,6 +1,9 @@
 package main
 
-import "sync"
+import (
+	"math"
+	"sync"
+)
 
 // speakerRef is a thread-safe ring of the samples actually sent to the
 // speaker. It is the echo reference for acoustic echo cancellation: Mai's own
@@ -131,6 +134,9 @@ func (e *EchoCanceller) Reset() {
 // Process returns the echo-cancelled residual for a mic frame. The reference
 // window for sample i is refWin[i : i+L]; the adaptive filter learns the echo
 // delay within L samples, so any room/capture latency below L is absorbed.
+//
+// This is the per-frame hot path and deliberately does no coherence analysis —
+// see EchoCoherence for that.
 func (e *EchoCanceller) Process(frame []float32) []float32 {
 	n := len(frame)
 	if n == 0 {
@@ -156,6 +162,72 @@ func (e *EchoCanceller) Process(frame []float32) []float32 {
 		}
 	}
 	return out
+}
+
+// coherenceDecim decimates the coherence correlation, cutting its cost 4x. 250us
+// of resolution is plenty to tell "her voice" from "not her voice".
+const coherenceDecim = 4
+
+// EchoCoherence reports how strongly the residual is explained by the speaker
+// reference: the largest normalised cross-correlation between the residual and
+// the reference, at any delay the canceller can model.
+//
+// It answers a question residual energy alone cannot: *is this residual just
+// Mai's own voice leaking through?* Her leaked voice is a delayed, quieter copy
+// of what she played and scores ~0.85-1.0, while another speaker, a fan drone or
+// room noise scores well below 0.5. That makes it usable as a double-talk
+// detector even while the canceller is still converging — the window where a
+// purely energy-based barge-in gate misfires, because an unconverged canceller
+// leaves her voice in the residual at close to full level.
+//
+// The lag scan is exhaustive rather than coarse-to-fine on purpose: the echo
+// path almost never lands on a stride boundary, and being a few dozen samples
+// off decorrelates the residual completely. Measured on a true echo, a
+// stride-only scan scored 0.17 where the exhaustive scan scores 0.85. Because
+// that costs ~1.6M multiply-adds, it is meant to be called only when a cheaper
+// energy gate has already fired, not on every frame.
+func (e *EchoCanceller) EchoCoherence(residual []float32) float64 {
+	n := len(residual)
+	if n == 0 {
+		return 0
+	}
+	refWin := e.ref.recent(e.L + n)
+	if len(refWin) < e.L+n {
+		return 0
+	}
+	if len(e.w) < e.L {
+		return 0
+	}
+
+	// Decimate the residual once — it is reused for every lag.
+	m := (n + coherenceDecim - 1) / coherenceDecim
+	res := make([]float64, m)
+	var resEnergy float64
+	for k, i := 0, 0; i < n; i, k = i+coherenceDecim, k+1 {
+		r := float64(residual[i])
+		res[k] = r
+		resEnergy += r * r
+	}
+	if resEnergy <= 0 {
+		return 0 // silence is not echo
+	}
+
+	best := 0.0
+	for d := 0; d < e.L; d++ {
+		var num, refEnergy float64
+		for k, i := 0, 0; i < n; i, k = i+coherenceDecim, k+1 {
+			x := float64(refWin[d+i])
+			num += res[k] * x
+			refEnergy += x * x
+		}
+		if refEnergy <= 0 {
+			continue
+		}
+		if c := math.Abs(num) / math.Sqrt(resEnergy*refEnergy); c > best {
+			best = c
+		}
+	}
+	return best
 }
 
 // refBuffer is the shared speaker-reference ring (16 kHz, the mic rate).

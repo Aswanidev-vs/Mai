@@ -82,11 +82,13 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		})
 	})
 
-	// TTS audio chunks → WS clients (for browser-side lip sync)
+	// TTS audio chunks → WS clients (browser-side lip sync; muted chunks are
+	// mirrored at zero gain when the speakers are local).
 	bus.Subscribe("tts.audio.chunk", func(event interfaces.Event) {
 		audio, _ := event.Payload["audio"].(string)
 		sampleRate, _ := event.Payload["sample_rate"].(int)
 		done, _ := event.Payload["done"].(bool)
+		muted, _ := event.Payload["muted"].(bool)
 		// Skip empty non-done chunks, but always forward done signals
 		if audio == "" && !done {
 			return
@@ -98,6 +100,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 			Audio:      audio,
 			SampleRate: sampleRate,
 			Done:       done,
+			Muted:      muted,
 		})
 	})
 

@@ -48,6 +48,17 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// bargeInEchoMaxDefault is the echo-coherence ceiling used when the config does
+// not set one: a residual whose correlation with Mai's own playback is at least
+// this strong is treated as her voice leaking through, not as the user.
+//
+// Chosen from measurement on a simulated room echo path with a fresh
+// (unconverged) canceller — Mai's own leaked voice scores 0.73-0.87 while a
+// normal interruption over her voice scores 0.45-0.67 — so 0.7 sits in the
+// middle of that gap. See
+// TestBargeIn_UncancelledEchoIsRejectedButInterruptionStillFires.
+const bargeInEchoMaxDefault = 0.7
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
@@ -140,6 +151,18 @@ func main() {
 	if bargeInSustain <= 0 {
 		bargeInSustain = 150 * time.Millisecond
 	}
+	// Echo-coherence guard: the strongest normalised correlation between the
+	// echo-cancelled residual and the speaker reference that still counts as
+	// someone interrupting. Mai's own voice leaking through a canceller that has
+	// not converged yet tracks the reference almost perfectly (~0.9) and is
+	// rejected; another speaker is uncorrelated with it. >= 1 disables the check.
+	// bargeInEchoMaxDefault is used when the config does not set one; see its
+	// package-level declaration for how 0.7 was chosen.
+	bargeInEchoMax := cfg.Audio.BargeInEchoMax
+	if bargeInEchoMax <= 0 {
+		bargeInEchoMax = bargeInEchoMaxDefault
+	}
+	var bargeLogNano atomic.Int64 // rate-limits the "why didn't it fire" diagnostics
 
 	// Shared across main scope so greeting / TTS / browser-mic paths can reach the bus.
 	var bus interfaces.EventBus
@@ -152,6 +175,15 @@ func main() {
 	// Echo cancellation for genuine barge-in: subtracts Mai's own TTS (echoed
 	// through the mic) so only a real second speaker survives in the residual.
 	echoCanceller := NewEchoCanceller(4096)
+
+	// Background-noise suppression: the mic is streamed through Sherpa-ONNX's
+	// DPDFNet speech enhancer so stationary noise (laptop fans, HVAC, mains
+	// hum) can no longer reach the wake-word spotter, the VAD or ASR as if it
+	// were a user utterance. nil when disabled or the model is unavailable —
+	// every call site then falls back to the raw-mic behaviour.
+	denoiser := newDenoiseGate(newNoiseSuppressor(&cfg))
+	defer denoiser.Close()
+
 	var bargeStartNano atomic.Int64 // when the residual first crossed the barge-in gate (0 = idle)
 	var ttsStartedNano atomic.Int64 // UnixNano when current TTS playback started
 
@@ -646,10 +678,23 @@ func main() {
 	type ttsItem struct {
 		text   string
 		speed  float32
-		volume float32 // emotion-adaptive loudness; applied as a sample gain in playSentence
-		seq    int64   // turn sequence from the orchestrator; used to drop stale audio
+		volume float32 // emotion-adaptive loudness; applied as a sample gain in renderSentence
+		seq    int64   // orchestrator turn id; every sentence of one reply shares it
+		final  bool    // end-of-turn marker: nothing follows for this turn
+		samples []float32 // pre-rendered audio (filled by the renderer, native rate)
 	}
 	ttsSentCh := make(chan ttsItem, 64)
+	// ttsRenderedCh carries the renderer's output to the player: sentences are
+	// synthesized AHEAD of playback (prefetch) so synthesis latency overlaps
+	// with the audio of the previous sentence instead of pausing between them.
+	// Capped and backpressured: when full, the renderer blocks on synthesis
+	// completion, bounding prefetch memory (~4 sentences of 44.1kHz audio).
+	ttsRenderedCh := make(chan ttsItem, 4)
+	// latestTurn is the newest turn id handed to the queue. The player reads it
+	// to drop the tail of an answer the user already interrupted: those
+	// superseded sentences sit AHEAD of the new turn in the FIFO queue, so
+	// comparing against what is playing right now can never see them.
+	var latestTurn atomic.Int64
 	// ttsShutdown stops the TTS player; ttsWG tracks every goroutine that can
 	// be inside sherpa's GenerateWithConfig. Both are joined during shutdown
 	// BEFORE the deferred DeleteOfflineTts frees the engine — destroying it
@@ -659,9 +704,9 @@ func main() {
 
 	log.Printf("[TTS] Synthesizer ready (%s)", cfg.TTS.ActiveModel)
 
-	// speak enqueues a sentence for the streaming player (see playSentence +
-	// the player goroutine below). Keeping a single consumer serializes all
-	// TTS so sentences never overlap, and lets barge-in drain the queue.
+	// speak enqueues a sentence for the renderer + streaming player below.
+	// Keeping a single consumer serializes all TTS so sentences never
+	// overlap, and lets barge-in drain the queue.
 	speak := func(text string, speed, volume float32, seq int64) {
 		if speed == 0 {
 			speed = ttsDefaultSpeed
@@ -669,12 +714,28 @@ func main() {
 		if volume == 0 {
 			volume = 1.0
 		}
+		if seq > 0 {
+			latestTurn.Store(seq)
+		}
 		ttsSentCh <- ttsItem{text: text, speed: speed, volume: volume, seq: seq}
 	}
 
-	// playSentence synthesizes and plays ONE sentence, halting immediately if
-	// a barge-in sets stopPlayback mid-utterance.
-	playSentence := func(text string, speed, volume float32) {
+	// speakTurn says a complete, self-contained utterance: the sentence plus the
+	// end-of-turn marker. Used by one-shot callers so the player finalizes the
+	// transcript as soon as the sentence has been spoken instead of waiting for
+	// a marker that never comes.
+	speakTurn := func(text string, speed, volume float32, seq int64) {
+		speak(text, speed, volume, seq)
+		ttsSentCh <- ttsItem{seq: seq, final: true}
+	}
+
+	// renderSentence synthesizes ONE sentence ahead of playback (prefetch). It
+	// is called by the renderer goroutine while the previous sentence is still
+	// playing, so Supertonic's ~0.6-2.2s synthesis latency overlaps with audio
+	// instead of appearing as a silent gap between sentences. It returns the
+	// volume-scaled samples at the engine's native rate, or nil when the
+	// sentence's turn was superseded while it was being synthesized.
+	renderSentence := func(text string, speed, volume float32, seq int64) []float32 {
 		if speed == 0 {
 			speed = ttsDefaultSpeed
 		}
@@ -685,78 +746,97 @@ func main() {
 			volume = 1.0
 		}
 		volume = float32(math.Max(0.5, math.Min(1.2, float64(volume))))
-		// applyVolume scales the utterance's samples in place by the volume
-		// factor, clamping each to [-1, 1] to prevent clipping on playback.
-		applyVolume := func(samples []float32) {
-			for i := range samples {
-				s := samples[i] * volume
+		out := make([]float32, 0, 44100*4)
+		synthesize(text, speed, func(samples []float32) bool {
+			// Abort mid-synthesis only when the turn itself was replaced
+			// (barge-in answered by a new reply). Deliberately NOT keyed on
+			// stopPlayback: the player clears that flag when the new turn's
+			// first item arrives, and the renderer runs ahead of the player —
+			// dropping on stopPlayback here could discard a fresh turn's
+			// first sentence before the flag is cleared.
+			if seq > 0 && seq < latestTurn.Load() {
+				return false
+			}
+			for _, s := range samples {
+				s := s * volume
 				if s > 1 {
 					s = 1
 				} else if s < -1 {
 					s = -1
 				}
-				samples[i] = s
+				out = append(out, s)
 			}
+			return true
+		})
+		if seq > 0 && seq < latestTurn.Load() {
+			return nil // superseded while synthesizing
 		}
-		atomic.StoreInt32(&isSpeaking, 1)
-		// Mark TTS as playing so handleAudioFrame's echo-cancel/drop guard runs
-		// for the browser mic too. Without this, the companion path never sets
-		// ttsPlaying and Mai's own voice (echoed through the browser mic) reaches
-		// ASR and gets transcribed as a user turn — the classic feedback loop.
-		atomic.StoreInt32(&ttsPlaying, 1)
+		return out
+	}
+
+	// playRendered plays pre-rendered samples, halting immediately if a
+	// barge-in sets stopPlayback mid-utterance. It reports whether the audio
+	// was rendered on the local speaker (and so mirrored to the browser as a
+	// muted chunk), so the player's end-of-turn chunk carries the same flag.
+	playRendered := func(samples []float32) bool {
+		// The AEC arming clocks stay per utterance (unlike isSpeaking/
+		// ttsPlaying/stopPlayback, which the player owns for the whole turn).
 		ttsStartedNano.Store(time.Now().UnixNano())
 		bargeStartNano.Store(0)
-		atomic.StoreInt32(&stopPlayback, 0)
-		defer atomic.StoreInt32(&ttsPlaying, 0)
-		log.Printf("[TTS-PLAY] Starting synthesis: speed=%.2f, text=%.80s...", speed, text)
+		local := cfg.Audio.TTSPlayLocalAlways || !companionHasClient()
+		if len(samples) == 0 {
+			return local
+		}
+		log.Printf("[TTS-PLAY] Playing rendered audio (%.2fs)", float64(len(samples))/44100.0)
 
-		if cfg.Audio.TTSPlayLocalAlways || !companionHasClient() {
+		if local {
 			// Always render to the local speaker so Mai is audible regardless
 			// of the companion tab's autoplay state. The playback callback
 			// feeds the echo reference (audio.go), so barge-in AEC still
-			// cancels Mai's own voice. Browser audio publishing is skipped to
-			// avoid doubled output; the tab keeps getting text/visual events.
+			// cancels Mai's own voice. The same chunks are mirrored to the
+			// companion muted: the tab plays them at zero gain so its
+			// lip-sync clock, viseme schedule and speaking state follow the
+			// exact audio the user hears instead of the mouth staying frozen.
+			// The pre-rendered buffer is sliced into ~200ms pieces so the
+			// browser keeps its crossfade/streaming semantics.
 			_ = playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
-				synthesize(text, speed, func(samples []float32) bool {
+				for len(samples) > 0 {
 					if atomic.LoadInt32(&stopPlayback) != 0 {
-						return false
+						return
 					}
-					applyVolume(samples)
-					ch <- ttsToBrowserResampler.resample(samples)
-					return true
-				})
+					n := len(samples)
+					if n > 8820 { // 200ms @ 44.1kHz
+						n = 8820
+					}
+					chunk := samples[:n]
+					samples = samples[n:]
+					resampled := ttsToBrowserResampler.resample(chunk)
+					publishTTSAudioChunk(bus, resampled, 44100, false, true)
+					ch <- resampled
+				}
 			})
 		} else {
 			// Opt-in browser-only path (tts_play_local_always: false): stream
 			// chunks to the companion tab. Echo reference is fed manually
-			// since the local speaker isn't used here.
-			synthStart := time.Now()
-			var publishedSamples int64
-			synthesize(text, speed, func(samples []float32) bool {
+			// since the local speaker isn't used here, and publishing is
+			// paced at real time so the tab's playback timeline matches.
+			for len(samples) > 0 {
 				if atomic.LoadInt32(&stopPlayback) != 0 {
-					return false
+					break
 				}
-				if len(samples) > 0 {
-					applyVolume(samples)
-					publishedSamples += int64(len(samples))
-					refBuffer.Push(ttsToEchoResampler.resample(samples))
-					publishTTSAudioChunk(bus, ttsToBrowserResampler.resample(samples), 44100, false)
+				n := len(samples)
+				if n > 8820 { // 200ms @ 44.1kHz
+					n = 8820
 				}
-				return true
-			})
-			publishTTSAudioChunk(bus, nil, 44100, true)
-
-			if ttsSampleRate > 0 {
-				estEnd := synthStart.Add(time.Duration(float64(publishedSamples)/float64(ttsSampleRate)*float64(time.Second)) + 400*time.Millisecond)
-				for time.Now().Before(estEnd) {
-					if atomic.LoadInt32(&stopPlayback) != 0 {
-						break
-					}
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(20 * time.Millisecond):
-					}
+				chunk := samples[:n]
+				samples = samples[n:]
+				refBuffer.Push(ttsToEchoResampler.resample(chunk))
+				publishTTSAudioChunk(bus, ttsToBrowserResampler.resample(chunk), 44100, false, false)
+				// Pace: this chunk represents 200ms of audio.
+				select {
+				case <-ctx.Done():
+					return local
+				case <-time.After(200 * time.Millisecond):
 				}
 			}
 		}
@@ -764,54 +844,134 @@ func main() {
 		lastResponseMu.Lock()
 		lastResponseTime = time.Now()
 		lastResponseMu.Unlock()
+		return local
 	}
 
-	// Player goroutine: consumes the sentence queue sequentially. Each
-	// sentence carries a turn sequence (orchestrator.ttsSeq). When a newer
-	// turn arrives we (a) halt any sentence currently being spoken and
-	// (b) drop every queued sentence belonging to an older, now-superseded
-	// turn. This is what makes interruption production-grade: the previous
-	// answer's tail is discarded instead of playing after the user takes
-	// over, while the NEW reply (the highest seq) is always preserved.
+	// Renderer goroutine: prefetches synthesis. It sits between the sentence
+	// queue (fed by the orchestrator) and the player, and synthesizes the next
+	// sentence WHILE the player is still speaking the current one. Without it,
+	// synthesis and playback were serialized in the player loop, so
+	// Supertonic's ~0.6-2.2s per-sentence latency appeared as a silent pause
+	// between every sentence. With it, synthesis overlaps playback and a
+	// multi-sentence reply plays back-to-back as long as synthesis keeps up
+	// (measured ~2.5-3x realtime on this machine).
 	ttsWG.Add(1)
 	go func() {
 		defer ttsWG.Done()
-		var playingSeq int64
+		defer close(ttsRenderedCh)
 		for {
 			select {
 			case <-ttsShutdown:
-				atomic.StoreInt32(&isSpeaking, 0)
-				lastTTSEndNano.Store(time.Now().UnixNano())
 				return
 			case item, ok := <-ttsSentCh:
 				if !ok {
 					return
 				}
-				// Stale audio from a turn the user already interrupted: drop it.
-				if item.seq > 0 && item.seq <= playingSeq {
-					log.Printf("[TTS-PLAYER] Dropping stale sentence (turn %d <= %d): %.60s...", item.seq, playingSeq, item.text)
-					if len(ttsSentCh) == 0 {
-						atomic.StoreInt32(&isSpeaking, 0)
-						atomic.StoreInt32(&stopPlayback, 0)
-						lastTTSEndNano.Store(time.Now().UnixNano())
+				// Superseded turn: drop before wasting synthesis time.
+				if item.seq > 0 && item.seq < latestTurn.Load() {
+					continue
+				}
+				if item.final {
+					// Markers pass straight through — the player's
+					// end-of-turn logic is order-sensitive.
+					ttsRenderedCh <- ttsItem{seq: item.seq, final: true}
+					continue
+				}
+				samples := renderSentence(item.text, item.speed, item.volume, item.seq)
+				if samples == nil {
+					// Superseded while synthesizing.
+					continue
+				}
+				ttsRenderedCh <- ttsItem{
+					text: item.text, seq: item.seq, samples: samples,
+				}
+			}
+		}
+	}()
+
+	// Player goroutine: consumes the sentence queue sequentially. Every sentence
+	// of one reply shares the orchestrator's turn id, and a turn is closed by an
+	// explicit end-of-turn item — never by "the queue looks empty right now".
+	// That distinction is the sync fix: an empty queue mid-reply means the LLM is
+	// still writing the next sentence, not that the answer is over. When a newer
+	// turn arrives we drop the superseded answer's queued tail and close its
+	// transcript, while the new reply (the highest turn id) is always preserved.
+	ttsWG.Add(1)
+	go func() {
+		defer ttsWG.Done()
+		var playingSeq int64 // turn currently being spoken (0 = none)
+		var turnOpen bool    // its transcript was announced and is not yet closed
+		var mirrored bool    // the turn is rendered locally; the browser chunk is muted
+		// closeTurn releases everything the player holds for one turn, and
+		// finalizes the browser transcript and its audio stream together so the
+		// text, the viseme schedule and the speaking state all end at once.
+		closeTurn := func() {
+			if !turnOpen {
+				return
+			}
+			turnOpen = false
+			atomic.StoreInt32(&isSpeaking, 0)
+			atomic.StoreInt32(&ttsPlaying, 0)
+			atomic.StoreInt32(&stopPlayback, 0)
+			lastTTSEndNano.Store(time.Now().UnixNano())
+			publishTTSAudioChunk(bus, nil, 44100, true, mirrored)
+			publishTranscript(bus, "", true)
+		}
+		for {
+			select {
+			case <-ttsShutdown:
+				closeTurn()
+				return
+			case item, ok := <-ttsRenderedCh:
+				if !ok {
+					closeTurn()
+					return
+				}
+				// A newer turn was requested while this one was still queued: the
+				// interrupted answer's tail is discarded instead of playing over
+				// the reply that replaced it.
+				if item.seq > 0 && item.seq < latestTurn.Load() {
+					log.Printf("[TTS-PLAYER] Dropping superseded sentence (turn %d < %d): %.60s...",
+						item.seq, latestTurn.Load(), item.text)
+					continue
+				}
+				if item.seq > playingSeq {
+					// Done with the superseded reply: close its transcript so the
+					// new answer opens its own message, and clear any barge-in
+					// halt for the fresh turn.
+					closeTurn()
+					atomic.StoreInt32(&stopPlayback, 0)
+					playingSeq = item.seq
+				}
+				if item.final {
+					// Nothing follows for this turn. Finalize only once nothing
+					// newer is queued behind the marker.
+					if len(ttsSentCh) == 0 && len(ttsRenderedCh) == 0 {
+						closeTurn()
 					}
 					continue
 				}
-				// A newer turn started: halt the sentence currently being spoken
-				// so the new reply begins promptly. playSentence resets
-				// stopPlayback at its own start, so this never blocks the new turn.
-				if item.seq > playingSeq {
-					atomic.StoreInt32(&stopPlayback, 1)
-					playingSeq = item.seq
+				// A barge-in halted this turn: drop the rest of it instead of
+				// resuming mid-answer (stopPlayback is only cleared when a new
+				// turn starts).
+				if turnOpen && atomic.LoadInt32(&stopPlayback) != 0 {
+					log.Printf("[TTS-PLAYER] Turn %d halted, dropping: %.60s...", item.seq, item.text)
+					continue
 				}
 				log.Printf("[TTS-PLAYER] Playing sentence (len=%d, turn=%d): %.80s...", len(item.text), item.seq, item.text)
-				playSentence(item.text, item.speed, item.volume)
-				log.Printf("[TTS-PLAYER] Finished playing sentence, queue_depth=%d", len(ttsSentCh))
-				if len(ttsSentCh) == 0 {
-					atomic.StoreInt32(&isSpeaking, 0)
-					atomic.StoreInt32(&stopPlayback, 0) // ensure clean state for next response
-					lastTTSEndNano.Store(time.Now().UnixNano())
-				}
+				// Hold the echo guard and the speaking state for the WHOLE turn,
+				// including the gap where the LLM is still producing the next
+				// sentence. Releasing them per sentence let Mai's own voice reach
+				// the mic in those gaps and produce phantom user turns.
+				atomic.StoreInt32(&isSpeaking, 1)
+				atomic.StoreInt32(&ttsPlaying, 1)
+				// Announce this sentence exactly when its audio starts, so
+				// transcript, voice and the browser's viseme schedule advance
+				// on the same timeline (TTS/LLM streaming sync).
+				publishTranscript(bus, item.text, false)
+				turnOpen = true
+				mirrored = playRendered(item.samples)
+				log.Printf("[TTS-PLAYER] Finished playing sentence, queue_depth=%d", len(ttsRenderedCh))
 			}
 		}
 	}()
@@ -928,14 +1088,20 @@ func main() {
 		// Deliver generated sentences into the serialized TTS queue. The
 		// orchestrator decides whether this happens during LLM generation or
 		// after the complete response, based on pocket.streaming.
-		// The playSentence function handles routing: when a browser client
+		// The playRendered function handles routing: when a browser client
 		// is connected it publishes audio chunks via the event bus (bridge
 		// forwards them to the browser); when no client is connected it
 		// falls back to local audio playback.  The bus subscription added
 		// below covers the local-only fallback path as well.
-		orch.TTSFunc = func(text string, params personality.TTSParams, seq int64) {
+		orch.TTSFunc = func(text string, params personality.TTSParams, seq int64, final bool) {
+			if final {
+				// End of this reply's sentences: the player may now finalize the
+				// transcript once the queued audio has actually played.
+				ttsSentCh <- ttsItem{seq: seq, final: true}
+				return
+			}
 			log.Printf("[TTS-FUNC] Enqueuing sentence (len=%d, speed=%.2f, volume=%.2f, turn=%d): %.80s...", len(text), params.Speed, params.Volume, seq, text)
-			ttsSentCh <- ttsItem{text: text, speed: params.Speed, volume: params.Volume, seq: seq}
+			speak(text, params.Speed, params.Volume, seq)
 		}
 		interruptCurrent = orch.InterruptCurrent
 		orch.DirectAction = executor.ParseAndExecute // Wire up the legacy highly-reliable regex parser
@@ -1010,7 +1176,9 @@ func main() {
 			speed, _ := event.Payload["speed"].(float32)
 			seq, _ := event.Payload["seq"].(int64)
 			log.Printf("[AGENT] Speaking (speed=%.2f, turn=%d): %s", speed, seq, text)
-			speak(text, speed, 1.0, seq)
+			// One-shot utterance on the legacy bus path: include the end-of-turn
+			// marker so the player finalizes the transcript as soon as it ends.
+			speakTurn(text, speed, 1.0, seq)
 			log.Printf("[FOLLOW-UP] Listening for follow-up (15s window)...")
 		})
 
@@ -1357,6 +1525,29 @@ func main() {
 		lastMicRMS = rms
 		lastMicMu.Unlock()
 
+		playing := atomic.LoadInt32(&ttsPlaying) != 0
+		speaking := atomic.LoadInt32(&isSpeaking) != 0
+		postTTS := false
+		if nano := lastTTSEndNano.Load(); nano > 0 {
+			if time.Since(time.Unix(0, nano)) < postTTSAECWindow {
+				postTTS = true
+			} else {
+				lastTTSEndNano.Store(0)
+			}
+		}
+
+		// Ask the noise suppressor about this frame. It analyses on its own
+		// goroutine (the model costs ~0.6 of a core), so Feed only posts a copy
+		// and Speech reads back the latest verdict — the capture callback never
+		// waits for it. It is only fed while the frame is actually heading for
+		// the spotter/VAD/ASR: during playback and the AEC window that follows
+		// it those consumers are gated off anyway, which parks the analysis.
+		noiseFrame := false
+		if denoiser != nil && !playing && !speaking && !postTTS {
+			denoiser.Feed(samples, false)
+			noiseFrame = !denoiser.Speech()
+		}
+
 		// While Mai is speaking, echo-cancel her own voice against the speaker
 		// reference so it does not reach ASR. If a real (different) speaker shows
 		// up in the residual, that's a genuine barge-in — stop playback and hand
@@ -1368,28 +1559,57 @@ func main() {
 				// early is pure training (echo only) and it converges before
 				// detection arms.
 				clean := echoCanceller.Process(samples)
-				var csum float32
-				for _, s := range clean {
-					csum += s * s
-				}
-				crms := math.Sqrt(float64(csum / float32(len(clean))))
+				crms := rmsOf(clean)
 				lastMicMu.Lock()
 				lastMicRMS = crms
 				lastMicMu.Unlock()
 
+				// Let the enhancer judge the residual: a fan or HVAC drone that
+				// survives the echo canceller is noise, not an interruption.
+				if denoiser != nil {
+					denoiser.Feed(clean, true)
+				}
+
 				warm := time.Since(time.Unix(0, ttsStartedNano.Load())) > bargeInWarmup
 				loud := crms > cfg.Audio.BargeInThreshold*bargeInMargin
-				// Require sustained, clearly-louder-than-echo residual (not a
-				// one-frame echo leak or reverb spike), so Mai's own voice
-				// echoing through the mic doesn't get misread as a user
-				// interruption and fed back to ASR (which makes her "say back"
-				// what was said).
+				// The coherence scan costs ~1.6M multiply-adds, so it only runs
+				// once the cheap energy gate has already fired.
+				var coherence float64
 				if warm && loud {
+					coherence = echoCanceller.EchoCoherence(clean)
+				}
+				// Energy alone must not cut Mai off: her own voice is loud in the
+				// residual too. Two independent checks have to agree before this
+				// is treated as the user speaking.
+				//   * notEcho - the residual must not be a delayed copy of what
+				//     Mai just played. A 4096-tap canceller needs a couple of
+				//     seconds of echo to converge, so at the 400ms warmup her
+				//     leaked voice used to trip this gate at warmup+sustain,
+				//     every single time.
+				//   * voiced - the enhancer must have analysed the residual and
+				//     found speech in it, which rejects a stationary drone that
+				//     clears the energy gate and carries no words.
+				notEcho := coherence < bargeInEchoMax
+				voiced := denoiser.HaveVerdict() && denoiser.Speech()
+				switch {
+				case !warm || !loud:
+					bargeStartNano.Store(0)
+				case !notEcho:
+					bargeStartNano.Store(0)
+					if rateLimit(&bargeLogNano, time.Second) {
+						log.Printf("[BARGE-IN] Ignored a loud residual (RMS=%.4f): %.0f%% correlated with Mai's own playback, so it is her voice leaking through an echo canceller that has not converged yet.", crms, coherence*100)
+					}
+				case !voiced:
+					bargeStartNano.Store(0)
+					if rateLimit(&bargeLogNano, time.Second) {
+						log.Printf("[BARGE-IN] Ignored a loud residual (RMS=%.4f): the noise suppressor says it is stationary noise, not speech.", crms)
+					}
+				default:
 					start := bargeStartNano.Load()
 					if start == 0 {
 						bargeStartNano.Store(time.Now().UnixNano())
 					} else if held := time.Since(time.Unix(0, start)); held >= bargeInSustain {
-						log.Printf("[BARGE-IN] Real speech over TTS detected (residual RMS=%.4f, held %v). Stopping playback.", crms, held)
+						log.Printf("[BARGE-IN] Real speech over TTS detected (residual RMS=%.4f, mic RMS=%.4f, echo corr=%.2f, held %v). Stopping playback.", crms, rms, coherence, held)
 						bargeStartNano.Store(0)
 						atomic.StoreInt32(&stopPlayback, 1)
 						if interruptCurrent != nil {
@@ -1419,8 +1639,6 @@ func main() {
 						}
 						return
 					}
-				} else {
-					bargeStartNano.Store(0)
 				}
 			}
 			// No genuine interruption: her echo is not user input, so drop the frame.
@@ -1435,26 +1653,34 @@ func main() {
 		// postTTSAECWindow so room reverberation doesn't reach ASR. During the
 		// first ttsCooldown the echo canceller settles; after that, only
 		// genuine speech (residual above threshold) passes through.
-		if nano := lastTTSEndNano.Load(); nano > 0 {
-			elapsed := time.Since(time.Unix(0, nano))
-			if elapsed < postTTSAECWindow {
-				if echoCanceller != nil {
-					clean := echoCanceller.Process(samples)
-					var csum float32
-					for _, s := range clean {
-						csum += s * s
-					}
-					crms := math.Sqrt(float64(csum / float32(len(clean))))
-					if crms < cfg.Audio.BargeInThreshold {
-						return // just echo, drop it
-					}
-					// Residual above threshold — genuine speech, fall through
-				} else {
+		if postTTS {
+			if echoCanceller != nil {
+				clean := echoCanceller.Process(samples)
+				crms := rmsOf(clean)
+				if denoiser != nil {
+					denoiser.Feed(clean, true)
+				}
+				if crms < cfg.Audio.BargeInThreshold {
+					return // just echo, drop it
+				}
+				// Above the threshold, but a stationary drone clears the
+				// threshold while carrying no words — so the enhancer must also
+				// agree that this is speech before it reaches ASR.
+				if denoiser.HaveVerdict() && !denoiser.Speech() {
 					return
 				}
+				// Residual above threshold — genuine speech, fall through
 			} else {
-				lastTTSEndNano.Store(0)
+				return
 			}
+		}
+
+		// A frame the enhancer positively identified as stationary noise is not
+		// user input. Dropping it here is what stops a laptop fan or HVAC drone
+		// from reaching the wake-word spotter, the VAD or ASR — and from
+		// opening a turn of its own.
+		if noiseFrame {
+			return
 		}
 
 		if fromBrowser {
@@ -1658,6 +1884,18 @@ func startOllama() func() {
 }
 
 // generateOllamaResponse sends text to Ollama and returns the generated text.
+// rateLimit reports whether a diagnostic may be logged now, allowing at most one
+// message per interval per stamp. Used for the barge-in "why didn't it fire"
+// messages, which would otherwise repeat on every captured frame.
+func rateLimit(stamp *atomic.Int64, every time.Duration) bool {
+	now := time.Now().UnixNano()
+	prev := stamp.Load()
+	if now-prev < int64(every) {
+		return false
+	}
+	return stamp.CompareAndSwap(prev, now)
+}
+
 func generateOllamaResponse(ctx context.Context, cfg models.Config, prompt string) (string, error) {
 	client := &http.Client{}
 
@@ -1777,9 +2015,30 @@ func resolveEnv(val string) string {
 	return val
 }
 
+// publishTranscript pushes one streamed transcript segment to the companion
+// UI. The TTS player (not the orchestrator) owns this so the text advances in
+// lock-step with the voice: a sentence is announced when its playback starts,
+// and the turn is finalized once the queue drains.
+func publishTranscript(bus interfaces.EventBus, text string, done bool) {
+	if bus == nil {
+		return
+	}
+	bus.Publish(interfaces.Event{
+		Type:   "chat.response",
+		Source: "main.tts",
+		Payload: map[string]interface{}{
+			"text": text,
+			"done": done,
+		},
+	})
+}
+
 // publishTTSAudioChunk encodes a single callback chunk and pushes it onto the
-// event bus so the bridge can forward it to the browser in real time.
-func publishTTSAudioChunk(bus interfaces.EventBus, samples []float32, sampleRate int, done bool) {
+// event bus so the bridge can forward it to the browser in real time. Muted
+// marks audio the browser plays at zero gain: the sound comes from the local
+// speakers and the tab only needs the same timeline for lip sync and the
+// speaking state.
+func publishTTSAudioChunk(bus interfaces.EventBus, samples []float32, sampleRate int, done bool, muted bool) {
 	if bus == nil {
 		return
 	}
@@ -1805,6 +2064,7 @@ func publishTTSAudioChunk(bus interfaces.EventBus, samples []float32, sampleRate
 			"audio":       encoded,
 			"sample_rate": sampleRate,
 			"done":        done,
+			"muted":       muted,
 		},
 	})
 }

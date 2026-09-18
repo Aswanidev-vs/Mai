@@ -22,10 +22,9 @@ type OllamaOptions struct {
 	MinP float64
 
 	// NumCtx pins the context window. Ollama's VRAM-based default is 4096 on
-	// small GPUs — below Mai's worst-case turn (~4.7k tokens) — which causes
-	// silent mid-context truncation. Pinning 32768 removes the wall; on this
-	// project's 4GB VRAM it was verified to fit with the model fully offloaded.
-	// 0 disables pinning.
+	// small GPUs, which is tight for a ~1.9k-token persona plus history.
+	// buildChatMessages trims history to stay inside whatever value is pinned,
+	// so the persona always survives. 0 disables pinning.
 	NumCtx int
 }
 
@@ -58,10 +57,9 @@ func NewOllamaProvider(model, url, systemPrompt string, think *bool, opts Ollama
 const ollamaKeepAlive = "10m"
 
 // applyTokenOptions adds min_p and num_ctx to an options map (creating it if
-// nil). num_keep is deliberately not set: when a prompt exceeds the 4k
-// window, Ollama's context shift protects the leading tokens by default —
-// the persona in the system field — so the character survives shifts even
-// when middle context is dropped.
+// nil). num_keep is deliberately not set: Ollama's overflow handling always
+// discards from the front of the prompt regardless of it, so the persona is
+// protected by trimming history in buildChatMessages instead.
 func (p *OllamaProvider) applyTokenOptions(options map[string]interface{}) map[string]interface{} {
 	if p.minP > 0 || p.numCtx > 0 {
 		if options == nil {
@@ -77,10 +75,90 @@ func (p *OllamaProvider) applyTokenOptions(options map[string]interface{}) map[s
 	return options
 }
 
-// StreamChat implements interfaces.ChatStreamer via Ollama's /api/chat
-// endpoint. The system prompt rides the dedicated "system" field (cached as a
-// stable prefix), and prior turns are sent verbatim as messages — measured on
-// a GTX 1650: a later turn prefills only the new tail tokens (~270 ms) because
+// chatTemplateOverheadTokens approximates what Ollama's chat template adds
+// around the message list (role markers plus the generation prompt).
+const chatTemplateOverheadTokens = 32
+
+// estimateTokens approximates a string's token count. English prose runs about
+// four characters per token — precise enough for a safety budget.
+func estimateTokens(s string) int { return (len(s) + 3) / 4 }
+
+// messageTokens approximates what a message list costs, including the
+// per-message role overhead Ollama's template adds.
+func messageTokens(msgs []interfaces.ChatMessage) int {
+	total := 0
+	for _, m := range msgs {
+		total += estimateTokens(m.Content) + 4
+	}
+	return total
+}
+
+// buildChatMessages returns the message list actually sent to /api/chat: the
+// persona leads as a system message, and history is trimmed to fit the pinned
+// window.
+//
+// Two Ollama behaviors drive this shape:
+//
+//   - /api/chat has no top-level "system" field (that parameter only exists on
+//     /api/generate). A persona sent there is silently ignored, so the model
+//     answered as a generic assistant — "I'm just a text model" — with Mai's
+//     whole personality sitting unused in config.yaml.
+//   - When a prompt overflows num_ctx, Ollama discards messages from the front
+//     of the conversation, so an over-long history erased the persona
+//     mid-session. Trimming here keeps the persona and the newest turns — the
+//     context a reply actually needs.
+func (p *OllamaProvider) buildChatMessages(messages []interfaces.ChatMessage, opts interfaces.GenerationOptions) []interfaces.ChatMessage {
+	msgs := make([]interfaces.ChatMessage, 0, len(messages)+1)
+	if p.systemPrompt != "" {
+		msgs = append(msgs, interfaces.ChatMessage{Role: "system", Content: p.systemPrompt})
+	}
+	msgs = append(msgs, messages...)
+
+	if p.numCtx <= 0 || len(msgs) <= 1 {
+		return msgs
+	}
+
+	// Leave room for the reply itself, on top of the template's own tokens.
+	reserve := opts.MaxTokens
+	if reserve <= 0 {
+		reserve = 256
+	}
+	budget := p.numCtx - reserve - chatTemplateOverheadTokens
+	if budget <= 0 {
+		return msgs // window too small to hold a reply at all — send as-is
+	}
+
+	// The persona and the current turn are kept; only the history between them
+	// is dropped, oldest pair first.
+	head := 0
+	for head < len(msgs) && msgs[head].Role == "system" {
+		head++
+	}
+	personaTokens := messageTokens(msgs[:head])
+	body := msgs[head:]
+
+	dropped := 0
+	for len(body) > 1 && personaTokens+messageTokens(body)+chatTemplateOverheadTokens > budget {
+		drop := 2
+		if len(body)-drop < 1 {
+			drop = len(body) - 1
+		}
+		body = body[drop:]
+		dropped += drop
+	}
+	if dropped > 0 {
+		log.Printf("[OLLAMA] Dropped %d oldest message(s) to keep the prompt inside num_ctx=%d (persona and current turn kept)", dropped, p.numCtx)
+	}
+
+	out := make([]interfaces.ChatMessage, 0, head+len(body))
+	out = append(out, msgs[:head]...)
+	return append(out, body...)
+}
+
+// StreamChat implements interfaces.ChatStreamer via Ollama's /api/chat endpoint.
+// The persona leads the message list as a system message (see
+// buildChatMessages), and prior turns are sent verbatim — measured on a
+// GTX 1650: a later turn prefills only the new tail tokens (~270 ms) because
 // llama-server reuses the KV cache of the identical prefix. That is what keeps
 // long conversations as fast as turn two.
 func (p *OllamaProvider) StreamChat(ctx context.Context, messages []interfaces.ChatMessage, opts interfaces.GenerationOptions, callback func(chunk string)) error {
@@ -124,13 +202,10 @@ func (p *OllamaProvider) streamChatOnce(ctx context.Context, messages []interfac
 
 	reqBody := map[string]interface{}{
 		"model":      p.model,
-		"messages":   messages,
+		"messages":   p.buildChatMessages(messages, opts),
 		"stream":     true,
 		"keep_alive": ollamaKeepAlive,
 		"options":    options,
-	}
-	if p.systemPrompt != "" {
-		reqBody["system"] = p.systemPrompt
 	}
 	if p.think != nil {
 		reqBody["think"] = *p.think

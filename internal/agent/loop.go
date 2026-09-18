@@ -78,16 +78,28 @@ type Orchestrator struct {
 	lastProsodyAt time.Time
 
 	DirectAction func(text string) (bool, string, error)
-	TTSFunc      func(text string, params personality.TTSParams, seq int64)
+	// TTSFunc hands one spoken sentence to the player. seq is the turn id:
+	// every sentence of a reply shares it, so the player can tell a superseded
+	// turn from the next sentence of the current one. A final=true call with
+	// empty text CLOSES the turn — only then may the player finalize the
+	// transcript and release the ASR/echo guard. Without that marker the player
+	// had to guess from a momentarily empty queue, which finalized the browser
+	// transcript (and reset the lip-sync clock) in the gap between two
+	// sentences whenever the LLM was slower than TTS playback.
+	TTSFunc func(text string, params personality.TTSParams, seq int64, final bool)
 	// ttsStreaming controls whether completed response sentences are handed
 	// to TTS while the LLM is still producing the answer. Pocket cannot accept
 	// incomplete token text, so streaming still uses safe sentence boundaries.
 	ttsStreaming atomic.Bool
 
-	// ttsSeq is a monotonic counter tagging every spoken sentence with the
-	// turn it belongs to. The TTS player uses it to drop audio from a turn
-	// that was superseded by an interruption (production-grade barge-in).
-	ttsSeq atomic.Int64
+	// ttsSeq is a monotonic TURN counter: the first sentence of a reply claims
+	// the next id, the rest of that reply reuse it, and endTTSTurn closes the
+	// turn. The TTS player uses it to drop audio from a turn that was
+	// superseded by an interruption (production-grade barge-in).
+	ttsSeq      atomic.Int64
+	ttsTurnMu   sync.Mutex
+	ttsTurnSeq  int64
+	ttsTurnOpen bool
 
 	skillsRunner *skills.Runner
 }
@@ -307,7 +319,7 @@ func (o *Orchestrator) proactiveMonitor(ctx context.Context) {
 		hour := time.Now().Hour()
 		if hour >= 9 && hour <= 22 {
 			if o.goals.GetPendingCount() > 0 {
-				o.publishTTS(fmt.Sprintf("You have %d pending tasks. Shall I continue?", o.goals.GetPendingCount()))
+				o.Speak(fmt.Sprintf("You have %d pending tasks. Shall I continue?", o.goals.GetPendingCount()))
 				return
 			}
 		}
@@ -315,7 +327,7 @@ func (o *Orchestrator) proactiveMonitor(ctx context.Context) {
 
 	report := o.meta.GetReport()
 	if report.TotalActions >= 10 && report.ActionSuccessRate < 0.5 {
-		o.publishTTS("I've been struggling with recent tasks. You may want to try rephrasing your commands.")
+		o.Speak("I've been struggling with recent tasks. You may want to try rephrasing your commands.")
 		return
 	}
 
@@ -330,7 +342,7 @@ func (o *Orchestrator) proactiveMonitor(ctx context.Context) {
 	for _, event := range events {
 		if event.Priority >= 2 {
 			msg := o.proactive.GenerateProactiveMessage(ctx, event)
-			o.publishTTS(msg)
+			o.Speak(msg)
 			break
 		}
 	}
@@ -909,6 +921,10 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 		cancel()
 		o.setTurnCancel(nil)
 	}()
+	// Close the TTS turn on every exit path — normal end, stream error, and
+	// barge-in — so the player always learns that no further sentences follow
+	// and can finalize the transcript once the queued audio has played.
+	defer o.endTTSTurn()
 
 	var full strings.Builder
 	var pending strings.Builder
@@ -1013,17 +1029,12 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 			o.publishTTS(spoken)
 		}
 	}
-	// Signal stream completion so the browser companion finalizes the transcript.
-	if o.bus != nil {
-		o.bus.Publish(interfaces.Event{
-			Type:   "chat.response",
-			Source: "agent.orchestrator",
-			Payload: map[string]interface{}{
-				"text": "",
-				"done": true,
-			},
-		})
-	}
+	// The stream itself is over, but the transcript's `done` is deliberately
+	// NOT published here when TTS is wired: the TTS player owns the transcript
+	// clock and signals completion once the last queued sentence has actually
+	// been spoken, so the browser text advances in step with the voice instead
+	// of seconds ahead of it (the TTS/LLM desync). The player also covers the
+	// error and interruption paths, so every turn still ends with a done.
 
 	response := full.String()
 	if strings.TrimSpace(response) == "" {
@@ -1476,8 +1487,38 @@ func (o *Orchestrator) publishEmotion(state personality.EmotionState) {
 	})
 }
 
+// ttsTurnID returns the id of the turn currently being spoken, claiming the
+// next id when no turn is open. Sentences of one reply therefore share an id,
+// while a new reply always gets a higher one — which is what lets the player
+// distinguish "next sentence of this answer" from "a newer answer".
+func (o *Orchestrator) ttsTurnID() int64 {
+	o.ttsTurnMu.Lock()
+	defer o.ttsTurnMu.Unlock()
+	if !o.ttsTurnOpen {
+		o.ttsTurnSeq = o.ttsSeq.Add(1)
+		o.ttsTurnOpen = true
+	}
+	return o.ttsTurnSeq
+}
+
+// endTTSTurn closes the current TTS turn, telling the player that no further
+// sentences are coming for this reply. Idempotent and a no-op when nothing was
+// spoken, so every exit path can call it safely. Without this marker the player
+// could only guess the answer had ended from an empty queue, which cut the
+// browser transcript and the echo guard short between sentences.
+func (o *Orchestrator) endTTSTurn() {
+	o.ttsTurnMu.Lock()
+	seq, open := o.ttsTurnSeq, o.ttsTurnOpen
+	o.ttsTurnOpen = false
+	o.ttsTurnMu.Unlock()
+	if !open || o.TTSFunc == nil {
+		return
+	}
+	o.TTSFunc("", personality.TTSParams{}, seq, true)
+}
+
 func (o *Orchestrator) publishTTS(text string) {
-	seq := o.ttsSeq.Add(1)
+	seq := o.ttsTurnID()
 	o.lastSpoken = strings.ToLower(text)
 	o.lastSpokenAt = time.Now()
 
@@ -1511,7 +1552,10 @@ func (o *Orchestrator) publishTTS(text string) {
 
 	// Always publish a transcript event so the browser companion gets
 	// progressive text even when TTSFunc is wired (bypassing the bus for audio).
-	if o.bus != nil {
+	// The player (TTSFunc sink) owns the transcript clock when wired: it re-announces
+	// each sentence as its audio actually starts and publishes the turn's done
+	// once the queue drains, so the browser text can never outrun the voice.
+	if o.bus != nil && o.TTSFunc == nil {
 		o.bus.Publish(interfaces.Event{
 			Type:   "chat.response",
 			Source: "agent.orchestrator",
@@ -1525,7 +1569,7 @@ func (o *Orchestrator) publishTTS(text string) {
 	// If a direct TTS sink is wired (streaming sentence queue), use it so the
 	// bus subscribers don't double-play. Otherwise fall back to the event bus.
 	if o.TTSFunc != nil {
-		o.TTSFunc(text, ttsParams, seq)
+		o.TTSFunc(text, ttsParams, seq, false)
 		return
 	}
 
@@ -1546,10 +1590,12 @@ func (o *Orchestrator) SetGoal(ctx context.Context, goal interfaces.Goal) error 
 	return nil
 }
 
-// Speak streams text to TTS, tagging it with the orchestrator's monotonic
-// turn sequence so the player can drop it if a newer turn supersedes it.
+// Speak says a complete, self-contained utterance (greeting, proactive
+// message): it publishes the text and immediately closes the turn, so the
+// player finalizes the transcript as soon as it has been spoken.
 func (o *Orchestrator) Speak(text string) {
 	o.publishTTS(text)
+	o.endTTSTurn()
 }
 
 func (o *Orchestrator) GetStatus() interfaces.AgentStatus {

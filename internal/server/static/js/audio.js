@@ -26,7 +26,11 @@ class AudioPlayer {
             this.analyser = this.audioContext.createAnalyser();
             this.analyser.fftSize = 512;
             this.analyser.smoothingTimeConstant = 0.7;
-            this.analyser.connect(this.audioContext.destination);
+            // NOTE: deliberately NOT connected to the destination. The
+            // analyser is a pass-through node, so wiring it here used to make
+            // everything fed to it audible on its own — which blocked muted
+            // (lip-sync-only) audio mirroring. Audible output is routed
+            // through the playback gain nodes in _playSmooth instead.
             // Resume on any user gesture (click, key, touch)
             const resumeCtx = () => {
                 if (this.audioContext && this.audioContext.state === 'suspended') {
@@ -51,11 +55,14 @@ class AudioPlayer {
         }
     }
 
-    // Queue a chunk for smooth sequential playback
-    async queueChunk(base64Audio, sampleRate, done) {
+    // Queue a chunk for smooth sequential playback. `muted` marks mirrored
+    // audio from local-speaker mode: it is scheduled and analysed exactly like
+    // audible audio, but output at zero gain so the tab never doubles the
+    // sound while its lip-sync clock still follows the real voice.
+    async queueChunk(base64Audio, sampleRate, done, muted) {
         if (!this.audioContext) this.init();
         await this.resume();
-        this.queue.push({ base64Audio, sampleRate, done });
+        this.queue.push({ base64Audio, sampleRate, done, muted: !!muted });
         if (!this._draining) {
             this._drainQueue();
         }
@@ -80,13 +87,27 @@ class AudioPlayer {
         }
 
         let chunkIndex = 0;
+        let prevDone = false;
         while (this.queue.length > 0) {
             const chunk = this.queue.shift();
             const isLastChunk = chunk.done && this.queue.length === 0;
+            // A chunk that arrives right behind an end-of-turn marker belongs to
+            // a NEW utterance — typically the reply that replaced an interrupted
+            // one, whose audio was queued before the marker was processed. The
+            // drain loop never exited, so restart the playback clock here:
+            // otherwise the viseme schedule is scaled by the previous reply's
+            // duration and the lips drift from the voice.
+            if (prevDone) {
+                chunkIndex = 0;
+                this._utteranceStartCtx = this.audioContext.currentTime;
+                this._nextStartTime = this.audioContext.currentTime;
+                this._knownDuration = 0;
+            }
+            prevDone = chunk.done;
             // First chunk of utterance: no crossfade-in (avoids initial silence)
             const applyCrossfade = chunkIndex > 0;
             try {
-                await this._playSmooth(chunk.base64Audio, chunk.sampleRate, applyCrossfade);
+                await this._playSmooth(chunk.base64Audio, chunk.sampleRate, applyCrossfade, chunk.muted);
             } catch (e) {
                 console.error('[Audio] Chunk play error:', e);
             }
@@ -108,8 +129,10 @@ class AudioPlayer {
     }
 
     // Smooth overlap-add playback — schedules chunk on AudioContext timeline
-    // with crossfade gain to eliminate gaps between chunks
-    _playSmooth(base64Audio, sampleRate, applyCrossfade) {
+    // with crossfade gain to eliminate gaps between chunks. With `muted`, the
+    // chunk is analysed but silent: local speakers own the sound, the tab only
+    // mirrors the timeline for lip sync.
+    _playSmooth(base64Audio, sampleRate, applyCrossfade, muted) {
         return new Promise((resolve, reject) => {
             try {
                 const binaryString = atob(base64Audio);
@@ -139,10 +162,23 @@ class AudioPlayer {
                 const source = this.audioContext.createBufferSource();
                 source.buffer = audioBuffer;
 
-                // Gain node for crossfade
+                // Gain node for crossfade (and the mute switch)
                 const gainNode = this.audioContext.createGain();
                 source.connect(gainNode);
-                gainNode.connect(this.analyser);
+
+                // The analyser is deliberately silent: it is a pass-through
+                // node, so anything fed into it used to leak straight to the
+                // destination (it used to be wired analyser → destination).
+                // Audible output now flows through the gain node instead, so a
+                // muted chunk (local-speaker mirror) can still feed the
+                // lip-sync analyser without doubling the sound.
+                if (muted) {
+                    source.connect(this.analyser);
+                    gainNode.connect(this.audioContext.destination);
+                    gainNode.gain.value = 0;
+                } else {
+                    gainNode.connect(this.analyser);
+                }
 
                 // Schedule start time: either now or at the previously planned end
                 const now = this.audioContext.currentTime;
@@ -150,7 +186,12 @@ class AudioPlayer {
                 const chunkDuration = float32Array.length / sr;
                 const crossfade = this._crossfadeMs / 1000;
 
-                if (applyCrossfade) {
+                if (muted) {
+                    // Silent mirror: keep the exact chunk timing (viseme
+                    // positions depend on it) but skip the gain automation.
+                    gainNode.gain.setValueAtTime(0, startTime);
+                    this._nextStartTime = startTime + chunkDuration - (applyCrossfade ? crossfade : 0);
+                } else if (applyCrossfade) {
                     // Crossfade in (first 40ms of this chunk)
                     gainNode.gain.setValueAtTime(0, startTime);
                     gainNode.gain.linearRampToValueAtTime(1, startTime + crossfade);
@@ -220,7 +261,10 @@ class AudioPlayer {
 
             const source = this.audioContext.createBufferSource();
             source.buffer = audioBuffer;
+            // Analyser alone is silent now; audible legacy playback routes
+            // through the destination explicitly.
             source.connect(this.analyser);
+            source.connect(this.audioContext.destination);
 
             return new Promise((resolve) => {
                 source.onended = resolve;
