@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/goleak"
+
+	"github.com/user/mai/internal/personality"
 )
 
 func TestTakeSentenceKeepsEllipsisTogether(t *testing.T) {
@@ -491,3 +493,67 @@ func TestIsEchoStrict_Performance(t *testing.T) {
 		_ = isEchoStrict(input, spoken)
 	}
 }
+
+// ttsEvent is one delivery from the orchestrator to the TTS player.
+type ttsEvent struct {
+	text  string
+	seq   int64
+	final bool
+}
+
+// TestTTSTurnLifecycle pins the contract the TTS player relies on to keep the
+// transcript, the voice and the viseme clock on one timeline: every sentence of
+// a reply shares a single turn id, and the turn is closed by exactly one
+// explicit end-of-turn marker instead of the player inferring the end of the
+// answer from a momentarily empty queue.
+func TestTTSTurnLifecycle(t *testing.T) {
+	o := &Orchestrator{
+		emotion:    personality.NewEmotionDetector(),
+		ttsAdapter: personality.NewTTSAdapter(1.25, 1, 1),
+	}
+	var got []ttsEvent
+	o.TTSFunc = func(text string, _ personality.TTSParams, seq int64, final bool) {
+		got = append(got, ttsEvent{text: text, seq: seq, final: final})
+	}
+
+	o.publishTTS("First sentence.")
+	o.publishTTS("Second sentence.")
+	o.publishTTS("Third sentence.")
+	o.endTTSTurn()
+
+	if !assert.Len(t, got, 4) {
+		return
+	}
+	reply := got[0].seq
+	for i, e := range got[:3] {
+		assert.Equal(t, reply, e.seq, "sentence %d must share the reply's turn id", i)
+		assert.False(t, e.final, "sentence %d must not close the turn", i)
+	}
+	assert.True(t, got[3].final, "the reply must end with a final marker")
+	assert.Empty(t, got[3].text, "the marker carries no text")
+	assert.Equal(t, reply, got[3].seq, "the marker must close this reply's turn")
+
+	// Idempotent, so every exit path may close the turn without double-signalling.
+	o.endTTSTurn()
+	assert.Len(t, got, 4, "closing a closed turn must not emit another marker")
+
+	// A self-contained utterance is published and closed in one call.
+	o.Speak("Standalone utterance.")
+	if !assert.Len(t, got, 6) {
+		return
+	}
+	assert.Equal(t, "Standalone utterance.", got[4].text)
+	assert.True(t, got[5].final)
+	assert.Greater(t, got[4].seq, reply, "a later reply must claim a higher turn id")
+
+	// The next reply starts a fresh turn rather than reusing the closed one.
+	o.publishTTS("Next reply.")
+	o.endTTSTurn()
+	if !assert.Len(t, got, 8) {
+		return
+	}
+	assert.Greater(t, got[6].seq, got[4].seq, "a new reply must claim a new turn id")
+	assert.Equal(t, got[6].seq, got[7].seq)
+	assert.True(t, got[7].final)
+}
+

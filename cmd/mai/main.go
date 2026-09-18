@@ -647,9 +647,15 @@ func main() {
 		text   string
 		speed  float32
 		volume float32 // emotion-adaptive loudness; applied as a sample gain in playSentence
-		seq    int64   // turn sequence from the orchestrator; used to drop stale audio
+		seq    int64   // orchestrator turn id; every sentence of one reply shares it
+		final  bool    // end-of-turn marker: nothing follows for this turn
 	}
 	ttsSentCh := make(chan ttsItem, 64)
+	// latestTurn is the newest turn id handed to the queue. The player reads it
+	// to drop the tail of an answer the user already interrupted: those
+	// superseded sentences sit AHEAD of the new turn in the FIFO queue, so
+	// comparing against what is playing right now can never see them.
+	var latestTurn atomic.Int64
 	// ttsShutdown stops the TTS player; ttsWG tracks every goroutine that can
 	// be inside sherpa's GenerateWithConfig. Both are joined during shutdown
 	// BEFORE the deferred DeleteOfflineTts frees the engine — destroying it
@@ -669,12 +675,26 @@ func main() {
 		if volume == 0 {
 			volume = 1.0
 		}
+		if seq > 0 {
+			latestTurn.Store(seq)
+		}
 		ttsSentCh <- ttsItem{text: text, speed: speed, volume: volume, seq: seq}
 	}
 
+	// speakTurn says a complete, self-contained utterance: the sentence plus the
+	// end-of-turn marker. Used by one-shot callers so the player finalizes the
+	// transcript as soon as the sentence has been spoken instead of waiting for
+	// a marker that never comes.
+	speakTurn := func(text string, speed, volume float32, seq int64) {
+		speak(text, speed, volume, seq)
+		ttsSentCh <- ttsItem{seq: seq, final: true}
+	}
+
 	// playSentence synthesizes and plays ONE sentence, halting immediately if
-	// a barge-in sets stopPlayback mid-utterance.
-	playSentence := func(text string, speed, volume float32) {
+	// a barge-in sets stopPlayback mid-utterance. It reports whether the audio
+	// was rendered on the local speaker (and so mirrored to the browser as a
+	// muted chunk), so the player's end-of-turn chunk carries the same flag.
+	playSentence := func(text string, speed, volume float32) bool {
 		if speed == 0 {
 			speed = ttsDefaultSpeed
 		}
@@ -698,19 +718,17 @@ func main() {
 				samples[i] = s
 			}
 		}
-		atomic.StoreInt32(&isSpeaking, 1)
-		// Mark TTS as playing so handleAudioFrame's echo-cancel/drop guard runs
-		// for the browser mic too. Without this, the companion path never sets
-		// ttsPlaying and Mai's own voice (echoed through the browser mic) reaches
-		// ASR and gets transcribed as a user turn — the classic feedback loop.
-		atomic.StoreInt32(&ttsPlaying, 1)
+		// isSpeaking, ttsPlaying and stopPlayback are owned by the player for the
+		// WHOLE turn rather than per sentence: releasing them between sentences
+		// let the mic pick up Mai's own voice in the gaps where the LLM was still
+		// producing the next one, and let a fresh sentence erase a barge-in that
+		// had just fired. Only the AEC arming clocks are per utterance.
 		ttsStartedNano.Store(time.Now().UnixNano())
 		bargeStartNano.Store(0)
-		atomic.StoreInt32(&stopPlayback, 0)
-		defer atomic.StoreInt32(&ttsPlaying, 0)
 		log.Printf("[TTS-PLAY] Starting synthesis: speed=%.2f, text=%.80s...", speed, text)
 
-		if cfg.Audio.TTSPlayLocalAlways || !companionHasClient() {
+		local := cfg.Audio.TTSPlayLocalAlways || !companionHasClient()
+		if local {
 			// Always render to the local speaker so Mai is audible regardless
 			// of the companion tab's autoplay state. The playback callback
 			// feeds the echo reference (audio.go), so barge-in AEC still
@@ -730,7 +748,6 @@ func main() {
 					return true
 				})
 			})
-			publishTTSAudioChunk(bus, nil, 44100, true, true)
 		} else {
 			// Opt-in browser-only path (tts_play_local_always: false): stream
 			// chunks to the companion tab. Echo reference is fed manually
@@ -749,7 +766,6 @@ func main() {
 				}
 				return true
 			})
-			publishTTSAudioChunk(bus, nil, 44100, true, false)
 
 			if ttsSampleRate > 0 {
 				estEnd := synthStart.Add(time.Duration(float64(publishedSamples)/float64(ttsSampleRate)*float64(time.Second)) + 400*time.Millisecond)
@@ -759,7 +775,7 @@ func main() {
 					}
 					select {
 					case <-ctx.Done():
-						return
+						return local
 					case <-time.After(20 * time.Millisecond):
 					}
 				}
@@ -769,65 +785,92 @@ func main() {
 		lastResponseMu.Lock()
 		lastResponseTime = time.Now()
 		lastResponseMu.Unlock()
+		return local
 	}
 
-	// Player goroutine: consumes the sentence queue sequentially. Each
-	// sentence carries a turn sequence (orchestrator.ttsSeq). When a newer
-	// turn arrives we (a) halt any sentence currently being spoken and
-	// (b) drop every queued sentence belonging to an older, now-superseded
-	// turn. This is what makes interruption production-grade: the previous
-	// answer's tail is discarded instead of playing after the user takes
-	// over, while the NEW reply (the highest seq) is always preserved.
+	// Player goroutine: consumes the sentence queue sequentially. Every sentence
+	// of one reply shares the orchestrator's turn id, and a turn is closed by an
+	// explicit end-of-turn item — never by "the queue looks empty right now".
+	// That distinction is the sync fix: an empty queue mid-reply means the LLM is
+	// still writing the next sentence, not that the answer is over. When a newer
+	// turn arrives we drop the superseded answer's queued tail and close its
+	// transcript, while the new reply (the highest turn id) is always preserved.
 	ttsWG.Add(1)
 	go func() {
 		defer ttsWG.Done()
-		var playingSeq int64
+		var playingSeq int64 // turn currently being spoken (0 = none)
+		var turnOpen bool    // its transcript was announced and is not yet closed
+		var mirrored bool    // the turn is rendered locally; the browser chunk is muted
+		// closeTurn releases everything the player holds for one turn, and
+		// finalizes the browser transcript and its audio stream together so the
+		// text, the viseme schedule and the speaking state all end at once.
+		closeTurn := func() {
+			if !turnOpen {
+				return
+			}
+			turnOpen = false
+			atomic.StoreInt32(&isSpeaking, 0)
+			atomic.StoreInt32(&ttsPlaying, 0)
+			atomic.StoreInt32(&stopPlayback, 0)
+			lastTTSEndNano.Store(time.Now().UnixNano())
+			publishTTSAudioChunk(bus, nil, 44100, true, mirrored)
+			publishTranscript(bus, "", true)
+		}
 		for {
 			select {
 			case <-ttsShutdown:
-				atomic.StoreInt32(&isSpeaking, 0)
-				lastTTSEndNano.Store(time.Now().UnixNano())
+				closeTurn()
 				return
 			case item, ok := <-ttsSentCh:
 				if !ok {
+					closeTurn()
 					return
 				}
-				// Stale audio from a turn the user already interrupted: drop it.
-				if item.seq > 0 && item.seq <= playingSeq {
-					log.Printf("[TTS-PLAYER] Dropping stale sentence (turn %d <= %d): %.60s...", item.seq, playingSeq, item.text)
+				// A newer turn was requested while this one was still queued: the
+				// interrupted answer's tail is discarded instead of playing over
+				// the reply that replaced it.
+				if item.seq > 0 && item.seq < latestTurn.Load() {
+					log.Printf("[TTS-PLAYER] Dropping superseded sentence (turn %d < %d): %.60s...",
+						item.seq, latestTurn.Load(), item.text)
+					continue
+				}
+				if item.seq > playingSeq {
+					// Done with the superseded reply: close its transcript so the
+					// new answer opens its own message, and clear any barge-in
+					// halt for the fresh turn.
+					closeTurn()
+					atomic.StoreInt32(&stopPlayback, 0)
+					playingSeq = item.seq
+				}
+				if item.final {
+					// Nothing follows for this turn. Finalize only once nothing
+					// newer is queued behind the marker.
 					if len(ttsSentCh) == 0 {
-						atomic.StoreInt32(&isSpeaking, 0)
-						atomic.StoreInt32(&stopPlayback, 0)
-						lastTTSEndNano.Store(time.Now().UnixNano())
-						// Nothing left of the superseded turn: finalize the
-						// transcript so the browser is not left mid-stream.
-						publishTranscript(bus, "", true)
+						closeTurn()
 					}
 					continue
 				}
-				// A newer turn started: halt the sentence currently being spoken
-				// so the new reply begins promptly. playSentence resets
-				// stopPlayback at its own start, so this never blocks the new turn.
-				if item.seq > playingSeq {
-					atomic.StoreInt32(&stopPlayback, 1)
-					playingSeq = item.seq
+				// A barge-in halted this turn: drop the rest of it instead of
+				// resuming mid-answer (stopPlayback is only cleared when a new
+				// turn starts).
+				if turnOpen && atomic.LoadInt32(&stopPlayback) != 0 {
+					log.Printf("[TTS-PLAYER] Turn %d halted, dropping: %.60s...", item.seq, item.text)
+					continue
 				}
 				log.Printf("[TTS-PLAYER] Playing sentence (len=%d, turn=%d): %.80s...", len(item.text), item.seq, item.text)
+				// Hold the echo guard and the speaking state for the WHOLE turn,
+				// including the gap where the LLM is still producing the next
+				// sentence. Releasing them per sentence let Mai's own voice reach
+				// the mic in those gaps and produce phantom user turns.
+				atomic.StoreInt32(&isSpeaking, 1)
+				atomic.StoreInt32(&ttsPlaying, 1)
 				// Announce this sentence exactly when its audio starts, so
 				// transcript, voice and the browser's viseme schedule advance
 				// on the same timeline (TTS/LLM streaming sync).
 				publishTranscript(bus, item.text, false)
-				playSentence(item.text, item.speed, item.volume)
+				turnOpen = true
+				mirrored = playSentence(item.text, item.speed, item.volume)
 				log.Printf("[TTS-PLAYER] Finished playing sentence, queue_depth=%d", len(ttsSentCh))
-				if len(ttsSentCh) == 0 {
-					atomic.StoreInt32(&isSpeaking, 0)
-					atomic.StoreInt32(&stopPlayback, 0) // ensure clean state for next response
-					lastTTSEndNano.Store(time.Now().UnixNano())
-					// Last sentence spoken: the player owns the transcript
-					// clock, so finalize the browser message here rather
-					// than when the LLM stream ended.
-					publishTranscript(bus, "", true)
-				}
 			}
 		}
 	}()
@@ -949,9 +992,15 @@ func main() {
 		// forwards them to the browser); when no client is connected it
 		// falls back to local audio playback.  The bus subscription added
 		// below covers the local-only fallback path as well.
-		orch.TTSFunc = func(text string, params personality.TTSParams, seq int64) {
+		orch.TTSFunc = func(text string, params personality.TTSParams, seq int64, final bool) {
+			if final {
+				// End of this reply's sentences: the player may now finalize the
+				// transcript once the queued audio has actually played.
+				ttsSentCh <- ttsItem{seq: seq, final: true}
+				return
+			}
 			log.Printf("[TTS-FUNC] Enqueuing sentence (len=%d, speed=%.2f, volume=%.2f, turn=%d): %.80s...", len(text), params.Speed, params.Volume, seq, text)
-			ttsSentCh <- ttsItem{text: text, speed: params.Speed, volume: params.Volume, seq: seq}
+			speak(text, params.Speed, params.Volume, seq)
 		}
 		interruptCurrent = orch.InterruptCurrent
 		orch.DirectAction = executor.ParseAndExecute // Wire up the legacy highly-reliable regex parser
@@ -1026,7 +1075,9 @@ func main() {
 			speed, _ := event.Payload["speed"].(float32)
 			seq, _ := event.Payload["seq"].(int64)
 			log.Printf("[AGENT] Speaking (speed=%.2f, turn=%d): %s", speed, seq, text)
-			speak(text, speed, 1.0, seq)
+			// One-shot utterance on the legacy bus path: include the end-of-turn
+			// marker so the player finalizes the transcript as soon as it ends.
+			speakTurn(text, speed, 1.0, seq)
 			log.Printf("[FOLLOW-UP] Listening for follow-up (15s window)...")
 		})
 

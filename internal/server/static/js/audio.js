@@ -87,9 +87,23 @@ class AudioPlayer {
         }
 
         let chunkIndex = 0;
+        let prevDone = false;
         while (this.queue.length > 0) {
             const chunk = this.queue.shift();
             const isLastChunk = chunk.done && this.queue.length === 0;
+            // A chunk that arrives right behind an end-of-turn marker belongs to
+            // a NEW utterance — typically the reply that replaced an interrupted
+            // one, whose audio was queued before the marker was processed. The
+            // drain loop never exited, so restart the playback clock here:
+            // otherwise the viseme schedule is scaled by the previous reply's
+            // duration and the lips drift from the voice.
+            if (prevDone) {
+                chunkIndex = 0;
+                this._utteranceStartCtx = this.audioContext.currentTime;
+                this._nextStartTime = this.audioContext.currentTime;
+                this._knownDuration = 0;
+            }
+            prevDone = chunk.done;
             // First chunk of utterance: no crossfade-in (avoids initial silence)
             const applyCrossfade = chunkIndex > 0;
             try {
