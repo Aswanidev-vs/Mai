@@ -107,7 +107,7 @@ asr:
 
 tts:
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
-  num_threads: 2
+  num_threads: 6   # was 2: Supertonic synthesis ~2.5x realtime @2 threads caused inter-sentence gaps; 6 cuts synthesis time (12 logical cores available)
   debug: 0
   output_sample_rate: 44100  # Supertonic outputs 44.1kHz, Pocket/ZipVoice may differ
 
