@@ -194,7 +194,7 @@ llm:
   api_key: ""
   auto_start: true
   local_model: qwen3.5:4b  # Model for local fallback (Ollama)
-  # stream: true
+  stream: true
   think: false
   # num_ctx pins Ollama's context window. The window has to hold the persona
   # (~1.9k tokens) plus the verbatim history: when a rendered prompt overflows
