@@ -61,16 +61,16 @@ func (r *speakerRef) recent(n int) []float32 {
 	return out
 }
 
-// resampler does linear-interpolation sample-rate conversion. It carries
-// fractional state between calls so it can be fed streaming chunks.
+// resampler does 4-point Catmull-Rom cubic Hermite spline sample-rate
+// conversion. It preserves high-frequency treble without the high-frequency
+// droop of linear interpolation, and carries fractional/history state across chunks.
 type resampler struct {
-	// step is the number of input samples represented by one output sample.
-	// Keeping the phase in input-sample units avoids extrapolating when the
-	// output rate is higher than the input rate.
 	step  float64
 	phase float64
-	prev  float32
-	has   bool
+	p0    float32
+	p1    float32
+	p2    float32
+	has   int
 }
 
 func newResampler(inRate, outRate int) *resampler {
@@ -86,24 +86,46 @@ func (r *resampler) resample(in []float32) []float32 {
 		copy(out, in)
 		return out
 	}
-	out := make([]float32, 0, int(float64(len(in))/r.step)+2)
+	out := make([]float32, 0, int(float64(len(in))/r.step)+4)
 	start := 0
-	if !r.has {
-		r.prev = in[0]
-		r.has = true
-		start = 1
+
+	// Seed history buffer on initial call
+	for r.has < 3 && start < len(in) {
+		s := in[start]
+		start++
+		switch r.has {
+		case 0:
+			r.p0, r.p1, r.p2 = s, s, s
+			r.has = 1
+		case 1:
+			r.p1, r.p2 = s, s
+			r.has = 2
+		case 2:
+			r.p2 = s
+			r.has = 3
+		}
 	}
+
 	for i := start; i < len(in); i++ {
-		curr := in[i]
+		p3 := in[i]
+		p0, p1, p2 := r.p0, r.p1, r.p2
+
+		// Catmull-Rom cubic coefficients for segment between p1 and p2
+		c0 := p1
+		c1 := 0.5 * (p2 - p0)
+		c2 := p0 - 2.5*p1 + 2.0*p2 - 0.5*p3
+		c3 := 0.5*(p3-p0) + 1.5*(p1-p2)
+
 		for r.phase < 1 {
 			t := float32(r.phase)
-			out = append(out, r.prev*(1-t)+curr*t)
+			v := ((c3*t+c2)*t+c1)*t + c0
+			out = append(out, v)
 			r.phase += r.step
 		}
-		// One input interval has been consumed. Any remaining phase carries
-		// into the next interval, including across streaming calls.
 		r.phase -= 1
-		r.prev = curr
+		r.p0 = p1
+		r.p1 = p2
+		r.p2 = p3
 	}
 	return out
 }

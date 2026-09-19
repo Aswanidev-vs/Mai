@@ -27,11 +27,10 @@ type exciterConfig struct {
 // defaultExciterConfig derives the band edges from the engine's sample rate so
 // the stage behaves sensibly for both 24 kHz Pocket and 44.1 kHz Supertonic.
 //
-// The source band starts at 3.5 kHz: below that is vowel/formant energy that
-// already carries brightness, while 3.5 kHz and up is where fricatives and
-// sibilants live, which is what a listener reads as "air". Doubling that lands
-// the synthesised harmonics at 7 kHz and up, inside the band the model leaves
-// empty.
+// The source band starts at 2.8 kHz: this captures the full consonant and
+// sibilant clarity band (fricatives, dental consonants) that listeners read as
+// articulation and air. Doubling that lands the synthesised harmonics at 5.6 kHz
+// and up, inside the air band the 24 kHz model leaves empty.
 func defaultExciterConfig(sampleRate int, amount float64) exciterConfig {
 	clampHz := func(hz float64) float64 {
 		if limit := 0.45 * float64(sampleRate); hz > limit {
@@ -42,9 +41,9 @@ func defaultExciterConfig(sampleRate int, amount float64) exciterConfig {
 	return exciterConfig{
 		sampleRate: sampleRate,
 		amount:     amount,
-		presence:   clampHz(3500),
-		bandLo:     clampHz(6500),
-		bandHi:     clampHz(10500),
+		presence:   clampHz(2800),
+		bandLo:     clampHz(6000),
+		bandHi:     clampHz(11000),
 	}
 }
 
@@ -84,6 +83,22 @@ func biquadHighpass(sampleRate int, freq, q float64) *biquad {
 		b2: (1 + cw) / 2 / a0,
 		a1: -2 * cw / a0,
 		a2: (1 - alpha) / a0,
+	}
+}
+
+func biquadPeaking(sampleRate int, freq, gainDB, q float64) *biquad {
+	A := math.Pow(10, gainDB/40)
+	w0 := 2 * math.Pi * freq / float64(sampleRate)
+	cw := math.Cos(w0)
+	sw := math.Sin(w0)
+	alpha := sw / (2 * q)
+	a0 := 1 + alpha/A
+	return &biquad{
+		b0: (1 + alpha*A) / a0,
+		b1: (-2 * cw) / a0,
+		b2: (1 - alpha*A) / a0,
+		a1: (-2 * cw) / a0,
+		a2: (1 - alpha/A) / a0,
 	}
 }
 
@@ -138,7 +153,7 @@ func applyExciter(samples []float32, sampleRate int, cfg exciterConfig) []float3
 	// than this in the sibilant band; a low-passed voice carries almost none.
 	rawRMS := rmsLevel(presence)
 	dryRMS := rmsLevel(samples)
-	if rawRMS < 0.05*dryRMS {
+	if rawRMS < 0.02*dryRMS {
 		return samples
 	}
 
@@ -219,6 +234,17 @@ func colourVoice(samples []float32, cfg colourConfig) []float32 {
 	}
 	out := pitchShift(samples, float64(cfg.pitch))
 	out = applyExciter(out, cfg.exciter.sampleRate, cfg.exciter)
+
+	// Presence & clarity enhancement (3.8 kHz +2.2 dB bell EQ):
+	// active when exciter is enabled to elevate consonant crispness and articulation.
+	if cfg.exciter.amount > 0 && cfg.sampleRate >= 16000 {
+		eq := biquadPeaking(cfg.sampleRate, 3800, 2.2, 1.2)
+		clarity := make([]float32, len(out))
+		for i, s := range out {
+			clarity[i] = float32(eq.process(float64(s)))
+		}
+		out = clarity
+	}
 
 	// The engine's own output level carries no information (measured
 	// -25.3 dBFS), so the voice is first brought to a fixed reference and only

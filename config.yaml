@@ -155,7 +155,7 @@ tts:
   # model did produce and folds them into the air band, which restores perceived
   # brightness. It is a psychoacoustic enhancement, not the reference's real top
   # end. Start around 0.25; raise for more air, set 0 to disable.
-  exciter_amount: 0.25
+  exciter_amount: 0.45
   # normalize_loudness: bring every utterance's active speech to
   # target_loudness_dbfs before the emotion volume is applied. This is the fix
   # for "the volume is at 100% but she still sounds quiet": measured Pocket
@@ -211,7 +211,7 @@ tts:
     # seed) give the same sentence a different timbre AND a different loudness
     # every time — measured peak 0.37 vs 0.56 for identical input. For a cloned
     # voice that reads as "she doesn't sound like the reference". Pin it:
-    temperature: 0.7
+    temperature: 0.6
     seed: 42            # any fixed integer; set to -1 to go back to random
     # Batch the sentences the LLM streaming handoff produces into ONE synthesis
     # call. Pocket pays a large fixed cost per call (fresh LM state + EOS
