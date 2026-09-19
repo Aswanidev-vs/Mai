@@ -184,6 +184,9 @@ func applyExciter(samples []float32, sampleRate int, cfg exciterConfig) []float3
 }
 
 func rmsLevel(samples []float32) float64 {
+	if len(samples) == 0 {
+		return 0
+	}
 	var acc float64
 	for _, v := range samples {
 		acc += float64(v) * float64(v)
@@ -191,26 +194,44 @@ func rmsLevel(samples []float32) float64 {
 	return math.Sqrt(acc / float64(len(samples)))
 }
 
-// colourVoice applies the post-synthesis chain in the order it must run:
-// makeup gain, then pitch, then brightness. Pitch runs before the exciter so the
-// exciter's synthesised harmonics are not resampled, which would alias them.
-func colourVoice(samples []float32, gain, pitch float32, exciter exciterConfig) []float32 {
+// colourConfig is the post-synthesis voice chain's configuration.
+type colourConfig struct {
+	sampleRate int
+	// volume is the emotion/style loudness offset. It is applied AFTER loudness
+	// normalisation so a preset changes loudness relative to a fixed reference
+	// instead of relative to the engine's own (very low) output level.
+	volume float32
+	pitch  float32
+	// outputGain is the master trim (config tts.output_gain).
+	outputGain float32
+	// targetRMS is the loudness normalisation target; <= 0 disables it.
+	targetRMS float64
+	exciter   exciterConfig
+}
+
+// colourVoice applies the post-synthesis chain in the order it must run. Pitch
+// runs before the exciter so the exciter's synthesised harmonics are not
+// resampled, which would alias them. Loudness normalisation runs after the
+// exciter but before the emotion offset, and the limiter runs last.
+func colourVoice(samples []float32, cfg colourConfig) []float32 {
 	if len(samples) == 0 {
 		return samples
 	}
-	out := samples
-	if gain != 1.0 {
-		out = make([]float32, len(samples))
-		for i, s := range samples {
-			v := s * gain
-			if v > 1 {
-				v = 1
-			} else if v < -1 {
-				v = -1
-			}
-			out[i] = v
-		}
+	out := pitchShift(samples, float64(cfg.pitch))
+	out = applyExciter(out, cfg.exciter.sampleRate, cfg.exciter)
+
+	// The engine's own output level carries no information (measured
+	// -25.3 dBFS), so the voice is first brought to a fixed reference and only
+	// then offset by the emotion volume.
+	if cfg.targetRMS > 0 {
+		out = normalizeLoudness(out, cfg.sampleRate, cfg.targetRMS)
 	}
-	out = pitchShift(out, float64(pitch))
-	return applyExciter(out, exciter.sampleRate, exciter)
+	if trim := cfg.volume * cfg.outputGain; trim != 1 {
+		scaled := make([]float32, len(out))
+		for i, s := range out {
+			scaled[i] = s * trim
+		}
+		out = scaled
+	}
+	return limitSamples(out)
 }

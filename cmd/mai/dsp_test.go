@@ -287,12 +287,24 @@ func TestExciterDisabledIsNoOp(t *testing.T) {
 	t.Log("[EXCITER] amount 0 is a byte-for-byte no-op")
 }
 
-// TestColourVoiceChain verifies the post-synthesis chain: gain is applied, the
-// disabled chain is a byte-for-byte pass-through, and the output stays in range.
+// TestColourVoiceChain verifies the post-synthesis chain: the exciter brightens
+// without clipping, the disabled chain reduces to the limiter alone (byte-for-
+// byte below the knee, soft-knee compression above it), and the master trim is
+// applied.
+//
+// targetRMS is 0 here (normalisation off) so these assertions stay exact;
+// TestLoudnessNormalisationFixesQuietEngineOutput covers the normaliser. The
+// limiter itself is always on — it is the stage that keeps the PCM16 conversion
+// from wrapping — so "disabled" means "limitSamples only", not "identity".
 func TestColourVoiceChain(t *testing.T) {
-	src := sine(24000, 1.0, 300, 1200)
+	sr := 24000
+	plain := func(volume, trim float32, exc exciterConfig) colourConfig {
+		return colourConfig{sampleRate: sr, volume: volume, pitch: 1, outputGain: trim, exciter: exc}
+	}
 
-	out := colourVoice(src, 1.0, 1.0, defaultExciterConfig(24000, 0.25))
+	src := sine(sr, 1.0, 300, 1200)
+
+	out := colourVoice(src, plain(1, 1, defaultExciterConfig(sr, 0.25)))
 	if len(out) != len(src) {
 		t.Fatalf("chain changed length: %d -> %d", len(src), len(out))
 	}
@@ -304,10 +316,10 @@ func TestColourVoiceChain(t *testing.T) {
 	t.Logf("[COLOUR] band-poor input stays in range (peak %.3f)", peakAbs(out))
 
 	// A voice-like signal with sibilant content must still brighten.
-	voiced := sine(24000, 1.0, 300, 900, 1800, 3600, 4500)
-	brightened := colourVoice(voiced, 1.0, 1.0, defaultExciterConfig(24000, 0.25))
-	before := bandEnergyRatio(voiced, 24000, 6000)
-	after := bandEnergyRatio(brightened, 24000, 6000)
+	voiced := sine(sr, 1.0, 300, 900, 1800, 3600, 4500)
+	brightened := colourVoice(voiced, plain(1, 1, defaultExciterConfig(sr, 0.25)))
+	before := bandEnergyRatio(voiced, sr, 6000)
+	after := bandEnergyRatio(brightened, sr, 6000)
 	if after < before*1.10 {
 		t.Errorf("chain did not brighten a voice-like signal: air band %.5f -> %.5f", before, after)
 	}
@@ -318,19 +330,197 @@ func TestColourVoiceChain(t *testing.T) {
 	}
 	t.Logf("[COLOUR] voice-like input: air band %.4f%% -> %.4f%%, in range", 100*before, 100*after)
 
-	plain := colourVoice(src, 1.0, 1.0, exciterConfig{sampleRate: 24000, amount: 0})
-	for i := range plain {
-		if plain[i] != src[i] {
-			t.Fatalf("fully disabled chain modified sample %d: %v -> %v", i, src[i], plain[i])
-		}
-	}
-	t.Log("[COLOUR] fully disabled chain is a byte-for-byte no-op")
-
-	quiet := colourVoice(src, 0.5, 1.0, exciterConfig{sampleRate: 24000, amount: 0})
+	// With every optional stage off, whatever remains is the always-on limiter.
+	// A quiet signal never reaches the knee, so it must come out untouched.
+	// (sine's second argument is duration; the partials' combined peak is ~0.75,
+	// so halve it to stay under the knee.)
+	quiet := sine(sr, 0.5, 300, 1200)
 	for i := range quiet {
-		if math.Abs(float64(quiet[i])-0.5*float64(src[i])) > 1e-4 {
-			t.Fatalf("gain not applied at sample %d: %v, want %v", i, quiet[i], 0.5*src[i])
+		quiet[i] *= 0.4 // peak ~0.36, well under the knee
+	}
+	noop := colourVoice(quiet, plain(1, 1, exciterConfig{sampleRate: sr, amount: 0}))
+	for i := range noop {
+		if noop[i] != quiet[i] {
+			t.Fatalf("fully disabled chain modified below-knee sample %d: %v -> %v", i, quiet[i], noop[i])
 		}
 	}
-	t.Log("[COLOUR] gain applied correctly")
+	t.Logf("[COLOUR] disabled chain is a byte-for-byte no-op below the knee (peak %.3f)", peakAbs(quiet))
+
+	// A signal over the knee may only be soft-knee compressed — never expanded,
+	// never clipped past the ceiling.
+	limited := colourVoice(src, plain(1, 1, exciterConfig{sampleRate: sr, amount: 0}))
+	for i := range limited {
+		if want := float32(softLimit(float64(src[i]))); limited[i] != want {
+			t.Fatalf("disabled chain did more than limit at sample %d: %v, want %v", i, limited[i], want)
+		}
+	}
+	t.Logf("[COLOUR] over-knee input (peak %.3f) is only knee-compressed (peak %.3f)",
+		peakAbs(src), peakAbs(limited))
+
+	// The trim scales before the limiter, so a halved signal stays under the
+	// knee and must survive exactly.
+	trimmed := colourVoice(src, plain(1, 0.5, exciterConfig{sampleRate: sr, amount: 0}))
+	for i := range trimmed {
+		if math.Abs(float64(trimmed[i])-0.5*float64(src[i])) > 1e-4 {
+			t.Fatalf("trim not applied at sample %d: %v, want %v", i, trimmed[i], 0.5*src[i])
+		}
+	}
+	t.Log("[COLOUR] master trim applied correctly")
+}
+
+// TestLoudnessNormalisationFixesQuietEngineOutput pins the measured defect:
+// Pocket emits rms 0.0544 (-25.3 dBFS) with a peak of 0.486, and the chain used
+// to pass that through at unity gain — which is the "the volume is at 100% and
+// she still sounds quiet" report. Normalisation must bring the speech to the
+// target while the limiter keeps the peak bounded.
+func TestLoudnessNormalisationFixesQuietEngineOutput(t *testing.T) {
+	const sr = 24000
+	wantDB := voiceTargetRMSDefault
+	target := dbfsToLinear(wantDB)
+
+	scaled := func(rms float64) []float32 {
+		s := sine(sr, 1.0, 220, 700, 1600, 3200, 4800)
+		scale := rms / rmsLevelInTest(s)
+		for i := range s {
+			s[i] = float32(float64(s[i]) * scale)
+		}
+		return s
+	}
+	offBy := func(rms float64) float64 { return math.Abs(levelDBFS(rms) - wantDB) }
+	cfg := colourConfig{sampleRate: sr, volume: 1, pitch: 1, outputGain: 1, targetRMS: target,
+		exciter: exciterConfig{sampleRate: sr, amount: 0}}
+
+	quiet := scaled(0.0544) // the level Pocket actually emits
+	out := colourVoice(quiet, cfg)
+	if err := offBy(rmsLevelInTest(out)); err > 1.0 {
+		t.Errorf("quiet output is %.1f dB off the %.0f dBFS target (in rms %.4f -> out rms %.4f)",
+			err, wantDB, rmsLevelInTest(quiet), rmsLevelInTest(out))
+	}
+	if peak := peakAbs(out); peak > limiterCeiling+1e-6 {
+		t.Errorf("limiter let a peak of %.3f through (ceiling %.2f)", peak, limiterCeiling)
+	}
+	t.Logf("[LOUDNESS] quiet engine output rms %.4f (%.1f dBFS) -> %.4f (%.1f dBFS), peak %.3f",
+		rmsLevelInTest(quiet), levelDBFS(rmsLevelInTest(quiet)),
+		rmsLevelInTest(out), levelDBFS(rmsLevelInTest(out)), peakAbs(out))
+
+	// An utterance already at the target must not be pushed louder.
+	loudOut := colourVoice(scaled(target), cfg)
+	if err := offBy(rmsLevelInTest(loudOut)); err > 1.0 {
+		t.Errorf("already-loud input left the target by %.1f dB", err)
+	}
+	t.Logf("[LOUDNESS] already-loud input stays put (peak %.3f)", peakAbs(loudOut))
+
+	// Silence must not be amplified: normalising near-silence would lift the
+	// room noise floor to the target level.
+	silent := make([]float32, sr/4)
+	if peak := peakAbs(colourVoice(silent, cfg)); peak > 1e-6 {
+		t.Errorf("silence was amplified to a peak of %.6f", peak)
+	}
+	t.Log("[LOUDNESS] silence is not amplified")
+}
+
+// TestLimiterCompressesInsteadOfWrapping is the regression test for the
+// distortion path: colourVoice used to hard-clip each sample, and any sample
+// that escaped above 1.0 wrapped sign in the PCM16 conversion — a full-scale
+// click rather than a loud sample.
+//
+// The limiter is tested directly rather than through the chain, because
+// loudness normalisation already attenuates a uniformly over-scale signal; the
+// limiter's real job is bounding a high-crest-factor transient that the
+// RMS-based gain could not foresee.
+func TestLimiterCompressesInsteadOfWrapping(t *testing.T) {
+	const sr = 24000
+	hot := sine(sr, 0.5, 300, 900, 1800)
+	for i := range hot {
+		hot[i] *= 3.0 // well past full scale
+	}
+
+	out := limitSamples(hot)
+	inPeak := peakAbs(hot)
+	if inPeak <= limiterKnee {
+		t.Fatalf("test signal is not over the knee (peak %.3f)", inPeak)
+	}
+	for i, v := range out {
+		if v > limiterCeiling+1e-6 || v < -limiterCeiling-1e-6 {
+			t.Fatalf("sample %d exceeds the ceiling %v (got %v)", i, limiterCeiling, v)
+		}
+	}
+	outPeak := peakAbs(out)
+	if outPeak <= limiterKnee {
+		t.Errorf("peak reduced to %.3f, below the knee %.2f — attenuating rather than limiting",
+			outPeak, limiterKnee)
+	}
+	if outPeak >= inPeak {
+		t.Errorf("over-scale input was not reduced (%.3f -> %.3f)", inPeak, outPeak)
+	}
+	t.Logf("[LIMITER] input peak %.3f -> output peak %.3f (ceiling %.2f), all samples in range",
+		inPeak, outPeak, limiterCeiling)
+
+	// Through the whole chain the peak must stay bounded for every emotion
+	// volume, including the loudest one (excited = 1.2) that is applied after
+	// normalisation.
+	for _, vol := range []float32{0.5, 1.0, 1.2} {
+		got := colourVoice(hot, colourConfig{sampleRate: sr, volume: vol, pitch: 1, outputGain: 1,
+			targetRMS: dbfsToLinear(voiceTargetRMSDefault), exciter: exciterConfig{sampleRate: sr, amount: 0}})
+		if peak := peakAbs(got); peak > limiterCeiling+1e-6 {
+			t.Errorf("chain at volume %.1f produced a peak of %.3f (ceiling %.2f)", vol, peak, limiterCeiling)
+		}
+	}
+	t.Log("[LIMITER] chain stays bounded at volumes 0.5 / 1.0 / 1.2")
+
+	// Below the knee the limiter must be transparent, or it would colour every
+	// quiet sentence.
+	soft := sine(sr, 0.25, 220, 660)
+	for i, v := range soft {
+		if got := softLimit(float64(v)); got != float64(v) {
+			t.Fatalf("softLimit altered below-knee sample %d (%v -> %v)", i, v, got)
+		}
+	}
+	t.Log("[LIMITER] transparent below the knee")
+}
+
+// TestPCM16DoesNotWrap covers the playback conversion. int16(s*32767) wraps on
+// overflow, so an over-full-scale sample used to come out as the opposite sign
+// at full amplitude: a full-scale click, which is what intermittent crackle in
+// the output is.
+func TestPCM16DoesNotWrap(t *testing.T) {
+	cases := []struct {
+		in   float32
+		want int16
+	}{
+		{0, 0}, {1, 32767}, {-1, -32767}, {1.5, 32767}, {3.0, 32767}, {-1.5, -32768}, {-3.0, -32768},
+	}
+	for _, c := range cases {
+		if got := pcm16(c.in); got != c.want {
+			t.Errorf("pcm16(%v) = %d, want %d", c.in, got, c.want)
+		}
+	}
+	// Documenting what the clamp prevents. This has to go through a variable:
+	// Go rejects the overflowing conversion at compile time when the operand is
+	// a constant, but performs (and silently wraps) it when the operand is a
+	// runtime value — which is exactly the case in the playback callback.
+	over := float64(1.5)
+	if naive := int16(over * 32767.0); naive >= 0 {
+		t.Errorf("expected the runtime conversion to wrap negative, got %d", naive)
+	} else {
+		t.Logf("[PCM] runtime int16(1.5*32767) = %d (a sign-flipped full-scale click)", naive)
+	}
+
+	// Every frame of the device buffer must be written: an untouched frame
+	// replays the previous callback's audio.
+	buf := make([]byte, 2*8)
+	for i := range buf {
+		buf[i] = 0xAB
+	}
+	writePCMFrame(buf, 0, 0.5)
+	fillSilence(buf, 1, 8)
+	if buf[0] != 0xFF || buf[1] != 0x3F {
+		t.Errorf("frame 0 = %#x %#x, want 0x3FFF (0.5 full scale)", buf[0], buf[1])
+	}
+	for i := 2; i < len(buf); i++ {
+		if buf[i] != 0 {
+			t.Fatalf("byte %d left stale (%#x); unfilled frames replay old audio", i, buf[i])
+		}
+	}
+	t.Log("[PCM] 0.5 -> 0x3FFF, remaining frames silenced")
 }

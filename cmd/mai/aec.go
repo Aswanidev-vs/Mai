@@ -32,6 +32,17 @@ func (r *speakerRef) Push(samples []float32) {
 	}
 }
 
+// Clear removes any stale playback history so the next utterance starts from a
+// clean echo reference instead of inheriting the previous turn's speaker audio.
+func (r *speakerRef) Clear() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := range r.buf {
+		r.buf[i] = 0
+	}
+	r.write = 0
+}
+
 // recent returns the last n samples (oldest-first).
 func (r *speakerRef) recent(n int) []float32 {
 	if n > len(r.buf) {
@@ -116,8 +127,7 @@ func NewEchoCanceller(L int) *EchoCanceller {
 		ref: refBuffer,
 		L:   L,
 		w:   make([]float32, L),
-		mu:  0.25, // faster convergence: the echo path must be learned within the
-		// barge-in warmup window, before detection arms
+		mu:  0.5, // fast convergence: echo path learned rapidly during initial frames
 		eps: 1e-4,
 	}
 }
@@ -145,12 +155,38 @@ func (e *EchoCanceller) Process(frame []float32) []float32 {
 	refWin := e.ref.recent(e.L + n)
 	out := make([]float32, n)
 	L := e.L
+	if len(refWin) < L+n {
+		copy(out, frame)
+		return out
+	}
+
+	var norm float32
+	for k := 0; k < L; k++ {
+		xk := refWin[k]
+		norm += xk * xk
+	}
+
 	for i := 0; i < n; i++ {
-		var y, norm float32
+		if i > 0 {
+			if i%128 == 0 {
+				norm = 0
+				for k := 0; k < L; k++ {
+					xk := refWin[i+k]
+					norm += xk * xk
+				}
+			} else {
+				prevX := refWin[i-1]
+				newX := refWin[i+L-1]
+				norm += newX*newX - prevX*prevX
+				if norm < 0 {
+					norm = 0
+				}
+			}
+		}
+
+		var y float32
 		for k := 0; k < L; k++ {
-			xk := refWin[i+k]
-			y += e.w[k] * xk
-			norm += xk * xk
+			y += e.w[k] * refWin[i+k]
 		}
 		res := frame[i] - y
 		out[i] = res

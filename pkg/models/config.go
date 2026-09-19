@@ -135,7 +135,16 @@ type Config struct {
 		// into the air band, restoring perceived brightness on a band-limited
 		// model (Pocket is 24 kHz, so it has no real top end). 0 = off.
 		ExciterAmount float32 `yaml:"exciter_amount"`
-		Supertonic    struct {
+		// NormalizeLoudness brings every utterance's active speech to
+		// TargetLoudnessDBFS. Style presets and the engine itself set only the
+		// absolute sample level, and Pocket's is ~9 dB low (measured -25.3
+		// dBFS), so without this the whole voice is quiet no matter how the
+		// preset is tuned. nil = enabled.
+		NormalizeLoudness *bool `yaml:"normalize_loudness"`
+		// TargetLoudnessDBFS is the loudness normalisation target in dBFS
+		// (-16 is normal program level). >=0 = -16.
+		TargetLoudnessDBFS float64 `yaml:"target_loudness_dbfs"`
+		Supertonic         struct {
 			ModelDir          string  `yaml:"model_dir"`
 			DurationPredictor string  `yaml:"duration_predictor"`
 			TextEncoder       string  `yaml:"text_encoder"`

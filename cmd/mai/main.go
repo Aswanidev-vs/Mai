@@ -677,6 +677,22 @@ func main() {
 		log.Printf("[TTS] Brightness exciter on (amount=%.2f, presence>=%.0f Hz, air %.0f-%.0f Hz)",
 			exciterCfg.amount, exciterCfg.presence, exciterCfg.bandLo, exciterCfg.bandHi)
 	}
+	// Loudness normalisation. Measured Pocket output is -25.3 dBFS RMS, about
+	// 9 dB below normal program level, and the makeup gain only cancels the
+	// style preset's 0.9 — so the engine's own deficit used to reach the speaker
+	// untouched, which is what "the volume is at 100% but she sounds quiet" is.
+	voiceTargetRMS := 0.0
+	if cfg.TTS.NormalizeLoudness == nil || *cfg.TTS.NormalizeLoudness {
+		targetDB := cfg.TTS.TargetLoudnessDBFS
+		if targetDB >= 0 {
+			targetDB = voiceTargetRMSDefault
+		}
+		voiceTargetRMS = dbfsToLinear(targetDB)
+		log.Printf("[TTS] Loudness normalisation on (target %.1f dBFS, peak ceiling %.2f)",
+			targetDB, limiterCeiling)
+	} else {
+		log.Printf("[TTS] Loudness normalisation off — the engine's raw output level reaches the speaker")
+	}
 
 	// synthesize picks the right TTS method based on active model and voice
 	// cloning config. Pocket audio delivery is controlled by pocket.streaming;
@@ -821,10 +837,10 @@ func main() {
 			volume = 1.0
 		}
 		volume = float32(math.Max(0.5, math.Min(1.2, float64(volume))))
-		// ttsOutputGain is a static makeup gain. It exists because a voice
-		// style can only attenuate on a model that ignores speed (Pocket):
-		// without it, choosing "calm" just makes her quieter.
-		gain := volume * ttsOutputGain
+		// ttsOutputGain is the master trim. It no longer has to carry the whole
+		// level: loudness normalisation below brings the utterance to a fixed
+		// reference first, so the style volume is an offset from that reference
+		// rather than from the engine's own (very low) output level.
 		// Pitch is only honoured when enabled; otherwise every sentence keeps
 		// the style's constant pitch, which is what keeps a clone recognisable.
 		if !cfg.TTS.PitchShift {
@@ -854,7 +870,24 @@ func main() {
 		if seq > 0 && seq < latestTurn.Load() {
 			return nil // superseded while synthesizing
 		}
-		return colourVoice(out, gain, pitch, exciterCfg)
+		if len(out) == 0 {
+			return nil
+		}
+		rendered := colourVoice(out, colourConfig{
+			sampleRate: ttsSampleRate,
+			volume:     volume,
+			pitch:      pitch,
+			outputGain: ttsOutputGain,
+			targetRMS:  voiceTargetRMS,
+			exciter:    exciterCfg,
+		})
+		// Level diagnostics: without these, "quiet", "clipping" and "too quiet
+		// to hear" are indistinguishable in the logs.
+		log.Printf("[TTS-LEVEL] raw rms=%.4f (%.1f dBFS) peak=%.3f -> out rms=%.4f (%.1f dBFS) peak=%.3f | %.2fs @ %d Hz",
+			rmsLevel(out), levelDBFS(rmsLevel(out)), peakOf(out),
+			rmsLevel(rendered), levelDBFS(rmsLevel(rendered)), peakOf(rendered),
+			float64(len(rendered))/float64(ttsSampleRate), ttsSampleRate)
+		return rendered
 	}
 
 	// playRendered plays pre-rendered samples, halting immediately if a
@@ -862,15 +895,20 @@ func main() {
 	// was rendered on the local speaker (and so mirrored to the browser as a
 	// muted chunk), so the player's end-of-turn chunk carries the same flag.
 	playRendered := func(samples []float32) bool {
-		// The AEC arming clocks stay per utterance (unlike isSpeaking/
-		// ttsPlaying/stopPlayback, which the player owns for the whole turn).
-		ttsStartedNano.Store(time.Now().UnixNano())
-		bargeStartNano.Store(0)
 		local := cfg.Audio.TTSPlayLocalAlways || !companionHasClient()
 		if len(samples) == 0 {
 			return local
 		}
-		log.Printf("[TTS-PLAY] Playing rendered audio (%.2fs)", float64(len(samples))/44100.0)
+		// 200 ms of audio at the ENGINE's rate. This was a hardcoded 8820 samples
+		// (200 ms at 44.1 kHz), which is 367 ms of a 24 kHz Pocket buffer, and
+		// the duration below divided by 44100 as well — so a Pocket sentence
+		// reported 1.84x its real length (a 40 s utterance logged as 21.77 s).
+		chunkFrames := ttsSampleRate / 5
+		if chunkFrames < 1 {
+			chunkFrames = 8820
+		}
+		log.Printf("[TTS-PLAY] Playing rendered audio (%.2fs @ %d Hz)",
+			float64(len(samples))/float64(ttsSampleRate), ttsSampleRate)
 
 		if local {
 			// Always render to the local speaker so Mai is audible regardless
@@ -888,8 +926,8 @@ func main() {
 						return
 					}
 					n := len(samples)
-					if n > 8820 { // 200ms @ 44.1kHz
-						n = 8820
+					if n > chunkFrames {
+						n = chunkFrames
 					}
 					chunk := samples[:n]
 					samples = samples[n:]
@@ -908,8 +946,8 @@ func main() {
 					break
 				}
 				n := len(samples)
-				if n > 8820 { // 200ms @ 44.1kHz
-					n = 8820
+				if n > chunkFrames {
+					n = chunkFrames
 				}
 				chunk := samples[:n]
 				samples = samples[n:]
@@ -970,6 +1008,7 @@ func main() {
 		defer ttsWG.Done()
 		defer close(ttsRenderedCh)
 		var deferred *ttsItem // item absorbed but not consumed by a batch drain
+		var batchedSeq int64  // turn whose first request has already been synthesized
 		queueClosed := false
 		for {
 			var item ttsItem
@@ -1001,7 +1040,15 @@ func main() {
 			}
 
 			text := item.text
-			if pocketBatching {
+			// The FIRST request of a turn is synthesized alone; only what is
+			// already queued behind it is merged. Batching the first request too
+			// is what left her silent for seconds before the first word: when the
+			// whole reply is already queued (a fast model, or a canned answer) it
+			// collapses into one request and nothing plays until all of it has
+			// been synthesized. A lone first sentence costs nothing, because the
+			// drain is non-blocking. seq == 0 has no turn concept and keeps its
+			// previous behaviour.
+			if pocketBatching && (item.seq == 0 || item.seq == batchedSeq) {
 				merged, next, open := drainPocketBatch(item)
 				text = merged
 				if next != nil {
@@ -1010,6 +1057,8 @@ func main() {
 				if !open {
 					queueClosed = true
 				}
+			} else if pocketBatching {
+				batchedSeq = item.seq
 			}
 
 			samples := renderSentence(text, item.speed, item.volume, item.pitch, item.seq)
@@ -1099,6 +1148,12 @@ func main() {
 				// the mic in those gaps and produce phantom user turns.
 				atomic.StoreInt32(&isSpeaking, 1)
 				atomic.StoreInt32(&ttsPlaying, 1)
+				if !turnOpen {
+					refBuffer.Clear()
+					echoCanceller.Reset()
+					ttsStartedNano.Store(time.Now().UnixNano())
+					bargeStartNano.Store(0)
+				}
 				// Announce this sentence exactly when its audio starts, so
 				// transcript, voice and the browser's viseme schedule advance
 				// on the same timeline (TTS/LLM streaming sync).
@@ -1413,6 +1468,8 @@ func main() {
 			// Streaming TTS: generate chunks and play them as they arrive.
 			atomic.StoreInt32(&isSpeaking, 1) // Block ASR during TTS playback
 			atomic.StoreInt32(&ttsPlaying, 1)
+			refBuffer.Clear()
+			echoCanceller.Reset()
 			ttsStartedNano.Store(time.Now().UnixNano())
 			bargeStartNano.Store(0)
 			atomic.StoreInt32(&stopPlayback, 0)
@@ -1732,13 +1789,13 @@ func main() {
 					bargeStartNano.Store(0)
 				case !notEcho:
 					bargeStartNano.Store(0)
-					if rateLimit(&bargeLogNano, time.Second) {
-						log.Printf("[BARGE-IN] Ignored a loud residual (RMS=%.4f): %.0f%% correlated with Mai's own playback, so it is her voice leaking through an echo canceller that has not converged yet.", crms, coherence*100)
+					if rateLimit(&bargeLogNano, 4*time.Second) {
+						log.Printf("[BARGE-IN] Echo suppressed (residual RMS=%.4f, %.0f%% reference correlation).", crms, coherence*100)
 					}
 				case !voiced:
 					bargeStartNano.Store(0)
-					if rateLimit(&bargeLogNano, time.Second) {
-						log.Printf("[BARGE-IN] Ignored a loud residual (RMS=%.4f): the noise suppressor says it is stationary noise, not speech.", crms)
+					if rateLimit(&bargeLogNano, 4*time.Second) {
+						log.Printf("[BARGE-IN] Stationary noise ignored in residual (RMS=%.4f).", crms)
 					}
 				default:
 					start := bargeStartNano.Load()
@@ -1798,6 +1855,10 @@ func main() {
 				}
 				if crms < cfg.Audio.BargeInThreshold {
 					return // just echo, drop it
+				}
+				// Reverb check: verify residual is not lingering reverberation from Mai's playback.
+				if echoCanceller.EchoCoherence(clean) >= bargeInEchoMax {
+					return // reverb tail of Mai's playback, drop it
 				}
 				// Above the threshold, but a stationary drone clears the
 				// threshold while carrying no words — so the enhancer must also

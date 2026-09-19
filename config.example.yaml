@@ -131,6 +131,14 @@ tts:
   # whose raw output already peaks near full scale clips on the "excited" path
   # (volume 1.2).
   output_gain: 1.0
+  # normalize_loudness: bring every utterance's active speech to
+  # target_loudness_dbfs before the emotion volume is applied. Engines emit their
+  # own conservative level (measured Pocket: -25.3 dBFS RMS, peak 0.486), and
+  # output_gain cannot fix that per sentence — levels differ and the peak would
+  # clip. A soft limiter replaces the per-sample hard clamp, so loud consonants
+  # compress instead of crackling.
+  normalize_loudness: true
+  target_loudness_dbfs: -16.0  # normal program level; -14 is louder, -20 quieter
 
   supertonic:
     model_dir: "./sherpa-onnx-supertonic-3-tts-int8-2026-05-11"

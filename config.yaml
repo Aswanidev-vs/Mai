@@ -156,6 +156,16 @@ tts:
   # brightness. It is a psychoacoustic enhancement, not the reference's real top
   # end. Start around 0.25; raise for more air, set 0 to disable.
   exciter_amount: 0.25
+  # normalize_loudness: bring every utterance's active speech to
+  # target_loudness_dbfs before the emotion volume is applied. This is the fix
+  # for "the volume is at 100% but she still sounds quiet": measured Pocket
+  # output with the cloned reference is rms 0.0544 (-25.3 dBFS) with a peak of
+  # 0.486 — about 9 dB below normal program level, and output_gain alone cannot
+  # fix it because every sentence's level differs and the peak would clip. A soft
+  # limiter replaces the old per-sample hard clamp, so loud consonants compress
+  # instead of crackling, and no sample can exceed the ceiling.
+  normalize_loudness: true
+  target_loudness_dbfs: -16.0  # normal program level; -14 is louder, -20 quieter
 
   supertonic:
     model_dir: "sherpa-onnx-supertonic-3-tts-int8-2026-05-11"

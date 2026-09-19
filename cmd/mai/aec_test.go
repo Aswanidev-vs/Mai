@@ -64,6 +64,18 @@ func TestSpeakerRef_EmptyPush(t *testing.T) {
 	}
 }
 
+func TestSpeakerRef_ClearResetsPlaybackReference(t *testing.T) {
+	ref := newSpeakerRef(8)
+	ref.Push([]float32{1, 2, 3, 4})
+
+	ref.Clear()
+	got := ref.recent(8)
+	for _, v := range got {
+		assert.Zero(t, v)
+	}
+	assert.Equal(t, 0, ref.write)
+}
+
 func TestSpeakerRef_ConcurrentAccess(t *testing.T) {
 	ref := newSpeakerRef(1000)
 	var wg sync.WaitGroup
@@ -163,7 +175,7 @@ func TestEchoCanceller_Process(t *testing.T) {
 	// Push some reference signal
 	refSignal := make([]float32, 1024)
 	for i := range refSignal {
-		refSignal[i] = float32(math.Sin(2*math.Pi*0.01*float64(i)))
+		refSignal[i] = float32(math.Sin(2 * math.Pi * 0.01 * float64(i)))
 	}
 	ref.Push(refSignal)
 
@@ -318,3 +330,39 @@ func TestRefBuffer_GlobalInstance(t *testing.T) {
 	assert.InDelta(t, float32(0.5), got[0], 1e-6)
 	assert.InDelta(t, float32(-0.5), got[1], 1e-6)
 }
+
+func TestRMSLevel_EmptyNoNaN(t *testing.T) {
+	assert.Equal(t, 0.0, rmsLevel(nil))
+	assert.Equal(t, 0.0, rmsLevel([]float32{}))
+	assert.False(t, math.IsNaN(rmsLevel([]float32{})))
+	assert.True(t, math.IsInf(levelDBFS(rmsLevel([]float32{})), -1))
+}
+
+func TestEchoCanceller_PreservesConvergenceAcrossSentences(t *testing.T) {
+	const n, L = 1600, 4096
+	ec := NewEchoCanceller(L)
+	span := 30 * n
+	ref := randomSignal(L+span+n, 42, 0.3)
+
+	// Prime reference ring
+	refBuffer.Clear()
+	refBuffer.Push(make([]float32, L))
+
+	// Sentence 1: 15 frames to converge
+	for t0 := 0; t0 < 15*n; t0 += n {
+		refBuffer.Push(ref[t0 : t0+n])
+		echo := syntheticEcho(ref, t0, n)
+		ec.Process(echo)
+	}
+
+	// Sentence 2 starts immediately without resetting ec
+	// First frame of sentence 2 should already be well-cancelled
+	refBuffer.Push(ref[15*n : 16*n])
+	echo2 := syntheticEcho(ref, 15*n, n)
+	out := ec.Process(echo2)
+	resRMS := rmsOf(out)
+	origRMS := rmsOf(echo2)
+
+	assert.Less(t, resRMS, origRMS*0.4, "converged filter must keep residual well below original echo at sentence transition")
+}
+
