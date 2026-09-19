@@ -123,6 +123,14 @@ tts:
   # Select active model: "supertonic" | "pocket" | "zipvoice"
   active_model: "supertonic"
   voice_style: ""  # Optional: "calm", "warm", "energetic", "serious", "soft"
+  # output_gain: makeup gain applied to every synthesized sample, AFTER the
+  # style/emotion volume. Style presets only ever attenuate, and Pocket ignores
+  # `speed` entirely (its ONNX impl never reads it), so on Pocket a preset like
+  # "calm" would do nothing except make her quieter. ~1.11 cancels the 0.9
+  # volume "calm" applies. Keep <= ~1.4: the clamp is per-sample, so a model
+  # whose raw output already peaks near full scale clips on the "excited" path
+  # (volume 1.2).
+  output_gain: 1.0
 
   supertonic:
     model_dir: "./sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
@@ -150,6 +158,22 @@ tts:
     vocab_json: "vocab.json"
     token_scores_json: "token_scores.json"
     voice_embedding_cache_capacity: 50
+    # Pocket's flow-matching sampler draws fresh Gaussian noise for every frame,
+    # so it is stochastic: without these, sherpa's defaults (temperature 0.7,
+    # random seed) give the same sentence a different timbre AND a different
+    # loudness each run — measured peak 0.37 vs 0.56 for identical input. A
+    # cloned voice that drifts like that reads as "not the reference voice".
+    temperature: 0.7
+    seed: 42             # any fixed integer; -1 restores the random default
+    # Merge the sentences the LLM streaming handoff produces into ONE synthesis
+    # call. Pocket pays a large fixed cost per call (fresh LM state + EOS
+    # search), so measured realtime factor was:
+    #   6 chars -> 1.13x  24 chars -> 2.04x  61 chars -> 2.23x  100 chars -> 2.20x
+    # One sentence at a time left Pocket barely ahead of playback, which showed
+    # up as silent gaps between sentences. The drain is non-blocking, so
+    # first-audio latency is unchanged. Supertonic is 4.58x and unaffected.
+    batch_sentences: true
+    batch_max_chars: 160
     # Custom Colab Pocket export example. Set bundle to enable Mai's direct
     # bundle runtime and point model_dir at the custom package.
     # model_dir: "./sherpa-onnx-pocket-tts-english_2026-04-2026-09-04"
@@ -175,11 +199,14 @@ tts:
 
   voice_cloning:
     enabled: false
-    model: "pocket"  # "pocket" or "zipvoice" (supertonic does NOT support cloning)
+    # Sherpa Pocket has NO built-in voice: without a readable reference WAV it
+    # generates silence, so startup now fails loudly instead of going mute.
     reference_audio: "./mai_san_v2.wav"
     reference_text: ""  # Only for ZipVoice. Empty = auto-detect
-    max_reference_audio_len: 10.0
-    seed: 42
+    # How much of the reference the voice encoder sees. The encoded voice is
+    # cached (voice_embedding_cache_capacity), so a higher value buys more
+    # conditioning data without adding per-sentence latency.
+    max_reference_audio_len: 30.0
 
 llm:
   provider: "ollama"

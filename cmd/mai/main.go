@@ -511,6 +511,9 @@ func main() {
 			ttsConfig.Model.Pocket.TextConditioner = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.TextConditioner)
 			ttsConfig.Model.Pocket.VocabJson = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.VocabJson)
 			ttsConfig.Model.Pocket.TokenScoresJson = join(cfg.TTS.Pocket.ModelDir, cfg.TTS.Pocket.TokenScoresJson)
+			if n := cfg.TTS.Pocket.VoiceEmbeddingCacheCapacity; n > 0 {
+				ttsConfig.Model.Pocket.VoiceEmbeddingCacheCapacity = n
+			}
 		case "zipvoice":
 			ttsConfig.Model.Zipvoice.Encoder = join(cfg.TTS.ZipVoice.ModelDir, cfg.TTS.ZipVoice.Encoder)
 			ttsConfig.Model.Zipvoice.Decoder = join(cfg.TTS.ZipVoice.ModelDir, cfg.TTS.ZipVoice.Decoder)
@@ -550,14 +553,27 @@ func main() {
 
 	// Voice cloning: load reference audio if enabled and active Sherpa model
 	// supports it. The custom Pocket runtime loads its reference WAV directly.
+	//
+	// The official Sherpa Pocket export ships no built-in voice, so a reference
+	// WAV is mandatory: without one GetVoiceEmbedding returns null and Generate
+	// produces silence. A missing/unreadable file must therefore be a loud
+	// failure rather than a silent mute.
+	pocketNeedsReference := cfg.TTS.ActiveModel == "pocket" && !usingCustomPocket
+	referenceAudioPath := cfg.TTS.VoiceCloning.ReferenceAudio
+	if cfg.TTS.VoiceCloning.Enabled && referenceAudioPath == "" && pocketNeedsReference {
+		referenceAudioPath = cfg.TTS.Pocket.Voice
+	}
+
 	var refAudio []float32
 	var refSampleRate int
 	voiceCloneEnabled := cfg.TTS.VoiceCloning.Enabled &&
 		!usingCustomPocket && (cfg.TTS.ActiveModel == "pocket" || cfg.TTS.ActiveModel == "zipvoice")
-	if voiceCloneEnabled && cfg.TTS.VoiceCloning.ReferenceAudio != "" {
-		wav := sherpa.ReadWaveMultiChannel(cfg.TTS.VoiceCloning.ReferenceAudio)
+	if voiceCloneEnabled && referenceAudioPath != "" {
+		wav := sherpa.ReadWaveMultiChannel(referenceAudioPath)
 		if wav != nil && wav.SamplesPerChannel > 0 && wav.SampleRate > 0 {
-			// Mix down to mono if stereo
+			// Mix down to mono if stereo. ReadWaveMultiChannel returns
+			// channel-major (planar) data: channel ch starts at
+			// ch*SamplesPerChannel.
 			if wav.ChannelCount > 1 {
 				mono := make([]float32, wav.SamplesPerChannel)
 				for i := 0; i < wav.SamplesPerChannel; i++ {
@@ -573,30 +589,93 @@ func main() {
 				copy(refAudio, wav.Samples[:wav.SamplesPerChannel])
 			}
 			refSampleRate = wav.SampleRate
+			channels := wav.ChannelCount
+			fullLen := len(refAudio)
 			if maxSeconds := cfg.TTS.VoiceCloning.MaxReferenceAudioLen; maxSeconds > 0 {
 				maxSamples := int(float64(refSampleRate) * float64(maxSeconds))
 				if maxSamples > 0 && len(refAudio) > maxSamples {
 					refAudio = refAudio[:maxSamples]
-					log.Printf("[TTS] Voice cloning reference trimmed to %.1f seconds", maxSeconds)
 				}
 			}
 			wav.Release()
-			log.Printf("[TTS] Voice cloning loaded: %s (%d samples, %d Hz, %d ch)",
-				cfg.TTS.VoiceCloning.ReferenceAudio, len(refAudio), refSampleRate, wav.ChannelCount)
+			log.Printf("[TTS] Voice cloning loaded: %s (%d samples, %d Hz, %d ch)", referenceAudioPath, len(refAudio), refSampleRate, channels)
+			if len(refAudio) < fullLen {
+				log.Printf("[TTS] Voice cloning reference limited to %.1fs of %.1fs by voice_cloning.max_reference_audio_len — raise it for a stronger clone",
+					float64(len(refAudio))/float64(refSampleRate), float64(fullLen)/float64(refSampleRate))
+			}
 		} else {
 			sr := 0
 			ns := 0
 			if wav != nil {
 				sr = wav.SampleRate
 				ns = wav.SamplesPerChannel
-			}
-			log.Printf("[TTS] WARNING: Failed to load reference audio %s (sample_rate=%d, samples=%d), falling back to default voice",
-				cfg.TTS.VoiceCloning.ReferenceAudio, sr, ns)
-			if wav != nil {
 				wav.Release()
 			}
+			if pocketNeedsReference {
+				log.Fatalf("[TTS] Voice cloning reference %q could not be read (sample_rate=%d, samples=%d). "+
+					"The Pocket model has no built-in voice, so it cannot synthesize without a reference WAV. "+
+					"Fix voice_cloning.reference_audio (PCM16 WAV) or point pocket.voice at one.",
+					referenceAudioPath, sr, ns)
+			}
+			log.Printf("[TTS] WARNING: Failed to load reference audio %s (sample_rate=%d, samples=%d), falling back to default voice",
+				referenceAudioPath, sr, ns)
 			voiceCloneEnabled = false
 		}
+	}
+	if pocketNeedsReference && refAudio == nil {
+		log.Fatalf("[TTS] Pocket requires a voice-cloning reference WAV: set tts.voice_cloning.enabled=true with " +
+			"voice_cloning.reference_audio (PCM16 WAV), or point pocket.voice at one. Without it Pocket generates silence.")
+	}
+
+	// Pocket's flow-matching sampler is stochastic: every frame is seeded from
+	// Gaussian noise. Left at the engine default (temperature 0.7, random seed)
+	// the same sentence comes back with a different timbre and level each time,
+	// which makes a cloned voice sound unstable. These knobs pin it down.
+	pocketExtra := map[string]any{}
+	if t := cfg.TTS.Pocket.Temperature; t > 0 {
+		pocketExtra["temperature"] = t
+	}
+	if cfg.TTS.Pocket.Seed != nil {
+		pocketExtra["seed"] = *cfg.TTS.Pocket.Seed
+	}
+	var pocketExtraJSON json.RawMessage
+	if len(pocketExtra) > 0 {
+		if encoded, err := json.Marshal(pocketExtra); err == nil {
+			pocketExtraJSON = encoded
+			log.Printf("[TTS] Pocket sampling pinned: %s", string(encoded))
+		}
+	}
+	if cfg.TTS.ActiveModel == "pocket" && cfg.TTS.Pocket.Seed == nil {
+		log.Printf("[TTS] Pocket seed not set — voice timbre and loudness will vary per sentence. " +
+			"Set tts.pocket.seed (e.g. 42) for a stable clone.")
+	}
+
+	// Makeup gain: style presets attenuate ("calm" = 0.9) and Pocket ignores
+	// speed entirely, so a preset can only ever make Pocket quieter. This
+	// restores the level without disabling the style's expression.
+	ttsOutputGain := cfg.TTS.OutputGain
+	if ttsOutputGain <= 0 {
+		ttsOutputGain = 1.0
+	}
+	if ttsOutputGain != 1.0 {
+		log.Printf("[TTS] Output gain: %.2fx", ttsOutputGain)
+	}
+
+	// Pitch shifting runs on the decoded audio, so it is the one expressive
+	// control that works on Pocket (whose ONNX graph ignores speed). It is off
+	// unless enabled: per-sentence pitch changes trade vocal consistency for
+	// expression, and a clone is recognised by its consistency.
+	// The exciter is the fix for the band-limited model's dull top end: Pocket is
+	// 24 kHz, so its real content stops near 12 kHz and nothing can put that
+	// back. Synthesising harmonics into the air band restores the brightness
+	// perceptually. 0 disables it.
+	exciterCfg := defaultExciterConfig(ttsSampleRate, float64(cfg.TTS.ExciterAmount))
+	if !cfg.TTS.PitchShift {
+		log.Printf("[TTS] Pitch shaping off (tts.pitch_shift) — all sentences keep the style's pitch")
+	}
+	if exciterCfg.amount > 0 {
+		log.Printf("[TTS] Brightness exciter on (amount=%.2f, presence>=%.0f Hz, air %.0f-%.0f Hz)",
+			exciterCfg.amount, exciterCfg.presence, exciterCfg.bandLo, exciterCfg.bandHi)
 	}
 
 	// synthesize picks the right TTS method based on active model and voice
@@ -629,21 +708,10 @@ func main() {
 			if err != nil && !errors.Is(err, pockettts.ErrGenerationStopped) {
 				log.Printf("[TTS] Custom Pocket generation failed: %v", err)
 			}
-		} else if voiceCloneEnabled && refAudio != nil {
-			ttsMu.Lock()
-			tts.GenerateWithConfig(text, &sherpa.GenerationConfig{
-				Speed:               speed,
-				ReferenceAudio:      refAudio,
-				ReferenceSampleRate: refSampleRate,
-				ReferenceText:       cfg.TTS.VoiceCloning.ReferenceText,
-			}, func(samples []float32, _ float32) bool {
-				return deliver(samples)
-			})
-			ttsMu.Unlock()
 		} else {
 			// Build the per-request config.
 			// Supertonic needs NumSteps + Extra (lang). Kokoro needs Sid + Extra (lang).
-			// Pocket/ZipVoice need Speed + Sid.
+			// Pocket/ZipVoice need Speed + ReferenceAudio (+ Pocket's sampling extras).
 			genCfg := &sherpa.GenerationConfig{
 				Speed: speed,
 				Sid:   cfg.TTS.Supertonic.Sid, // Default speaker id; kokoro overrides with its own below
@@ -660,6 +728,20 @@ func main() {
 					genCfg.Extra = json.RawMessage(fmt.Sprintf(`{"lang": "%s"}`, cfg.TTS.Kokoro.Lang))
 				}
 			}
+			// Voice cloning reference (Pocket/ZipVoice). The reference must ride
+			// on the same request as the sampling extras, otherwise a cloned
+			// Pocket request would silently fall back to the engine's random
+			// seed/temperature and the voice would drift sentence to sentence.
+			if voiceCloneEnabled && refAudio != nil {
+				genCfg.ReferenceAudio = refAudio
+				genCfg.ReferenceSampleRate = refSampleRate
+				genCfg.ReferenceText = cfg.TTS.VoiceCloning.ReferenceText
+			}
+			// Pocket's sampling extras are Pocket-specific: zipvoice ignores
+			// unknown extra keys but should not receive them at all.
+			if cfg.TTS.ActiveModel == "pocket" && len(pocketExtraJSON) > 0 {
+				genCfg.Extra = pocketExtraJSON
+			}
 			ttsMu.Lock()
 			tts.GenerateWithConfig(text, genCfg, func(samples []float32, _ float32) bool {
 				return deliver(samples)
@@ -674,15 +756,8 @@ func main() {
 
 	// Realtime TTS: streamed sentences are enqueued here and played one at a
 	// time by a single player goroutine, so the first audio starts as soon as
-	// the first sentence is ready and playback never overlaps.
-	type ttsItem struct {
-		text   string
-		speed  float32
-		volume float32 // emotion-adaptive loudness; applied as a sample gain in renderSentence
-		seq    int64   // orchestrator turn id; every sentence of one reply shares it
-		final  bool    // end-of-turn marker: nothing follows for this turn
-		samples []float32 // pre-rendered audio (filled by the renderer, native rate)
-	}
+	// the first sentence is ready and playback never overlaps. The ttsItem type
+	// and drainTTSBatch live in tts_batch.go.
 	ttsSentCh := make(chan ttsItem, 64)
 	// ttsRenderedCh carries the renderer's output to the player: sentences are
 	// synthesized AHEAD of playback (prefetch) so synthesis latency overlaps
@@ -707,7 +782,7 @@ func main() {
 	// speak enqueues a sentence for the renderer + streaming player below.
 	// Keeping a single consumer serializes all TTS so sentences never
 	// overlap, and lets barge-in drain the queue.
-	speak := func(text string, speed, volume float32, seq int64) {
+	speak := func(text string, speed, volume, pitch float32, seq int64) {
 		if speed == 0 {
 			speed = ttsDefaultSpeed
 		}
@@ -717,15 +792,15 @@ func main() {
 		if seq > 0 {
 			latestTurn.Store(seq)
 		}
-		ttsSentCh <- ttsItem{text: text, speed: speed, volume: volume, seq: seq}
+		ttsSentCh <- ttsItem{text: text, speed: speed, volume: volume, pitch: pitch, seq: seq}
 	}
 
 	// speakTurn says a complete, self-contained utterance: the sentence plus the
 	// end-of-turn marker. Used by one-shot callers so the player finalizes the
 	// transcript as soon as the sentence has been spoken instead of waiting for
 	// a marker that never comes.
-	speakTurn := func(text string, speed, volume float32, seq int64) {
-		speak(text, speed, volume, seq)
+	speakTurn := func(text string, speed, volume, pitch float32, seq int64) {
+		speak(text, speed, volume, pitch, seq)
 		ttsSentCh <- ttsItem{seq: seq, final: true}
 	}
 
@@ -733,9 +808,9 @@ func main() {
 	// is called by the renderer goroutine while the previous sentence is still
 	// playing, so Supertonic's ~0.6-2.2s synthesis latency overlaps with audio
 	// instead of appearing as a silent gap between sentences. It returns the
-	// volume-scaled samples at the engine's native rate, or nil when the
+	// fully coloured samples at the engine's native rate, or nil when the
 	// sentence's turn was superseded while it was being synthesized.
-	renderSentence := func(text string, speed, volume float32, seq int64) []float32 {
+	renderSentence := func(text string, speed, volume, pitch float32, seq int64) []float32 {
 		if speed == 0 {
 			speed = ttsDefaultSpeed
 		}
@@ -746,6 +821,22 @@ func main() {
 			volume = 1.0
 		}
 		volume = float32(math.Max(0.5, math.Min(1.2, float64(volume))))
+		// ttsOutputGain is a static makeup gain. It exists because a voice
+		// style can only attenuate on a model that ignores speed (Pocket):
+		// without it, choosing "calm" just makes her quieter.
+		gain := volume * ttsOutputGain
+		// Pitch is only honoured when enabled; otherwise every sentence keeps
+		// the style's constant pitch, which is what keeps a clone recognisable.
+		if !cfg.TTS.PitchShift {
+			pitch = 1.0
+		}
+		if pitch == 0 {
+			pitch = 1.0
+		}
+
+		// Collect the raw engine output first, then run the colour chain once
+		// over the whole sentence: the pitch shifter needs the complete buffer,
+		// and the exciter's filters need contiguous state.
 		out := make([]float32, 0, 44100*4)
 		synthesize(text, speed, func(samples []float32) bool {
 			// Abort mid-synthesis only when the turn itself was replaced
@@ -757,21 +848,13 @@ func main() {
 			if seq > 0 && seq < latestTurn.Load() {
 				return false
 			}
-			for _, s := range samples {
-				s := s * volume
-				if s > 1 {
-					s = 1
-				} else if s < -1 {
-					s = -1
-				}
-				out = append(out, s)
-			}
+			out = append(out, samples...)
 			return true
 		})
 		if seq > 0 && seq < latestTurn.Load() {
 			return nil // superseded while synthesizing
 		}
-		return out
+		return colourVoice(out, gain, pitch, exciterCfg)
 	}
 
 	// playRendered plays pre-rendered samples, halting immediately if a
@@ -855,36 +938,87 @@ func main() {
 	// between every sentence. With it, synthesis overlaps playback and a
 	// multi-sentence reply plays back-to-back as long as synthesis keeps up
 	// (measured ~2.5-3x realtime on this machine).
+	//
+	// Pocket needs more than prefetch. Its Generate() pays a large FIXED cost
+	// per call (a fresh LM state plus the EOS search loop) and only reuses
+	// state within one call, so measured realtime factor collapses on short
+	// input: 6 chars 1.13x, 24 chars 2.04x, 61 chars 2.23x, 100 chars 2.20x.
+	// The LLM streaming handoff emits short sentences (clause flush at 60
+	// chars), so one-at-a-time synthesis left Pocket barely ahead of playback
+	// and sentences arrived with silent gaps. Merging the sentences already
+	// waiting in the queue into a single request amortizes that fixed cost —
+	// and because the drain is non-blocking it adds no latency to the first
+	// sentence. Supertonic (4.58x, cheap per call) does not need this and keeps
+	// its existing one-sentence-per-request behavior.
+	pocketBatching := cfg.TTS.ActiveModel == "pocket" && pocketTTS == nil &&
+		(cfg.TTS.Pocket.BatchSentences == nil || *cfg.TTS.Pocket.BatchSentences)
+	pocketBatchMaxChars := cfg.TTS.Pocket.BatchMaxChars
+	if pocketBatchMaxChars <= 0 {
+		pocketBatchMaxChars = 160
+	}
+	if pocketBatching {
+		log.Printf("[TTS] Pocket sentence batching on (max %d chars per request)", pocketBatchMaxChars)
+	}
+	// drainPocketBatch adapts drainTTSBatch (tts_batch.go) to this queue. See
+	// tts_batch.go for why Pocket needs it and for the measured numbers.
+	drainPocketBatch := func(first ttsItem) (string, *ttsItem, bool) {
+		return drainTTSBatch(ttsSentCh, first, pocketBatchMaxChars, &latestTurn)
+	}
+
 	ttsWG.Add(1)
 	go func() {
 		defer ttsWG.Done()
 		defer close(ttsRenderedCh)
+		var deferred *ttsItem // item absorbed but not consumed by a batch drain
+		queueClosed := false
 		for {
-			select {
-			case <-ttsShutdown:
-				return
-			case item, ok := <-ttsSentCh:
-				if !ok {
+			var item ttsItem
+			if deferred != nil {
+				item, deferred = *deferred, nil
+			} else {
+				if queueClosed {
 					return
 				}
-				// Superseded turn: drop before wasting synthesis time.
-				if item.seq > 0 && item.seq < latestTurn.Load() {
-					continue
+				select {
+				case <-ttsShutdown:
+					return
+				case it, ok := <-ttsSentCh:
+					if !ok {
+						return
+					}
+					item = it
 				}
-				if item.final {
-					// Markers pass straight through — the player's
-					// end-of-turn logic is order-sensitive.
-					ttsRenderedCh <- ttsItem{seq: item.seq, final: true}
-					continue
+			}
+			// Superseded turn: drop before wasting synthesis time.
+			if item.seq > 0 && item.seq < latestTurn.Load() {
+				continue
+			}
+			if item.final {
+				// Markers pass straight through — the player's
+				// end-of-turn logic is order-sensitive.
+				ttsRenderedCh <- ttsItem{seq: item.seq, final: true}
+				continue
+			}
+
+			text := item.text
+			if pocketBatching {
+				merged, next, open := drainPocketBatch(item)
+				text = merged
+				if next != nil {
+					deferred = next
 				}
-				samples := renderSentence(item.text, item.speed, item.volume, item.seq)
-				if samples == nil {
-					// Superseded while synthesizing.
-					continue
+				if !open {
+					queueClosed = true
 				}
-				ttsRenderedCh <- ttsItem{
-					text: item.text, seq: item.seq, samples: samples,
-				}
+			}
+
+			samples := renderSentence(text, item.speed, item.volume, item.pitch, item.seq)
+			if samples == nil {
+				// Superseded while synthesizing.
+				continue
+			}
+			ttsRenderedCh <- ttsItem{
+				text: text, seq: item.seq, samples: samples,
 			}
 		}
 	}()
@@ -1100,8 +1234,8 @@ func main() {
 				ttsSentCh <- ttsItem{seq: seq, final: true}
 				return
 			}
-			log.Printf("[TTS-FUNC] Enqueuing sentence (len=%d, speed=%.2f, volume=%.2f, turn=%d): %.80s...", len(text), params.Speed, params.Volume, seq, text)
-			speak(text, params.Speed, params.Volume, seq)
+			log.Printf("[TTS-FUNC] Enqueuing sentence (len=%d, speed=%.2f, volume=%.2f, pitch=%.2f, turn=%d): %.80s...", len(text), params.Speed, params.Volume, params.Pitch, seq, text)
+			speak(text, params.Speed, params.Volume, params.Pitch, seq)
 		}
 		interruptCurrent = orch.InterruptCurrent
 		orch.DirectAction = executor.ParseAndExecute // Wire up the legacy highly-reliable regex parser
@@ -1174,11 +1308,13 @@ func main() {
 		bus.Subscribe("action.tts.request", func(event interfaces.Event) {
 			text, _ := event.Payload["text"].(string)
 			speed, _ := event.Payload["speed"].(float32)
+			volume, _ := event.Payload["volume"].(float32)
+			pitch, _ := event.Payload["pitch"].(float32)
 			seq, _ := event.Payload["seq"].(int64)
-			log.Printf("[AGENT] Speaking (speed=%.2f, turn=%d): %s", speed, seq, text)
+			log.Printf("[AGENT] Speaking (speed=%.2f, pitch=%.2f, turn=%d): %s", speed, pitch, seq, text)
 			// One-shot utterance on the legacy bus path: include the end-of-turn
 			// marker so the player finalizes the transcript as soon as it ends.
-			speakTurn(text, speed, 1.0, seq)
+			speakTurn(text, speed, volume, pitch, seq)
 			log.Printf("[FOLLOW-UP] Listening for follow-up (15s window)...")
 		})
 

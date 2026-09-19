@@ -14,11 +14,6 @@ import (
 	"github.com/user/mai/pkg/interfaces"
 )
 
-type ttsItem struct {
-	text  string
-	speed float32
-}
-
 // TestStress_PublishTTSAudioChunk verifies no goroutine or memory leak
 // when publishing many TTS chunks rapidly (simulating streaming TTS).
 func TestStress_PublishTTSAudioChunk(t *testing.T) {
@@ -27,7 +22,7 @@ func TestStress_PublishTTSAudioChunk(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		samples := make([]float32, 2048)
 		for j := range samples {
-			samples[j] = float32(math.Sin(2*math.Pi*0.01*float64(j+i*2048)))
+			samples[j] = float32(math.Sin(2 * math.Pi * 0.01 * float64(j+i*2048)))
 		}
 		publishTTSAudioChunk(nil, samples, 44100, i%50 == 0, false)
 	}
@@ -45,7 +40,7 @@ func TestStress_PublishTTSAudio(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		samples := make([]float32, 32768) // 32k samples
 		for j := range samples {
-			samples[j] = float32(math.Sin(2*math.Pi*0.001*float64(j)))
+			samples[j] = float32(math.Sin(2 * math.Pi * 0.001 * float64(j)))
 		}
 		publishTTSAudio(nil, samples, 44100, i%10 == 0)
 	}
@@ -68,7 +63,7 @@ func TestStress_EchoCanceller(t *testing.T) {
 		// Push reference signal
 		refSig := make([]float32, 512)
 		for j := range refSig {
-			refSig[j] = float32(math.Sin(2*math.Pi*0.01*float64(j+i*512)))
+			refSig[j] = float32(math.Sin(2 * math.Pi * 0.01 * float64(j+i*512)))
 		}
 		ref.Push(refSig)
 
@@ -94,7 +89,7 @@ func TestStress_Resampler(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		chunk := make([]float32, 1024)
 		for j := range chunk {
-			chunk[j] = float32(math.Sin(2*math.Pi*0.01*float64(j+i*1024)))
+			chunk[j] = float32(math.Sin(2 * math.Pi * 0.01 * float64(j+i*1024)))
 		}
 		_ = rs.resample(chunk)
 	}

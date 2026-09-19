@@ -131,9 +131,31 @@ tts:
   output_sample_rate: 44100  # Supertonic outputs 44.1kHz, Pocket/ZipVoice may differ
 
   # Select active model: "supertonic" | "pocket" | "zipvoice" | "kokoro"
-  active_model: "supertonic"
+  active_model: "pocket"
   voice_style: "calm"  # Matches new prompt: calm, measured, quietly warm (was "soft"/kuudere)
   base_speed: 1.0  # Baseline speech rate. Lower = warmer/calmer; 1.0 plugs a measured voice (was 1.05).
+  # output_gain: makeup gain applied to every synthesized sample, AFTER the
+  # style/emotion volume. A style preset can only ever attenuate, and Pocket
+  # ignores `speed` completely (its ONNX impl never reads it), so "calm" would
+  # otherwise do nothing to Pocket except make her 10% quieter. 1.11 exactly
+  # cancels the 0.9 volume that "calm" applies. Keep <= ~1.4: the sample clamp
+  # is per-sample, so a model whose raw output already peaks near full scale
+  # would clip on the "excited" emotion path (volume 1.2).
+  output_gain: 1.11
+  # pitch_shift: emotion/style pitch shaping. Pocket ignores speed entirely, so
+  # pitch is the only expressive lever it has, and unlike speed this is applied
+  # to the decoded audio so it works on EVERY model. OFF by default: per-sentence
+  # pitch changes trade vocal consistency for expression, and a clone is
+  # recognised by its consistency. Turn on if you want the style's pitch
+  # ("calm" = 0.95, "warm" = 1.05) to actually shape the voice.
+  pitch_shift: false
+  # exciter_amount: brightness. Pocket is a 24 kHz model, so everything above
+  # ~12 kHz is simply absent — that IS the "dulled / toned down" sound, and no
+  # filter or gain can put it back. This synthesises harmonics from the band the
+  # model did produce and folds them into the air band, which restores perceived
+  # brightness. It is a psychoacoustic enhancement, not the reference's real top
+  # end. Start around 0.25; raise for more air, set 0 to disable.
+  exciter_amount: 0.25
 
   supertonic:
     model_dir: "sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
@@ -174,6 +196,22 @@ tts:
     vocab_json: "vocab.json"
     token_scores_json: "token_scores.json"
     voice_embedding_cache_capacity: 50
+    # Pocket's flow-matching sampler draws Gaussian noise for every frame, so it
+    # is stochastic. Left unset, sherpa's defaults (temperature 0.7, random
+    # seed) give the same sentence a different timbre AND a different loudness
+    # every time — measured peak 0.37 vs 0.56 for identical input. For a cloned
+    # voice that reads as "she doesn't sound like the reference". Pin it:
+    temperature: 0.7
+    seed: 42            # any fixed integer; set to -1 to go back to random
+    # Batch the sentences the LLM streaming handoff produces into ONE synthesis
+    # call. Pocket pays a large fixed cost per call (fresh LM state + EOS
+    # search), so measured realtime factor on this machine was:
+    #   6 chars -> 1.13x   24 chars -> 2.04x   61 chars -> 2.23x   100 chars -> 2.20x
+    # One sentence at a time left Pocket barely ahead of playback (silent gaps
+    # between sentences); merging the sentences already queued amortizes the
+    # cost, and the drain is non-blocking so first-audio latency is unchanged.
+    batch_sentences: true
+    batch_max_chars: 160
 
   zipvoice:
     model_dir: "sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"
@@ -189,12 +227,19 @@ tts:
 
   voice_cloning:
     enabled: true
-    model: "pocket"  # "pocket" or "zipvoice" (supertonic does NOT support cloning)
-    # Sherpa Pocket requires a standard PCM16 WAV reference.
+    # Sherpa Pocket requires a standard PCM16 WAV reference. Pocket has no
+    # built-in voice, so without a readable reference it generates SILENCE and
+    # the assistant starts up mute. mai-san-pcm.wav is 24 kHz stereo PCM16,
+    # 34.76 s, dual-mono (the L/R downmix is lossless).
     reference_audio: "./mai-san-pcm.wav"
     reference_text: ""  # Only for ZipVoice. Empty = auto-detect
-    max_reference_audio_len: 10.0
-    seed: 42
+    # How much of the reference the voice encoder is allowed to see. This is a
+    # fidelity/conditioning trade-off, not a latency one: the encoded voice is
+    # cached (voice_embedding_cache_capacity) so the encoder runs once, and
+    # raising 10 -> full measured the same realtime factor (1.9x). Every second
+    # of mai-san-pcm.wav is speech (per-second RMS -18 to -30 dBFS, no silence),
+    # so a low cap only throws away conditioning data.
+    max_reference_audio_len: 30.0
     
 llm:
   # MODE: false = 100% local (Ollama) | true = Hybrid (cloud + local guardrail)
