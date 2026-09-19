@@ -32,6 +32,17 @@ func (r *speakerRef) Push(samples []float32) {
 	}
 }
 
+// Clear removes any stale playback history so the next utterance starts from a
+// clean echo reference instead of inheriting the previous turn's speaker audio.
+func (r *speakerRef) Clear() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := range r.buf {
+		r.buf[i] = 0
+	}
+	r.write = 0
+}
+
 // recent returns the last n samples (oldest-first).
 func (r *speakerRef) recent(n int) []float32 {
 	if n > len(r.buf) {
@@ -50,16 +61,16 @@ func (r *speakerRef) recent(n int) []float32 {
 	return out
 }
 
-// resampler does linear-interpolation sample-rate conversion. It carries
-// fractional state between calls so it can be fed streaming chunks.
+// resampler does 4-point Catmull-Rom cubic Hermite spline sample-rate
+// conversion. It preserves high-frequency treble without the high-frequency
+// droop of linear interpolation, and carries fractional/history state across chunks.
 type resampler struct {
-	// step is the number of input samples represented by one output sample.
-	// Keeping the phase in input-sample units avoids extrapolating when the
-	// output rate is higher than the input rate.
 	step  float64
 	phase float64
-	prev  float32
-	has   bool
+	p0    float32
+	p1    float32
+	p2    float32
+	has   int
 }
 
 func newResampler(inRate, outRate int) *resampler {
@@ -75,24 +86,46 @@ func (r *resampler) resample(in []float32) []float32 {
 		copy(out, in)
 		return out
 	}
-	out := make([]float32, 0, int(float64(len(in))/r.step)+2)
+	out := make([]float32, 0, int(float64(len(in))/r.step)+4)
 	start := 0
-	if !r.has {
-		r.prev = in[0]
-		r.has = true
-		start = 1
+
+	// Seed history buffer on initial call
+	for r.has < 3 && start < len(in) {
+		s := in[start]
+		start++
+		switch r.has {
+		case 0:
+			r.p0, r.p1, r.p2 = s, s, s
+			r.has = 1
+		case 1:
+			r.p1, r.p2 = s, s
+			r.has = 2
+		case 2:
+			r.p2 = s
+			r.has = 3
+		}
 	}
+
 	for i := start; i < len(in); i++ {
-		curr := in[i]
+		p3 := in[i]
+		p0, p1, p2 := r.p0, r.p1, r.p2
+
+		// Catmull-Rom cubic coefficients for segment between p1 and p2
+		c0 := p1
+		c1 := 0.5 * (p2 - p0)
+		c2 := p0 - 2.5*p1 + 2.0*p2 - 0.5*p3
+		c3 := 0.5*(p3-p0) + 1.5*(p1-p2)
+
 		for r.phase < 1 {
 			t := float32(r.phase)
-			out = append(out, r.prev*(1-t)+curr*t)
+			v := ((c3*t+c2)*t+c1)*t + c0
+			out = append(out, v)
 			r.phase += r.step
 		}
-		// One input interval has been consumed. Any remaining phase carries
-		// into the next interval, including across streaming calls.
 		r.phase -= 1
-		r.prev = curr
+		r.p0 = p1
+		r.p1 = p2
+		r.p2 = p3
 	}
 	return out
 }
@@ -116,8 +149,7 @@ func NewEchoCanceller(L int) *EchoCanceller {
 		ref: refBuffer,
 		L:   L,
 		w:   make([]float32, L),
-		mu:  0.25, // faster convergence: the echo path must be learned within the
-		// barge-in warmup window, before detection arms
+		mu:  0.5, // fast convergence: echo path learned rapidly during initial frames
 		eps: 1e-4,
 	}
 }
@@ -145,12 +177,38 @@ func (e *EchoCanceller) Process(frame []float32) []float32 {
 	refWin := e.ref.recent(e.L + n)
 	out := make([]float32, n)
 	L := e.L
+	if len(refWin) < L+n {
+		copy(out, frame)
+		return out
+	}
+
+	var norm float32
+	for k := 0; k < L; k++ {
+		xk := refWin[k]
+		norm += xk * xk
+	}
+
 	for i := 0; i < n; i++ {
-		var y, norm float32
+		if i > 0 {
+			if i%128 == 0 {
+				norm = 0
+				for k := 0; k < L; k++ {
+					xk := refWin[i+k]
+					norm += xk * xk
+				}
+			} else {
+				prevX := refWin[i-1]
+				newX := refWin[i+L-1]
+				norm += newX*newX - prevX*prevX
+				if norm < 0 {
+					norm = 0
+				}
+			}
+		}
+
+		var y float32
 		for k := 0; k < L; k++ {
-			xk := refWin[i+k]
-			y += e.w[k] * xk
-			norm += xk * xk
+			y += e.w[k] * refWin[i+k]
 		}
 		res := frame[i] - y
 		out[i] = res

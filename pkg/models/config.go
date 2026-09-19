@@ -18,8 +18,8 @@ type Config struct {
 	// hum — from reaching the wake-word spotter, VAD and ASR as speech.
 	Denoise struct {
 		Enabled        bool    `yaml:"enabled"`
-		Model          string  `yaml:"model"`      // Streaming DPDFNet ONNX export (profile dpdfnet_16khz)
-		Provider       string  `yaml:"provider"`   // "cpu", "cuda", "coreml", "opencl"
+		Model          string  `yaml:"model"`    // Streaming DPDFNet ONNX export (profile dpdfnet_16khz)
+		Provider       string  `yaml:"provider"` // "cpu", "cuda", "coreml", "opencl"
 		NumThreads     int     `yaml:"num_threads"`
 		SpeechRatioMin float64 `yaml:"speech_ratio_min"` // Denoised/raw energy ratio below which a frame is noise, not speech
 	} `yaml:"denoise"`
@@ -120,7 +120,31 @@ type Config struct {
 		OutputSampleRate int     `yaml:"output_sample_rate"`
 		TTSVoiceStyle    string  `yaml:"voice_style"` // Optional: "calm", "warm", "energetic", "serious", "soft"
 		BaseSpeed        float32 `yaml:"base_speed"`  // Baseline speech rate; lower = warmer/calmer (supertonic only honors speed)
-		Supertonic       struct {
+		// OutputGain is a makeup gain applied to every synthesized sample after
+		// the style/emotion volume. Style presets attenuate ("calm" = 0.9), and
+		// a model that ignores speed (Pocket does) can only ever get quieter
+		// from a style, so this is the knob that restores the level. <=0 = 1.0.
+		OutputGain float32 `yaml:"output_gain"`
+		// PitchShift enables emotion/style pitch shaping. Pocket ignores speed
+		// entirely, so pitch is the only expressive lever it has; the shift is
+		// applied to the decoded audio and therefore works on every model. Off
+		// by default because per-sentence pitch changes trade vocal consistency
+		// for expression, and consistency is what makes a clone recognisable.
+		PitchShift bool `yaml:"pitch_shift"`
+		// ExciterAmount mixes synthesised harmonics of the voice's presence band
+		// into the air band, restoring perceived brightness on a band-limited
+		// model (Pocket is 24 kHz, so it has no real top end). 0 = off.
+		ExciterAmount float32 `yaml:"exciter_amount"`
+		// NormalizeLoudness brings every utterance's active speech to
+		// TargetLoudnessDBFS. Style presets and the engine itself set only the
+		// absolute sample level, and Pocket's is ~9 dB low (measured -25.3
+		// dBFS), so without this the whole voice is quiet no matter how the
+		// preset is tuned. nil = enabled.
+		NormalizeLoudness *bool `yaml:"normalize_loudness"`
+		// TargetLoudnessDBFS is the loudness normalisation target in dBFS
+		// (-16 is normal program level). >=0 = -16.
+		TargetLoudnessDBFS float64 `yaml:"target_loudness_dbfs"`
+		Supertonic         struct {
 			ModelDir          string  `yaml:"model_dir"`
 			DurationPredictor string  `yaml:"duration_predictor"`
 			TextEncoder       string  `yaml:"text_encoder"`
@@ -160,8 +184,24 @@ type Config struct {
 			TokenScoresJson string  `yaml:"token_scores_json"`
 			Precision       string  `yaml:"precision"`
 			Temperature     float32 `yaml:"temperature"`
-			LSDSteps        int     `yaml:"lsd_steps"`
-			Voice           string  `yaml:"voice"`
+			// Seed makes the flow-matching noise deterministic. Pocket samples
+			// noise every frame, so without a fixed seed the same sentence comes
+			// out with a different timbre and level each time. nil keeps the
+			// engine default (random).
+			Seed *int `yaml:"seed"`
+			// BatchSentences merges the sentences the LLM streaming handoff
+			// produces into a single synthesis call. Pocket pays a large fixed
+			// cost per call (fresh LM state + EOS search), so several short
+			// sentences synthesized together are far faster in aggregate than
+			// one at a time. nil means enabled for Pocket.
+			BatchSentences *bool `yaml:"batch_sentences"`
+			BatchMaxChars  int   `yaml:"batch_max_chars"` // Character budget per merged request; <=0 = 160
+			// VoiceEmbeddingCacheCapacity caches the encoded reference voice so
+			// the encoder runs once per reference instead of once per sentence.
+			// <=0 = sherpa's own default (50).
+			VoiceEmbeddingCacheCapacity int    `yaml:"voice_embedding_cache_capacity"`
+			LSDSteps                    int    `yaml:"lsd_steps"`
+			Voice                       string `yaml:"voice"`
 		} `yaml:"pocket"`
 		ZipVoice struct {
 			ModelDir string `yaml:"model_dir"`
@@ -174,7 +214,6 @@ type Config struct {
 		} `yaml:"zipvoice"`
 		VoiceCloning struct {
 			Enabled              bool    `yaml:"enabled"`
-			Model                string  `yaml:"model"`
 			ReferenceAudio       string  `yaml:"reference_audio"`
 			ReferenceText        string  `yaml:"reference_text"`
 			MaxReferenceAudioLen float32 `yaml:"max_reference_audio_len"`

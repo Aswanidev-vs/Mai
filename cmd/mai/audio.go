@@ -99,6 +99,41 @@ func (c *audioCapture) onRecvFrames(_, pSample []byte, frameCount uint32) {
 	c.onSamples(samples)
 }
 
+// pcm16 converts one float sample to the 16-bit PCM the device plays.
+//
+// The clamping is not cosmetic: Go's int16 conversion WRAPS on overflow, so a
+// sample above full scale used to come out as the opposite sign at full
+// amplitude. A single such sample is a full-scale click, which is exactly what
+// intermittent crackle in the output sounds like.
+func pcm16(s float32) int16 {
+	v := float64(s) * 32767.0
+	if v > 32767 {
+		return 32767
+	}
+	if v < -32768 {
+		return -32768
+	}
+	return int16(v)
+}
+
+// writePCMFrame writes one sample into a stereo-interleaved-free mono frame.
+func writePCMFrame(dst []byte, frame int, s float32) {
+	v := pcm16(s)
+	dst[frame*2] = byte(v & 0xFF)
+	dst[frame*2+1] = byte(v >> 8) // arithmetic shift = correct two's complement high byte
+}
+
+// fillSilence writes zeros for frames [from, to). Every frame of the device
+// buffer must be written on every callback: miniaudio hands back its internal
+// buffer as-is, so leaving frames untouched re-plays a slice of the previous
+// callback — heard as a click or a short burst of stale audio.
+func fillSilence(dst []byte, from, to int) {
+	for i := from; i < to; i++ {
+		dst[i*2] = 0
+		dst[i*2+1] = 0
+	}
+}
+
 // playAudioStreaming plays TTS chunks as they arrive on a channel.
 // The generator function is called in a goroutine and should send
 // float32 sample slices into the returned channel, then close it when done.
@@ -129,14 +164,15 @@ func playAudioStreaming(ctx context.Context, sampleRate int, stop *int32, genera
 	var streamDone bool
 	cond := sync.NewCond(&mu)
 
-	rs := newResampler(44100, 16000) // TTS is played at 44.1k; reference must match the 16k mic.
+	rs := newResampler(sampleRate, 16000) // Reference ring must match the 16k mic rate.
 	onSamples := func(pOutputSample, _ []byte, frameCount uint32) {
+		n := int(frameCount)
 		if stop != nil && atomic.LoadInt32(stop) != 0 {
+			fillSilence(pOutputSample, 0, n)
 			return
 		}
 		mu.Lock()
 		start := readIdx
-		n := int(frameCount)
 		written := 0
 		for written < n {
 			if readIdx >= len(buf) {
@@ -147,13 +183,14 @@ func playAudioStreaming(ctx context.Context, sampleRate int, stop *int32, genera
 				cond.Wait()
 				continue
 			}
-			s := buf[readIdx]
+			writePCMFrame(pOutputSample, written, buf[readIdx])
 			readIdx++
-			s16 := int16(s * 32767.0)
-			pOutputSample[written*2] = byte(s16 & 0xFF)
-			pOutputSample[written*2+1] = byte(s16 >> 8)
 			written++
 		}
+		// Underrun, barge-in or end of stream: the frames this callback found no
+		// audio for are still played by the device, so they must be silence
+		// rather than whatever the previous callback left in the buffer.
+		fillSilence(pOutputSample, written, n)
 		// Feed exactly the samples sent to the speaker into the echo reference.
 		if written > 0 {
 			refBuffer.Push(rs.resample(buf[start:readIdx]))
@@ -241,25 +278,39 @@ func playAudio(ctx context.Context, samples []float32, sampleRate int, stop *int
 	deviceConfig.Playback.Channels = 1
 	deviceConfig.SampleRate = uint32(sampleRate)
 
+	var rs *resampler
+	if sampleRate != 16000 {
+		rs = newResampler(sampleRate, 16000)
+	}
+
 	var playbackIndex int
 	onSamples := func(pOutputSample, _ []byte, frameCount uint32) {
+		n := int(frameCount)
 		if stop != nil && atomic.LoadInt32(stop) != 0 {
+			fillSilence(pOutputSample, 0, n)
 			return // Stop playback immediately on barge-in
 		}
-		n := int(frameCount)
 		start := playbackIndex
-		for i := 0; i < n; i++ {
+		written := 0
+		for written < n {
 			if playbackIndex >= len(samples) {
-				return
+				break
 			}
-			s16 := int16(samples[playbackIndex] * 32767.0)
-			pOutputSample[i*2] = byte(s16 & 0xFF)
-			pOutputSample[i*2+1] = byte(s16 >> 8)
+			writePCMFrame(pOutputSample, written, samples[playbackIndex])
 			playbackIndex++
+			written++
 		}
+		// End of buffer: the remaining frames must be silence, not the previous
+		// callback's contents.
+		fillSilence(pOutputSample, written, n)
 		// Chime also leaves the speaker, so include it in the echo reference.
 		if playbackIndex > start {
-			refBuffer.Push(samples[start:playbackIndex])
+			played := samples[start:playbackIndex]
+			if rs != nil {
+				refBuffer.Push(rs.resample(played))
+			} else {
+				refBuffer.Push(played)
+			}
 		}
 	}
 

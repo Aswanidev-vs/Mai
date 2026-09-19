@@ -1577,10 +1577,11 @@ func (o *Orchestrator) publishTTS(text string) {
 		Type:   "action.tts.request",
 		Source: "agent.orchestrator",
 		Payload: map[string]interface{}{
-			"text":  text,
-			"speed": ttsParams.Speed,
-			"pitch": ttsParams.Pitch,
-			"seq":   seq,
+			"text":   text,
+			"speed":  ttsParams.Speed,
+			"volume": ttsParams.Volume,
+			"pitch":  ttsParams.Pitch,
+			"seq":    seq,
 		},
 	})
 }
@@ -1626,9 +1627,10 @@ func (o *Orchestrator) handleTranscription(event interfaces.Event) {
 			Type:   "action.tts.request",
 			Source: "agent.orchestrator",
 			Payload: map[string]interface{}{
-				"text":  resp.Text,
-				"speed": ttsParams.Speed,
-				"pitch": ttsParams.Pitch,
+				"text":   resp.Text,
+				"speed":  ttsParams.Speed,
+				"volume": ttsParams.Volume,
+				"pitch":  ttsParams.Pitch,
 			},
 		})
 	}
