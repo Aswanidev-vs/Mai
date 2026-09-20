@@ -154,8 +154,13 @@ tts:
   # filter or gain can put it back. This synthesises harmonics from the band the
   # model did produce and folds them into the air band, which restores perceived
   # brightness. It is a psychoacoustic enhancement, not the reference's real top
-  # end. Start around 0.25; raise for more air, set 0 to disable.
-  exciter_amount: 0.45
+  # end. Measured on the clone: 0.45 put ~7x the reference air-band share into the
+  # output and read as harsh/sharp, so this ships at 0.25 (the original
+  # start-here value; measured air share 1.7%, peak unchanged). Raise for more
+  # air, set 0 to disable.
+  # exciter_amount: 0.25
+  exciter_amount: 0.0
+
   # normalize_loudness: bring every utterance's active speech to
   # target_loudness_dbfs before the emotion volume is applied. This is the fix
   # for "the volume is at 100% but she still sounds quiet": measured Pocket
@@ -165,7 +170,8 @@ tts:
   # limiter replaces the old per-sample hard clamp, so loud consonants compress
   # instead of crackling, and no sample can exceed the ceiling.
   normalize_loudness: true
-  target_loudness_dbfs: -16.0  # normal program level; -14 is louder, -20 quieter
+  # target_loudness_dbfs: -16.0  # normal program level; -14 is louder, -20 quieter
+  target_loudness_dbfs: -18.0  # normal program level; -14 is louder, -20 quieter
 
   supertonic:
     model_dir: "sherpa-onnx-supertonic-3-tts-int8-2026-05-11"

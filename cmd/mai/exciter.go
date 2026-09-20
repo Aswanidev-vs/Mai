@@ -235,10 +235,12 @@ func colourVoice(samples []float32, cfg colourConfig) []float32 {
 	out := pitchShift(samples, float64(cfg.pitch))
 	out = applyExciter(out, cfg.exciter.sampleRate, cfg.exciter)
 
-	// Presence & clarity enhancement (3.8 kHz +2.2 dB bell EQ):
-	// active when exciter is enabled to elevate consonant crispness and articulation.
+	// Presence & clarity enhancement (3.8 kHz bell EQ): active when the exciter
+	// is enabled to elevate consonant crispness and articulation. Capped at
+	// +1 dB: Pocket's voiced band already reaches 12 kHz, so more gain here only
+	// sharpens sibilants past what a human voice has.
 	if cfg.exciter.amount > 0 && cfg.sampleRate >= 16000 {
-		eq := biquadPeaking(cfg.sampleRate, 3800, 2.2, 1.2)
+		eq := biquadPeaking(cfg.sampleRate, 3800, 1.0, 1.2)
 		clarity := make([]float32, len(out))
 		for i, s := range out {
 			clarity[i] = float32(eq.process(float64(s)))
