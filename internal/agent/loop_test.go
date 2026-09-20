@@ -23,6 +23,20 @@ func TestTakeSentenceKeepsEllipsisTogether(t *testing.T) {
 	assert.Equal(t, "That makes sense.", second)
 }
 
+func TestTakeSentenceNaturalClauses(t *testing.T) {
+	var buf strings.Builder
+	// Should not split at "relax or do" / "chores."
+	buf.WriteString("You're asking me this at 2:40 PM on Sunday when most people are probably trying to relax or do chores. It makes you wonder.")
+
+	first, ok := takeSentence(&buf)
+	assert.True(t, ok)
+	assert.Equal(t, "You're asking me this at 2:40 PM on Sunday when most people are probably trying to relax or do chores.", first)
+
+	second, ok := takeSentence(&buf)
+	assert.True(t, ok)
+	assert.Equal(t, "It makes you wonder.", second)
+}
+
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
