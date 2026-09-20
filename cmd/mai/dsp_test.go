@@ -419,7 +419,54 @@ func TestLoudnessNormalisationFixesQuietEngineOutput(t *testing.T) {
 	t.Log("[LOUDNESS] silence is not amplified")
 }
 
-// TestLimiterCompressesInsteadOfWrapping is the regression test for the
+// TestLoudnessLeavesUnspeakableEngineOutputAlone pins the other half of the
+// contract: an utterance the engine did not really speak must not have the
+// +12 dB cap spent on it. Measured Pocket failures — a lone "..." fragment, or
+// an early EOS that leaves a sub-second lead-in blip — come back at rms 0.0018
+// (-55 dBFS) with a peak near 0.011, and normalising that just raises the
+// model's noise floor, which makes the [TTS-LEVEL] line read as a level problem
+// when it is really a failed generation.
+func TestLoudnessLeavesUnspeakableEngineOutputAlone(t *testing.T) {
+	const sr = 24000
+	target := dbfsToLinear(voiceTargetRMSDefault)
+
+	// 0.56 s with a single short blip: the shape the logging captured.
+	failed := make([]float32, sr*56/100)
+	for i := 4000; i < 5000; i++ {
+		failed[i] = float32(0.011 * math.Sin(2*math.Pi*300*float64(i)/float64(sr)))
+	}
+	if gain, ok := loudnessGain(failed, sr, target); ok {
+		t.Errorf("failed generation was normalised at %.2fx (%+.1f dB); want it left alone",
+			gain, 20*math.Log10(gain))
+	}
+	out := normalizeLoudness(failed, sr, target)
+	for i := range failed {
+		if out[i] != failed[i] {
+			t.Fatalf("sample %d changed (%v -> %v); a failed generation must pass through untouched",
+				i, failed[i], out[i])
+		}
+	}
+	t.Logf("[LOUDNESS] failed generation (peak %.3f) passes through unamplified", peakAbs(failed))
+
+	// The guard must not swallow genuinely quiet speech: 20 dB below the target
+	// still normalises, capped as always at the +12 dB maximum.
+	quiet := sine(sr, 1.0, 220, 700, 1600)
+	scale := 0.0158 / rmsLevelInTest(quiet) // ~20 dB below the -16 dBFS target
+	for i := range quiet {
+		quiet[i] = float32(float64(quiet[i]) * scale)
+	}
+	gain, ok := loudnessGain(quiet, sr, target)
+	if !ok {
+		t.Fatalf("genuinely quiet speech (rms %.4f) was treated as a failed generation", rmsLevelInTest(quiet))
+	}
+	if gain != voiceMaxGain {
+		t.Errorf("quiet speech gained %.2fx (%+.1f dB), want the %.1fx cap",
+			gain, 20*math.Log10(gain), voiceMaxGain)
+	}
+	t.Logf("[LOUDNESS] quiet-but-real speech (rms %.4f) still normalises at the %+.1f dB cap",
+		rmsLevelInTest(quiet), 20*math.Log10(gain))
+}
+
 // distortion path: colourVoice used to hard-clip each sample, and any sample
 // that escaped above 1.0 wrapped sign in the PCM16 conversion — a full-scale
 // click rather than a loud sample.

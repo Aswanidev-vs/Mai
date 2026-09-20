@@ -501,7 +501,40 @@ type ttsEvent struct {
 	final bool
 }
 
-// TestTTSTurnLifecycle pins the contract the TTS player relies on to keep the
+// TestPublishTTSDropsUnspeakableFragments pins the guard on the fragment class a
+// drifting model produces: takeSentence deliberately keeps "..." together as one
+// segment, stripFormattingForVoice leaves punctuation intact, and Pocket answers
+// a lone "..." with its 40 s maximum (measured ~30 s of CPU, most of it silence
+// glitched with short bursts). The fragment must not reach the engine, and must
+// not open a turn either — the player would then hold a turn open waiting for a
+// sentence that was never spoken.
+func TestPublishTTSDropsUnspeakableFragments(t *testing.T) {
+	o := &Orchestrator{
+		emotion:    personality.NewEmotionDetector(),
+		ttsAdapter: personality.NewTTSAdapter(1.25, 1, 1),
+	}
+	var got []ttsEvent
+	o.TTSFunc = func(text string, _ personality.TTSParams, seq int64, final bool) {
+		got = append(got, ttsEvent{text: text, seq: seq, final: final})
+	}
+
+	for _, fragment := range []string{"...", ".", "-", "…", "—", "?!", "   "} {
+		o.publishTTS(fragment)
+	}
+	assert.Empty(t, got, "an unpronounceable fragment must not reach the engine")
+
+	// Speakable text still goes through, in a turn of its own.
+	o.publishTTS("Right.")
+	o.endTTSTurn()
+	if !assert.Len(t, got, 2) {
+		return
+	}
+	assert.Equal(t, "Right.", got[0].text)
+	assert.False(t, got[0].final)
+	assert.True(t, got[1].final, "the speakable sentence still closes its turn")
+	assert.Equal(t, got[0].seq, got[1].seq)
+}
+
 // transcript, the voice and the viseme clock on one timeline: every sentence of
 // a reply shares a single turn id, and the turn is closed by exactly one
 // explicit end-of-turn marker instead of the player inferring the end of the

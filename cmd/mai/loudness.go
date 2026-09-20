@@ -17,8 +17,17 @@ const (
 	voiceTargetRMSDefault = -16.0 // dBFS
 	voiceMinGain          = 0.5   // never attenuate by more than 6 dB
 	voiceMaxGain          = 4.0   // +12 dB, enough for the measured 9.3 dB deficit
-	limiterKnee           = 0.70
-	limiterCeiling        = 0.95
+	// An utterance that needs more gain than this is not speech. Measured Pocket
+	// failures (a lone "..." fragment, or an early EOS that leaves a sub-second
+	// lead-in blip) come back 30 dB or more below the target with the loudest
+	// sample in the whole buffer around 0.01. Normalising that spends the full
+	// +12 dB cap on the model's noise floor, which dresses a failed generation up
+	// as a merely quiet utterance — in the audio and in the [TTS-LEVEL] log
+	// alike. Real sentences from the same engine measure 1.3-3.7x, so 16x
+	// (+24 dB) cannot catch speech.
+	voiceUnreachableGain = voiceMaxGain * 4
+	limiterKnee          = 0.70
+	limiterCeiling       = 0.95
 	// Frames quieter than this fraction of the loudest frame are silence and are
 	// excluded from the loudness measurement. Pocket pads utterances with
 	// silence, and averaging over that padding would over-boost the speech.
@@ -49,9 +58,10 @@ func normalizeLoudness(samples []float32, sampleRate int, targetRMS float64) []f
 }
 
 // loudnessGain reports the scale factor that brings the utterance's active
-// speech to targetRMS. It returns false for a silent utterance, which must not
-// be normalised: amplifying near-silence would put the room noise floor at the
-// target level.
+// speech to targetRMS. It returns false for an utterance that must not be
+// normalised: digital silence, or a buffer sitting so far below the target that
+// amplifying it would only raise the engine's noise floor (voiceUnreachableGain)
+// — which is what a failed generation looks like coming out of the engine.
 func loudnessGain(samples []float32, sampleRate int, targetRMS float64) (float64, bool) {
 	frame := sampleRate / 100 // 10 ms
 	if frame < 1 {
@@ -90,7 +100,11 @@ func loudnessGain(samples []float32, sampleRate int, targetRMS float64) (float64
 	if activeRMS < 1e-6 {
 		return 0, false
 	}
-	return math.Max(voiceMinGain, math.Min(voiceMaxGain, targetRMS/activeRMS)), true
+	needed := targetRMS / activeRMS
+	if needed > voiceUnreachableGain {
+		return 0, false
+	}
+	return math.Max(voiceMinGain, math.Min(voiceMaxGain, needed)), true
 }
 
 // softLimit bounds a sample to limiterCeiling through a C1-continuous knee, so

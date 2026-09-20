@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/user/mai/internal/cognition"
 	"github.com/user/mai/internal/memory"
@@ -1518,6 +1519,16 @@ func (o *Orchestrator) endTTSTurn() {
 }
 
 func (o *Orchestrator) publishTTS(text string) {
+	// A fragment with no letter or digit in it cannot be spoken, and handing one
+	// to the engine is not free: measured on this machine, a lone "..." (or ".",
+	// "-", "…", "Hm.") makes Pocket answer with its 40 s maximum — ~30 s of CPU
+	// on a queue that serializes every sentence, mostly silence glitched with
+	// short bursts — while the transcript announces text the user never hears.
+	// Every spoken path (streamed sentences, greetings, proactive lines) and the
+	// transcript both funnel through here, so this one check covers them.
+	if !speakableText(text) {
+		return
+	}
 	seq := o.ttsTurnID()
 	o.lastSpoken = strings.ToLower(text)
 	o.lastSpokenAt = time.Now()
@@ -1783,6 +1794,21 @@ func cleanResponse(s string) string {
 	}
 
 	return strings.TrimSpace(s)
+}
+
+// speakableText reports whether cleaned text contains anything a TTS engine can
+// pronounce. Punctuation-only fragments ("...", "—", "…") survive
+// stripFormattingForVoice, so they used to reach the engine as a whole
+// utterance. A letter or digit is the cheapest reliable test for "there is
+// something to say": pocket TTS answers a fragment with 40 s of glitched
+// near-silence, and no model can do anything better with it.
+func speakableText(s string) bool {
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // stripFormattingForVoice removes markdown-ish artifacts a drifting model may
