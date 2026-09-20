@@ -882,11 +882,22 @@ func main() {
 			exciter:    exciterCfg,
 		})
 		// Level diagnostics: without these, "quiet", "clipping" and "too quiet
-		// to hear" are indistinguishable in the logs.
-		log.Printf("[TTS-LEVEL] raw rms=%.4f (%.1f dBFS) peak=%.3f -> out rms=%.4f (%.1f dBFS) peak=%.3f | %.2fs @ %d Hz",
+		// to hear" are indistinguishable in the logs. The gain is the
+		// normaliser's own verdict on this utterance: a value pinned at the
+		// +12 dB cap means the engine came back quieter than normalisation can
+		// rescue, and "skipped" means it found no speech at all — neither of
+		// which the raw/out levels alone can tell apart.
+		gainNote := "off"
+		if voiceTargetRMS > 0 {
+			gainNote = "skipped (no speech in engine output)"
+			if gain, ok := loudnessGain(out, ttsSampleRate, voiceTargetRMS); ok {
+				gainNote = fmt.Sprintf("%.2fx (%+.1f dB)", gain, 20*math.Log10(gain))
+			}
+		}
+		log.Printf("[TTS-LEVEL] raw rms=%.4f (%.1f dBFS) peak=%.3f -> out rms=%.4f (%.1f dBFS) peak=%.3f | gain %s | %.2fs @ %d Hz",
 			rmsLevel(out), levelDBFS(rmsLevel(out)), peakOf(out),
 			rmsLevel(rendered), levelDBFS(rmsLevel(rendered)), peakOf(rendered),
-			float64(len(rendered))/float64(ttsSampleRate), ttsSampleRate)
+			gainNote, float64(len(rendered))/float64(ttsSampleRate), ttsSampleRate)
 		return rendered
 	}
 

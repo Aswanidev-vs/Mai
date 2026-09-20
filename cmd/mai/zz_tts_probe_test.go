@@ -141,6 +141,19 @@ func probeStats(t *testing.T, label string, samples []float32, sampleRate int, w
 		label, sampleRate, dur, rms, 20*math.Log10(rms), peak, wall.Seconds(), dur/wall.Seconds())
 }
 
+// probeAssertStatsVisible is a placeholder visibility hook: sherpa's per-op
+// timings only surface through its own oplog (if the DLL build emits one), so
+// the Go side just reports whether that log exists alongside the go-side ratio.
+func probeAssertStatsVisible(t *testing.T, goLog string) {
+	t.Helper()
+	oplog := filepath.Join(probeRepoRoot(), "sherpa-onnx-pocket-tts-2026-01-26", "oplog.txt")
+	if data, err := os.ReadFile(oplog); err == nil {
+		t.Logf("[MA-VIS] sherpa oplog.txt present (%d bytes) — per-op timings in the file", len(data))
+	} else {
+		t.Logf("[MA-VIS] no sherpa oplog.txt: per-op timings unavailable (dll lacks MaInvoke? use assertVisible path)")
+	}
+	t.Logf("[MA-VIS] go-side ratio: %s", goLog)
+}
 func probePocket(t *testing.T, label, dir string, int8 bool, ref []float32, refRate int, extra string) {
 	t.Helper()
 	sfx := ""
@@ -416,7 +429,11 @@ func TestProbeConfigPocketKnobsLoad(t *testing.T) {
 		want any
 	}{
 		{"tts.output_gain", cfg.TTS.OutputGain, float32(1.11)},
-		{"tts.pocket.temperature", cfg.TTS.Pocket.Temperature, float32(0.7)},
+		// Temperature was lowered 0.7 -> 0.6 to tighten clone consistency across
+		// sentences; exciter_amount 0.45 -> 0.25 softened the harsh edge
+		// (measured air-band share was ~7x the reference's).
+		{"tts.pocket.temperature", cfg.TTS.Pocket.Temperature, float32(0.6)},
+		{"tts.exciter_amount", cfg.TTS.ExciterAmount, float32(0.25)},
 		{"tts.pocket.batch_max_chars", cfg.TTS.Pocket.BatchMaxChars, 160},
 		{"tts.pocket.voice_embedding_cache_capacity", cfg.TTS.Pocket.VoiceEmbeddingCacheCapacity, 50},
 		{"tts.voice_cloning.max_reference_audio_len", cfg.TTS.VoiceCloning.MaxReferenceAudioLen, float32(30)},

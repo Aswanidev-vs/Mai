@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/user/mai/internal/cognition"
 	"github.com/user/mai/internal/memory"
@@ -1281,53 +1282,88 @@ func detectAction(lower string) string {
 	return ""
 }
 
-// takeSentence extracts the next complete sentence from buf, mutating buf to
-// remove what it took. A sentence ends at .!? or a newline; if the buffer grows
-// past maxLen without a boundary it cuts at the last clause break. Returns
-// ("", false) when no sentence is ready yet.
+// takeSentence extracts the next complete sentence or natural thought unit
+// from buf, mutating buf to remove what it took.
+//
+// A sentence primarily ends at standard punctuation (. ! ?) followed by a space,
+// quote, or newline. If an utterance is exceptionally long (>200 chars) without
+// sentence-ending punctuation, it falls back to a major punctuation boundary
+// (semicolon, colon, dash, or comma followed by space) to keep latency reasonable
+// without severing mid-clause thoughts like "relax or do" / "chores.".
 func takeSentence(buf *strings.Builder) (string, bool) {
 	s := buf.String()
-	const maxLen = 100
+	if len(s) == 0 {
+		return "", false
+	}
 
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c == '!' || c == '?' || c == '\n' {
+		if c == '\n' {
 			return consumeSentence(buf, s, i+1)
 		}
+		if c == '!' || c == '?' {
+			// Require boundary (space, quote, end of text) so "!?" or "! " don't fragment
+			if i+1 == len(s) || s[i+1] == ' ' || s[i+1] == '"' || s[i+1] == '\'' || s[i+1] == '\n' {
+				return consumeSentence(buf, s, i+1)
+			}
+		}
 		if c == '.' {
-			// Keep ellipses together so a thoughtful pause is one spoken chunk,
-			// rather than three tiny sentences sent to TTS separately.
+			// Keep ellipses together so a thoughtful pause stays in one chunk
 			if i+1 < len(s) && s[i+1] == '.' {
 				continue
 			}
-			// Don't split on common abbreviations like "Dr." or "e.g.".
-			if i > 0 && i+1 < len(s) && isLowerByte(s[i-1]) && s[i+1] == ' ' {
+			// Skip dots that are part of an ellipsis already started
+			if i > 0 && s[i-1] == '.' {
+				// wait until end of ellipsis
+				if i+1 < len(s) && s[i+1] == '.' {
+					continue
+				}
+				// If end of ellipsis is followed by space/quote or end of string, emit it
+				if i+1 == len(s) || s[i+1] == ' ' || s[i+1] == '"' || s[i+1] == '\'' || s[i+1] == '\n' {
+					return consumeSentence(buf, s, i+1)
+				}
 				continue
 			}
-			return consumeSentence(buf, s, i+1)
+			// Don't split on common abbreviations like "Dr.", "Mr.", "e.g.", "vs." or numbers "2.4"
+			if i > 0 && i+1 < len(s) {
+				if isLowerByte(s[i-1]) && s[i+1] == ' ' {
+					// Check common abbreviation patterns
+					wordStart := strings.LastIndexAny(s[:i], " \t\n")
+					if wordStart < 0 {
+						wordStart = 0
+					} else {
+						wordStart++
+					}
+					abbr := strings.ToLower(s[wordStart:i])
+					if abbr == "dr" || abbr == "mr" || abbr == "ms" || abbr == "mrs" || abbr == "prof" || abbr == "eg" || abbr == "ie" || abbr == "vs" || abbr == "etc" {
+						continue
+					}
+				}
+				if isDigitByte(s[i-1]) && isDigitByte(s[i+1]) {
+					continue
+				}
+			}
+			if i+1 == len(s) || s[i+1] == ' ' || s[i+1] == '"' || s[i+1] == '\'' || s[i+1] == '\n' {
+				return consumeSentence(buf, s, i+1)
+			}
 		}
 	}
 
-	if len(s) >= maxLen {
-		cut := strings.LastIndex(s[:maxLen], ",")
-		if cut < 0 {
-			cut = strings.LastIndex(s[:maxLen], ";")
+	// Only split on secondary punctuation if buffer is getting very long (>180 chars)
+	// to avoid blocking the user when an LLM writes run-on sentences.
+	const fallbackLen = 180
+	if len(s) >= fallbackLen {
+		// Look backwards for major clause pauses: semicolon, dash, colon, comma
+		for _, delim := range []string{"; ", " — ", " - ", ": ", ", "} {
+			if cut := strings.LastIndex(s[:fallbackLen], delim); cut >= 50 {
+				return consumeSentence(buf, s, cut+len(delim))
+			}
 		}
-		if cut < 0 {
-			cut = strings.LastIndex(s[:maxLen], " ")
-		}
-		if cut < 0 {
-			cut = maxLen
-		}
-		return consumeSentence(buf, s, cut+1)
-	}
-
-	// Early flush at 60 chars on clause breaks (comma/semicolon + space) to
-	// reduce first-audio latency without waiting for the full maxLen.
-	if len(s) >= 60 {
-		for i := len(s) - 1; i >= 50; i-- {
-			if (s[i] == ',' || s[i] == ';') && i+1 < len(s) && s[i+1] == ' ' {
-				return consumeSentence(buf, s, i+2)
+		// If no punctuation at all for 220 chars, break cleanly at a word boundary
+		const hardMaxLen = 220
+		if len(s) >= hardMaxLen {
+			if cut := strings.LastIndex(s[:hardMaxLen], " "); cut >= 100 {
+				return consumeSentence(buf, s, cut+1)
 			}
 		}
 	}
@@ -1343,6 +1379,7 @@ func consumeSentence(buf *strings.Builder, s string, end int) (string, bool) {
 }
 
 func isLowerByte(b byte) bool { return b >= 'a' && b <= 'z' }
+func isDigitByte(b byte) bool { return b >= '0' && b <= '9' }
 
 func (o *Orchestrator) adaptResponse(response string, emotion personality.EmotionState) string {
 	response = cleanResponse(response)
@@ -1518,6 +1555,16 @@ func (o *Orchestrator) endTTSTurn() {
 }
 
 func (o *Orchestrator) publishTTS(text string) {
+	// A fragment with no letter or digit in it cannot be spoken, and handing one
+	// to the engine is not free: measured on this machine, a lone "..." (or ".",
+	// "-", "…", "Hm.") makes Pocket answer with its 40 s maximum — ~30 s of CPU
+	// on a queue that serializes every sentence, mostly silence glitched with
+	// short bursts — while the transcript announces text the user never hears.
+	// Every spoken path (streamed sentences, greetings, proactive lines) and the
+	// transcript both funnel through here, so this one check covers them.
+	if !speakableText(text) {
+		return
+	}
 	seq := o.ttsTurnID()
 	o.lastSpoken = strings.ToLower(text)
 	o.lastSpokenAt = time.Now()
@@ -1783,6 +1830,21 @@ func cleanResponse(s string) string {
 	}
 
 	return strings.TrimSpace(s)
+}
+
+// speakableText reports whether cleaned text contains anything a TTS engine can
+// pronounce. Punctuation-only fragments ("...", "—", "…") survive
+// stripFormattingForVoice, so they used to reach the engine as a whole
+// utterance. A letter or digit is the cheapest reliable test for "there is
+// something to say": pocket TTS answers a fragment with 40 s of glitched
+// near-silence, and no model can do anything better with it.
+func speakableText(s string) bool {
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // stripFormattingForVoice removes markdown-ish artifacts a drifting model may
