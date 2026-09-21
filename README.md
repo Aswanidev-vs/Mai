@@ -84,20 +84,20 @@ Voice Input (Mic)                   Streaming Audio Chunks
 
 ---
 
-## Dual-Mode Architecture
+## Operating Modes
 
-Mai operates in two modes, switchable at runtime via configuration:
+Mai operates in three modes, selected through configuration and runtime flags:
 
 | Mode | Behavior | Use Case |
 |------|----------|----------|
 | **Legacy Mode** | Classic wake word → ASR → regex/LLM → TTS pipeline | Fast, simple commands with minimal overhead |
-| **Agentic Mode** | Full cognitive loop with memory, planning, and proactivity | Complex multi-step tasks, autonomous monitoring |
+| **Agentic Mode** | Full cognitive loop with memory, ReAct tool use, and proactivity | Complex multi-step tasks, autonomous monitoring |
 | **Companion Mode** | Web-based 3D character with voice interaction | Real-time conversational companion |
 
 In **Agentic Mode**, Mai features:
 - **Unified Prompt Engine**: Single prompt template with JARVIS personality — consistent across all task types
-- **Natural Language ReAct**: Thinks through problems naturally, not in rigid JSON steps
-- **Simplified Routing**: Regex fast path → LLM handles everything else (2 paths, not 5)
+- **Natural Language ReAct**: Natural-language reasoning with structured JSON steps; up to 3 iterations per request
+- **Multi-stage Routing**: Greeting fast path → skill routing → regex fast path → task-type routing → ReAct fallback
 - **Emotion-Aware Pipeline**: Prosody analysis from audio → emotion detection → adapted TTS speed/pitch/volume
 - **Proactive Intelligence**: Pattern learning (time-of-day, frequency), anticipatory suggestions, idle reminders
 - **User Modeling**: Learns preferences, tracks habits, extracts topics, persists to `data/user_profile.json`
@@ -185,9 +185,9 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 | Feature | Status | Description |
 |---------|--------|-------------|
 | **Unified Prompt Engine** | ✅ Ready | Single prompt template with JARVIS personality — consistent across all task types |
-| **Natural Language ReAct** | ✅ Ready | Thinks through problems naturally, not rigid JSON steps. Max 3 tool calls per request. |
-| **Smart Routing** | ✅ Ready | Regex fast path → LLM handles everything else (2 paths, not 5) |
-| **Fact Verifier** | ✅ Ready | Claim verification and tool call result validation |
+| **Natural Language ReAct** | ✅ Ready | Natural-language reasoning with structured JSON steps; up to 3 iterations per request |
+| **Multi-stage Routing** | ✅ Ready | Greeting fast path → skill routing → regex fast path → task-type routing → ReAct fallback |
+| **Fact Verifier** | ⚠️ Available | Claim and tool-result verification helpers exist, but are not wired into the active ReAct loop |
 
 ### Agentic Layer — Memory & Knowledge
 
@@ -241,7 +241,7 @@ Say **"Mai"**, **"Hey Mai"** to wake the assistant. Speak your request naturally
 | **Privacy Guard** | ✅ Ready | Sensitive data detection for hybrid cloud/local routing |
 | **Perception Bridge** | ✅ Ready | Audio transcription and vision event publishing |
 | **Meta-Cognition** | ✅ Ready | Performance tracking, strategy analysis, and self-improvement |
-| **MCP Client** | ✅ Ready | Model Context Protocol for external tool discovery |
+| **MCP Client** | Optional | Auto-discovers tools from configured MCP servers when `mcp.enabled: true` |
 | **Companion Skills** | ✅ Ready | Skill routing via `data/skills.json` (trigger phrases → skill execution) |
 
 ---
@@ -457,14 +457,8 @@ Edit `config.yaml` to match your preferences. Key sections:
 Pull a recommended model via Ollama:
 
 ```bash
-# Small, fast, capable (recommended for most hardware)
-ollama pull gemma2:2b
-
-# Or for higher quality with more RAM
-ollama pull qwen2.5:3b
-
-# Or for best multilingual support
-ollama pull phi3:mini
+# Current default / recommended starting point
+ollama pull qwen3.5:4b
 ```
 
 ### 6. Build & Run
@@ -551,11 +545,17 @@ Enable intelligent routing between local and cloud models:
 
 ```yaml
 llm:
-  provider: "openai"
-  model: "gpt-4o-mini"
-  url: "https://api.openai.com/v1/chat/completions"
-  api_key: "sk-..."
+  provider: "ollama"
+  model: "qwen3.5:4b"
+  local_model: "qwen3.5:4b"
+  url: "http://localhost:11434/api/generate"
   hybrid_mode: true
+
+  cloud:
+    provider: "openrouter"
+    model: "openai/gpt-oss:free"
+    url: "https://openrouter.ai/api/v1"
+    api_key: "${OPENROUTER_API_KEY}"
 
 privacy:
   detection_enabled: true
@@ -642,7 +642,11 @@ audio:
   playback_device: ""
   barge_in_enabled: true
   barge_in_threshold: 0.008
+  barge_in_warmup_ms: 400
+  barge_in_sustain_ms: 150
+  barge_in_echo_max: 0.7
   thinking_chime: true
+  tts_play_local_always: true
 ```
 
 ### GPU Provider
@@ -667,28 +671,79 @@ tts:
 ### TTS
 ```yaml
 tts:
-  active_model: "supertonic"
-  voice_style: "soft"
-  base_speed: 1.05
-  num_threads: 2
+  active_model: "pocket"
+  voice_style: "calm"
+  base_speed: 1.0
+  num_threads: 6
   output_sample_rate: 44100
+  output_gain: 1.11
+  normalize_loudness: true
+  target_loudness_dbfs: -18.0
+  pitch_shift: false
+  exciter_amount: 0.0
   supertonic:
     model_dir: "./sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
     speed: 1.25
+  pocket:
+    model_dir: "./sherpa-onnx-pocket-tts-2026-01-26"
+    streaming: true
+    temperature: 0.6
+    seed: 42
+    batch_sentences: true
+    batch_max_chars: 160
+  zipvoice:
+    model_dir: "./sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"
+    vocoder: "./vocos_24khz.onnx"
+    num_steps: 4
+    speed: 1.0
+  voice_cloning:
+    enabled: true
+    reference_audio: "./mai-san-pcm.wav"
+    reference_text: ""
+    max_reference_audio_len: 30.0
 ```
 
 ### LLM
 ```yaml
 llm:
-  provider: "ollama"
-  model: "gemma4:e2b-it-qat"
+  provider: "ollama"              # "ollama" | "openai" | "gemini" | "claude" | "openrouter" | "nvidia"
+  model: "qwen3.5:4b"
   url: "http://localhost:11434/api/generate"
   auto_start: true
+  local_model: "qwen3.5:4b"       # model used when hybrid mode routes to the local backend
   hybrid_mode: false
+  think: true
+  num_ctx: 131072
+  chat_history_turns: 20
+  # cloud:
+  #   provider: "openrouter"
+  #   model: "openai/gpt-oss:free"
+  #   url: "https://openrouter.ai/api/v1"
+  #   api_key: "${OPENROUTER_API_KEY}"
   sampling:
     temperature: 0.55
     top_p: 0.85
     max_tokens: 400
+```
+
+> Hybrid mode routes non-sensitive prompts to the configured cloud provider and sensitive prompts to the local provider. The local provider is always `ollama`.
+
+### Privacy
+```yaml
+privacy:
+  detection_enabled: true
+  sensitive_words:
+    - "password"
+    - "secret"
+    - "credit card"
+  block_cloud_on_sensitivity: true
+```
+
+### MCP
+```yaml
+mcp:
+  enabled: false
+  servers: []
 ```
 
 ---
@@ -750,13 +805,13 @@ internal/server/static/
 | 9 | Memory System | ✅ Complete | Working + Episodic + Semantic + Procedural + RAG |
 | 10 | Emotion Engine | ✅ Complete | Text + prosody detection, adaptive TTS |
 | 11 | Dynamic Prompts | ✅ Complete | Unified prompt engine with JARVIS personality |
-| 12 | Function Calling | ✅ Complete | Structured JSON tool invocation |
-| 13 | ReAct Reasoning | ✅ Complete | Natural language reasoning (not rigid JSON steps) |
+| 12 | ReAct Tool Loop | ✅ Complete | Structured tool invocation via ReAct |
+| 13 | ReAct Reasoning | ✅ Complete | Natural-language reasoning with structured JSON steps |
 | 14 | User Modeling | ✅ Complete | Preferences, habits, topics |
 | 15 | Proactive Intel | ✅ Complete | Pattern learning, idle reminders |
 | 16 | Companion UI | ✅ Complete | VRM character, streaming TTS, mic input, alive-ness |
 | 17 | Motion3 System | ✅ Complete | VRoid parameter animation playback |
-| 18 | Cognitive Optimization | ✅ Complete | Simplified routing (2 paths), unified prompts, lazy memory |
+| 18 | Cognitive Optimization | ✅ Complete | Multi-stage routing, unified prompts, lazy memory |
 | 19 | Performance Tuning | ✅ Complete | Zero-alloc event bus, ring buffer, approximate search |
 | 20 | GPU Offloading | ✅ Complete | CUDA/CoreML/OpenCL for KWS, VAD, ASR, TTS |
 | 21 | Native Integrations | 🔜 Planned | Discord/Telegram bots, plugin architecture |
