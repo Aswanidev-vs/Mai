@@ -123,6 +123,9 @@ audio.onSpeakingStart = () => {
 audio.onSpeakingEnd = () => {
     character.setSpeaking(false);
 };
+audio.onChunkScheduled = (duration) => {
+    character.setVisemeDuration(duration);
+};
 
 const statusIndicator = document.getElementById('statusIndicator');
 const statusText = document.getElementById('statusText');
@@ -188,7 +191,10 @@ ws.on('chat.response', (params) => {
         gazeAvoidBuffer += params.text;
         // Rebuild the viseme schedule as spoken sentences arrive, so it is
         // ready before/during audio playback instead of only at stream end.
-        character.prepareVisemes(ttsTextBuffer);
+        character.prepareVisemes(params.text);
+        // Queue the reset now; AudioPlayer applies it when this sentence's
+        // first PCM is actually scheduled on the AudioContext timeline.
+        audio.beginVisemeUtterance();
     }
     if (params.done) {
         chat.finalizeMessage();
@@ -237,11 +243,13 @@ ws.on('tts.chunk', (params) => {
     if (audio.analyser && !character.analyser) {
         character.setAnalyser(audio.analyser);
     }
-    audio.queueChunk(params.audio || '', params.sample_rate, !!params.done, !!params.muted);
-    // Feed the running audio duration so the viseme schedule stays scaled to reality
-    if (params.audio) {
-        character.setVisemeDuration(audio.getKnownDuration());
-    }
+    audio.queueChunk(
+        params.audio || '',
+        params.sample_rate,
+        !!params.done,
+        !!params.muted,
+        Number(params.duration_seconds) || 0
+    );
 });
 
 // Emotion detection

@@ -10,9 +10,9 @@ import (
 
 // Bridge connects the Mai event bus to WebSocket clients.
 type Bridge struct {
-	hub          *Hub
-	getStatus    func() interfaces.AgentStatus
-	cancel       context.CancelFunc
+	hub       *Hub
+	getStatus func() interfaces.AgentStatus
+	cancel    context.CancelFunc
 }
 
 // NewBridge creates a Bridge, subscribes to bus events, and starts status polling.
@@ -89,6 +89,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		sampleRate, _ := event.Payload["sample_rate"].(int)
 		done, _ := event.Payload["done"].(bool)
 		muted, _ := event.Payload["muted"].(bool)
+		durationSeconds, _ := event.Payload["duration_seconds"].(float64)
 		// Skip empty non-done chunks, but always forward done signals
 		if audio == "" && !done {
 			return
@@ -97,10 +98,11 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 			sampleRate = 24000
 		}
 		b.hub.BroadcastNotification(NotifTTSChunk, TTSChunkParams{
-			Audio:      audio,
-			SampleRate: sampleRate,
-			Done:       done,
-			Muted:      muted,
+			Audio:           audio,
+			SampleRate:      sampleRate,
+			Done:            done,
+			Muted:           muted,
+			DurationSeconds: durationSeconds,
 		})
 	})
 

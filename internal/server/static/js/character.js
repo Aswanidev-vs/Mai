@@ -1526,7 +1526,7 @@ class CharacterRenderer {
     }
 
     setVisemeDuration(d) {
-        if (d > 0) this.visemeDuration = d;
+        this.visemeDuration = Number.isFinite(d) && d >= 0 ? d : 0;
     }
 
     setSpeaking(s) {
