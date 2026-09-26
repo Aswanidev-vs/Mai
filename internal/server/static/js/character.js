@@ -699,9 +699,14 @@ class CharacterRenderer {
                         'rightRingProximal', 'rightRingIntermediate', 'rightRingDistal',
                         'rightLittleProximal', 'rightLittleIntermediate', 'rightLittleDistal',
                     ];
-                    clip.tracks = clip.tracks.filter(track => {
-                        return !armBones.some(bone => track.name.includes(bone));
-                    });
+                    // Tracks target the normalized nodes (Normalized_J_Bip_L_Hand.quaternion),
+                    // so match on those names — a humanoid bone name never appears in them.
+                    const armTrackPrefixes = armBones
+                        .map(bone => vrm.humanoid.getNormalizedBoneNode(bone)?.name)
+                        .filter(Boolean)
+                        .map(name => `${name}.`);
+                    clip.tracks = clip.tracks.filter(track =>
+                        !armTrackPrefixes.some(prefix => track.name.startsWith(prefix)));
 
                     this.mixer = new THREE.AnimationMixer(vrm.scene);
                     const action = this.mixer.clipAction(clip);
@@ -1433,9 +1438,10 @@ class CharacterRenderer {
             this.idleBehaviorTimer -= delta;
             if (!this.idleBehavior && this.idleBehaviorTimer <= 0) {
                 this.idleBehaviorTimer = this._rand(IDLE_BEHAVIOR_MIN, IDLE_BEHAVIOR_MAX);
-                const behaviorOptions = ['stretch', 'glance', 'adjust', 'breatheDeep', 'headNod', 'shoulderShrug'];
+                // No arm-moving behaviors: a random arm swing reads as a glitch.
+                const behaviorOptions = ['glance', 'adjust', 'breatheDeep', 'headNod', 'shoulderShrug'];
                 const kind = behaviorOptions[Math.floor(secureRand() * behaviorOptions.length)];
-                const durations = { stretch: 2.2, glance: 1.4, adjust: 1.0, breatheDeep: 2.8, headNod: 0.8, shoulderShrug: 1.2 };
+                const durations = { glance: 1.4, adjust: 1.0, breatheDeep: 2.8, headNod: 0.8, shoulderShrug: 1.2 };
                 this.idleBehavior = { kind, dur: durations[kind] };
                 this.idleBehaviorT = 0;
             }
@@ -1446,8 +1452,6 @@ class CharacterRenderer {
                 const env = Math.sin(Math.min(1, p) * Math.PI); // 0→1→0
                 
                 switch (k) {
-                    case 'stretch': 
-                        tr += env * 0.07; tp -= env * 0.04; ty += env * 0.02; break;
                     case 'glance': 
                         ty += env * 0.15; tp += env * 0.02; break;
                     case 'adjust': 
@@ -1488,22 +1492,6 @@ class CharacterRenderer {
             neck.rotation.x += this.postureHead.pitch * 0.4;
             neck.rotation.y += this.postureHead.yaw * 0.4;
             neck.rotation.z += this.postureHead.roll * 0.4;
-        }
-
-        // Enhanced stretch with more natural arm movement.
-        if (this.idleBehavior && this.idleBehavior.kind === 'stretch') {
-            const p = Math.min(1, this.idleBehaviorT / this.idleBehavior.dur);
-            const env = Math.sin(p * Math.PI) * 0.6;
-            const lu = h.getNormalizedBoneNode('leftUpperArm');
-            const ru = h.getNormalizedBoneNode('rightUpperArm');
-            if (lu) {
-                lu.rotation.z += env * 0.45;
-                lu.rotation.x -= env * 0.1;
-            }
-            if (ru) {
-                ru.rotation.z -= env * 0.45;
-                ru.rotation.x -= env * 0.1;
-            }
         }
     }
 
@@ -1719,11 +1707,13 @@ class CharacterRenderer {
         setIdleRotation('spine', (breath * 0.0084 + breath2 * 0.0024 + breath3 * 0.0012) * b * breathAmp, 0, Math.sin(elapsed * 0.12) * 0.001 * b);
         setIdleRotation('chest', (breath * 0.006 + breath2 * 0.0012) * b * breathAmp, 0, 0);
         
-        // Subtle shoulder breathing
+        // Subtle shoulder breathing — assigned from a clean base each frame; nothing
+        // else resets these bones, so a per-frame `+=` integrates frame by frame
+        // (unbounded and frame-rate dependent).
         const leftShoulder = h.getNormalizedBoneNode('leftShoulder');
         const rightShoulder = h.getNormalizedBoneNode('rightShoulder');
-        if (leftShoulder) leftShoulder.rotation.x += (breath * 0.002) * b;
-        if (rightShoulder) rightShoulder.rotation.x += (breath * 0.002) * b;
+        if (leftShoulder) leftShoulder.rotation.x = (breath * 0.002) * b;
+        if (rightShoulder) rightShoulder.rotation.x = (breath * 0.002) * b;
 
         // More natural head movement with layered frequencies
         const t = elapsed;
@@ -1741,11 +1731,12 @@ class CharacterRenderer {
         setIdleRotation('leftLowerArm', -0.35 + Math.sin(elapsed * 0.2 + 0.7) * 0.006, 0.1, 0);
         setIdleRotation('rightLowerArm', -0.35 - Math.sin(elapsed * 0.2 + 0.2) * 0.006, -0.1, 0);
         
-        // Subtle finger movement for aliveness
+        // Subtle wrist sway for aliveness — assigned, never accumulated, so the
+        // wrist can't keep turning on its own between frames.
         const leftHand = h.getNormalizedBoneNode('leftHand');
         const rightHand = h.getNormalizedBoneNode('rightHand');
-        if (leftHand) leftHand.rotation.z += Math.sin(elapsed * 0.3) * 0.002;
-        if (rightHand) rightHand.rotation.z += Math.sin(elapsed * 0.35) * 0.002;
+        if (leftHand) leftHand.rotation.z = Math.sin(elapsed * 0.3) * 0.002;
+        if (rightHand) rightHand.rotation.z = Math.sin(elapsed * 0.35) * 0.002;
     }
 
     // ── Procedural Hair Sway ──
