@@ -566,6 +566,208 @@ func TestProbePocketSeedDeterminism(t *testing.T) {
 	}
 }
 
+// TestProbePocketNoiseFloorVsTemperature measures Pocket's sampler noise floor
+// against temperature, the knob that controls it.
+//
+// Pocket's flow-matching sampler draws Gaussian noise per frame, so the model
+// emits a low-level floor even where the reference recording is silent. Measured
+// against mai-san-pcm.wav (its own silence is -96.9 dBFS), Pocket's quietest
+// 300 ms comes back at -42.6 dBFS — a floor the model creates, ~55 dB above true
+// silence. Loudness normalisation then lifts it along with the speech (+6.2 dB on
+// a typical sentence), which is what reads as a fan-like drone behind the voice.
+// No level gate can remove it: the floor only sits ~19 dB below speech and
+// fluctuates frame to frame, so gating either does nothing or chews word tails.
+//
+// Run with:
+//
+//	MAI_TTS_PROBE=1 go test -c -o zzprobe.exe ./cmd/mai && ./zzprobe.exe -test.run TestProbePocketNoiseFloorVsTemperature -test.v
+func TestProbePocketNoiseFloorVsTemperature(t *testing.T) {
+	probeGate(t)
+	root := probeRepoRoot()
+	dir := filepath.Join(root, "sherpa-onnx-pocket-tts-2026-01-26")
+	ref, rate := probeRefMono(t, filepath.Join(root, "mai-san-pcm.wav"), 10.0)
+
+	cfg := sherpa.OfflineTtsConfig{}
+	cfg.Model.NumThreads = 6
+	cfg.Model.Provider = "cpu"
+	cfg.Model.Pocket.LmFlow = filepath.Join(dir, "lm_flow.onnx")
+	cfg.Model.Pocket.LmMain = filepath.Join(dir, "lm_main.onnx")
+	cfg.Model.Pocket.Encoder = filepath.Join(dir, "encoder.onnx")
+	cfg.Model.Pocket.Decoder = filepath.Join(dir, "decoder.onnx")
+	cfg.Model.Pocket.TextConditioner = filepath.Join(dir, "text_conditioner.onnx")
+	cfg.Model.Pocket.VocabJson = filepath.Join(dir, "vocab.json")
+	cfg.Model.Pocket.TokenScoresJson = filepath.Join(dir, "token_scores.json")
+
+	tts := sherpa.NewOfflineTts(&cfg)
+	if tts == nil {
+		t.Fatal("NewOfflineTts returned nil")
+	}
+	defer sherpa.DeleteOfflineTts(tts)
+
+	// The comma gives the decoder somewhere to pause, so the render actually
+	// contains the low-energy frames whose floor we are measuring.
+	const text = "I thought about it, and the answer is simpler than you are making it."
+
+	// gen mirrors main.go: an empty extra means "no seed / no temperature", which
+	// is what sherpa's own defaults do (temperature 0.7, random seed).
+	gen := func(extra string) []float32 {
+		var got []float32
+		genCfg := &sherpa.GenerationConfig{
+			Speed:               1.0,
+			ReferenceAudio:      ref,
+			ReferenceSampleRate: rate,
+		}
+		if extra != "" {
+			genCfg.Extra = json.RawMessage(extra)
+		}
+		tts.GenerateWithConfig(text, genCfg, func(samples []float32, _ float32) bool {
+			got = append(got, samples...)
+			return true
+		})
+		return got
+	}
+
+	rmsOf := func(s []float32) float64 {
+		if len(s) == 0 {
+			return 0
+		}
+		var acc float64
+		for _, v := range s {
+			acc += float64(v) * float64(v)
+		}
+		return math.Sqrt(acc / float64(len(s)))
+	}
+	dbfs := func(v float64) float64 {
+		if v <= 0 {
+			return math.Inf(-1)
+		}
+		return 20 * math.Log10(v)
+	}
+	// Quietest 300 ms window: the floor the listener hears between words.
+	quietestRMS := func(s []float32) float64 {
+		w := int(float64(rate) * 0.3)
+		if len(s) <= w {
+			return rmsOf(s)
+		}
+		best := math.MaxFloat64
+		for i := 0; i+w <= len(s); i += w / 6 {
+			if r := rmsOf(s[i : i+w]); r < best {
+				best = r
+			}
+		}
+		return best
+	}
+	// Active-speech level, using the same 10%-of-max rule loudnessGain uses.
+	activeSpeechRMS := func(s []float32) float64 {
+		frame := rate / 100
+		if frame < 1 {
+			frame = 1
+		}
+		var maxFrame float64
+		for i := 0; i+frame <= len(s); i += frame {
+			if r := rmsOf(s[i : i+frame]); r > maxFrame {
+				maxFrame = r
+			}
+		}
+		if maxFrame == 0 {
+			return 0
+		}
+		cutoff := 0.1 * maxFrame
+		var acc float64
+		n := 0
+		for i := 0; i+frame <= len(s); i += frame {
+			if r := rmsOf(s[i : i+frame]); r >= cutoff {
+				acc += r * r
+				n++
+			}
+		}
+		if n == 0 {
+			return 0
+		}
+		return math.Sqrt(acc / float64(n))
+	}
+
+	cases := []struct {
+		label string
+		extra string
+	}{
+		// The 19 Sep probe_pocket-fp32-ref10.wav was rendered with no Extra at
+		// all, i.e. sherpa's own defaults (temperature 0.7, random seed). That
+		// render measures p10 = -58.9 dBFS; the shipped config pins both.
+		{"sherpa default (no Extra)", ""},
+		{"seed=42", `{"seed":42}`},
+		{"seed=43", `{"seed":43}`},
+		{"seed=44", `{"seed":44}`},
+		{"seed=42 temp=0.7", `{"seed":42,"temperature":0.7}`},
+		{"seed=42 temp=0.6", `{"seed":42,"temperature":0.6}`},
+	}
+
+	type row struct {
+		label         string
+		floor, speech float64
+	}
+	var rows []row
+	renders := make(map[string][]float32, len(cases))
+
+	for _, c := range cases {
+		s := gen(c.extra)
+		renders[c.label] = s
+		if len(s) == 0 {
+			t.Logf("[FLOOR] %-24s produced no audio", c.label)
+			continue
+		}
+		floor, speech := quietestRMS(s), activeSpeechRMS(s)
+		rows = append(rows, row{c.label, floor, speech})
+		t.Logf("[FLOOR] %-24s floor(p05)=%7.1f dBFS  speech=%6.1f dBFS  peak=%.3f  %.2fs",
+			c.label, dbfs(floor), dbfs(speech), peakAbs(s), float64(len(s))/float64(rate))
+		probeWriteWAV(t, filepath.Join(root, fmt.Sprintf("probe_floor_%02d.wav", len(rows))), s, rate)
+	}
+
+	if len(rows) < 2 {
+		return
+	}
+	// Guard against the extra silently not reaching the sampler: if every render
+	// is byte-identical, the sweep proves nothing.
+	first := renders[cases[0].label]
+	identical := true
+	for _, c := range cases[1:] {
+		other := renders[c.label]
+		if len(other) != len(first) {
+			identical = false
+			break
+		}
+		for i := range first {
+			if first[i] != other[i] {
+				identical = false
+				break
+			}
+		}
+		if !identical {
+			break
+		}
+	}
+	if identical {
+		t.Log("[FLOOR] renders are byte-identical — the Extra config is not reaching the sampler")
+		return
+	}
+
+	best, worst := rows[0], rows[0]
+	for _, r := range rows[1:] {
+		if r.floor < best.floor {
+			best = r
+		}
+		if r.floor > worst.floor {
+			worst = r
+		}
+	}
+	spread := dbfs(worst.floor) - dbfs(best.floor)
+	t.Logf("[FLOOR] floor spread across configs = %.1f dB (cleanest %q, noisiest %q)",
+		spread, best.label, worst.label)
+	if spread < 3.0 {
+		t.Log("[FLOOR] seed/temperature barely move the floor — they are not the lever for this artifact")
+	}
+}
+
 // TestProbePocketBatchDrain exercises the real drainTTSBatch (tts_batch.go)
 // against the same queue shape the orchestrator's streaming handoff produces:
 // short same-turn sentences plus the end-of-turn marker. Pure Go, race-tested.

@@ -920,6 +920,7 @@ func main() {
 		}
 		log.Printf("[TTS-PLAY] Playing rendered audio (%.2fs @ %d Hz)",
 			float64(len(samples))/float64(ttsSampleRate), ttsSampleRate)
+		sentenceDuration := float64(len(samples)) / float64(ttsSampleRate)
 
 		if local {
 			// Always render to the local speaker so Mai is audible regardless
@@ -943,7 +944,7 @@ func main() {
 					chunk := samples[:n]
 					samples = samples[n:]
 					resampled := ttsToBrowserResampler.resample(chunk)
-					publishTTSAudioChunk(bus, resampled, 44100, false, true)
+					publishTTSAudioChunk(bus, resampled, 44100, false, true, sentenceDuration)
 					ch <- resampled
 				}
 			})
@@ -963,7 +964,7 @@ func main() {
 				chunk := samples[:n]
 				samples = samples[n:]
 				refBuffer.Push(ttsToEchoResampler.resample(chunk))
-				publishTTSAudioChunk(bus, ttsToBrowserResampler.resample(chunk), 44100, false, false)
+				publishTTSAudioChunk(bus, ttsToBrowserResampler.resample(chunk), 44100, false, false, sentenceDuration)
 				// Pace: this chunk represents 200ms of audio.
 				select {
 				case <-ctx.Done():
@@ -2246,9 +2247,13 @@ func publishTranscript(bus interfaces.EventBus, text string, done bool) {
 // marks audio the browser plays at zero gain: the sound comes from the local
 // speakers and the tab only needs the same timeline for lip sync and the
 // speaking state.
-func publishTTSAudioChunk(bus interfaces.EventBus, samples []float32, sampleRate int, done bool, muted bool) {
+func publishTTSAudioChunk(bus interfaces.EventBus, samples []float32, sampleRate int, done bool, muted bool, durationSeconds ...float64) {
 	if bus == nil {
 		return
+	}
+	duration := 0.0
+	if len(durationSeconds) > 0 && durationSeconds[0] > 0 {
+		duration = durationSeconds[0]
 	}
 	var encoded string
 	if len(samples) > 0 {
@@ -2269,10 +2274,11 @@ func publishTTSAudioChunk(bus interfaces.EventBus, samples []float32, sampleRate
 		Type:   "tts.audio.chunk",
 		Source: "main",
 		Payload: map[string]interface{}{
-			"audio":       encoded,
-			"sample_rate": sampleRate,
-			"done":        done,
-			"muted":       muted,
+			"audio":            encoded,
+			"sample_rate":      sampleRate,
+			"done":             done,
+			"muted":            muted,
+			"duration_seconds": duration,
 		},
 	})
 }

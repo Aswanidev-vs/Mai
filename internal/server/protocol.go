@@ -19,12 +19,12 @@ type WSError struct {
 
 // Client → Server methods
 const (
-	MethodChatInput        = "chat.input"
-	MethodConfigUpdate     = "config.update"
-	MethodStateRequest     = "state.request"
-	MethodAudioInput       = "audio.input"
-	MethodAudioInputStart  = "audio.input.start"
-	MethodAudioInputStop   = "audio.input.stop"
+	MethodChatInput       = "chat.input"
+	MethodConfigUpdate    = "config.update"
+	MethodStateRequest    = "state.request"
+	MethodAudioInput      = "audio.input"
+	MethodAudioInputStart = "audio.input.start"
+	MethodAudioInputStop  = "audio.input.stop"
 )
 
 // Server → Client notifications
@@ -71,6 +71,9 @@ type TTSChunkParams struct {
 	// comes from the local device, and the tab only needs the same timeline
 	// to drive lip sync and the speaking state.
 	Muted bool `json:"muted,omitempty"`
+	// DurationSeconds is the complete sentence duration, repeated on each PCM
+	// chunk so the browser can normalize visemes before streaming finishes.
+	DurationSeconds float64 `json:"duration_seconds,omitempty"`
 }
 
 // EmotionDetectedParams carries the detected emotion state.

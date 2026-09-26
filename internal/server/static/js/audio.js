@@ -8,7 +8,10 @@ class AudioPlayer {
         this.playing = false;
         this.onSpeakingStart = null;
         this.onSpeakingEnd = null;
+        this.onChunkScheduled = null;
         this._draining = false;
+        this._generation = 0;
+        this._visemeSentencePending = false;
 
         // Playback clock for viseme-accurate lip sync
         this._utteranceStartCtx = null;
@@ -59,18 +62,23 @@ class AudioPlayer {
     // audio from local-speaker mode: it is scheduled and analysed exactly like
     // audible audio, but output at zero gain so the tab never doubles the
     // sound while its lip-sync clock still follows the real voice.
-    async queueChunk(base64Audio, sampleRate, done, muted) {
+    // Queue in arrival order before resuming. Resuming first yields to the
+    // event loop, allowing bursty WebSocket chunks to enter the queue out of order.
+    queueChunk(base64Audio, sampleRate, done, muted, durationSeconds = 0) {
         if (!this.audioContext) this.init();
-        await this.resume();
-        this.queue.push({ base64Audio, sampleRate, done, muted: !!muted });
+        this.queue.push({ base64Audio, sampleRate, done, muted: !!muted, durationSeconds: Number(durationSeconds) || 0 });
         if (!this._draining) {
             this._drainQueue();
         }
+        this.resume();
     }
 
     async _drainQueue() {
         if (this._draining) return;
         this._draining = true;
+        const generation = this._generation;
+        let chunkIndex = 0;
+        let emptySince = performance.now();
 
         // Signal speaking start
         if (!this.playing && this.queue.length > 0) {
@@ -86,53 +94,44 @@ class AudioPlayer {
             if (this.onSpeakingStart) this.onSpeakingStart();
         }
 
-        let chunkIndex = 0;
-        let prevDone = false;
-        while (this.queue.length > 0) {
-            const chunk = this.queue.shift();
-            const isLastChunk = chunk.done && this.queue.length === 0;
-            // A chunk that arrives right behind an end-of-turn marker belongs to
-            // a NEW utterance — typically the reply that replaced an interrupted
-            // one, whose audio was queued before the marker was processed. The
-            // drain loop never exited, so restart the playback clock here:
-            // otherwise the viseme schedule is scaled by the previous reply's
-            // duration and the lips drift from the voice.
-            if (prevDone) {
-                chunkIndex = 0;
-                this._utteranceStartCtx = this.audioContext.currentTime;
-                this._nextStartTime = this.audioContext.currentTime;
-                this._knownDuration = 0;
+        // `done` is the only end-of-turn signal. WebSocket chunks can arrive
+        // with real-time gaps while the next sentence is synthesized, so an
+        // empty queue must not close the mouth between chunks.
+        while (generation === this._generation) {
+            if (this.queue.length === 0) {
+                // Bound only the gap between chunks. Normal TTS gaps are short;
+                // a dropped/lost done marker must not leave the renderer speaking.
+                if (performance.now() - emptySince > 5000) break;
+                await new Promise(r => setTimeout(r, 10));
+                continue;
             }
-            prevDone = chunk.done;
-            // First chunk of utterance: no crossfade-in (avoids initial silence)
-            const applyCrossfade = chunkIndex > 0;
+            const chunk = this.queue.shift();
             try {
-                await this._playSmooth(chunk.base64Audio, chunk.sampleRate, applyCrossfade, chunk.muted);
+                // Sources are played sequentially, so the next chunk starts
+                // after this one ends. Gain automation still protects boundaries.
+                await this._playSmooth(chunk.base64Audio, chunk.sampleRate, chunkIndex > 0, chunk.muted, chunk.durationSeconds);
             } catch (e) {
                 console.error('[Audio] Chunk play error:', e);
             }
             chunkIndex++;
-
-            // After playing: if this was the final chunk (done=true) and queue
-            // is now empty, wait for audio to finish then exit.
-            if (isLastChunk) {
-                await this._waitForLastSource();
-                break;
-            }
+            emptySince = performance.now();
+            if (chunk.done) break;
         }
 
-        this.playing = false;
-        this._draining = false;
-        this._utteranceStartCtx = null;
-        this._nextStartTime = 0;
-        if (this.onSpeakingEnd) this.onSpeakingEnd();
+        if (generation === this._generation) {
+            this.playing = false;
+            this._draining = false;
+            this._utteranceStartCtx = null;
+            this._nextStartTime = 0;
+            if (this.onSpeakingEnd) this.onSpeakingEnd();
+        }
     }
 
     // Smooth overlap-add playback — schedules chunk on AudioContext timeline
     // with crossfade gain to eliminate gaps between chunks. With `muted`, the
     // chunk is analysed but silent: local speakers own the sound, the tab only
     // mirrors the timeline for lip sync.
-    _playSmooth(base64Audio, sampleRate, applyCrossfade, muted) {
+    _playSmooth(base64Audio, sampleRate, applyCrossfade, muted, durationSeconds = 0) {
         return new Promise((resolve, reject) => {
             try {
                 const binaryString = atob(base64Audio);
@@ -155,10 +154,6 @@ class AudioPlayer {
                 const sr = sampleRate || 24000;
                 const audioBuffer = this.audioContext.createBuffer(1, float32Array.length, sr);
                 audioBuffer.getChannelData(0).set(float32Array);
-                // Grows as chunks are actually scheduled, staying in lockstep
-                // with getPlayhead() for viseme timing
-                this._knownDuration += float32Array.length / sr;
-
                 const source = this.audioContext.createBufferSource();
                 source.buffer = audioBuffer;
 
@@ -166,25 +161,31 @@ class AudioPlayer {
                 const gainNode = this.audioContext.createGain();
                 source.connect(gainNode);
 
-                // The analyser is deliberately silent: it is a pass-through
-                // node, so anything fed into it used to leak straight to the
-                // destination (it used to be wired analyser → destination).
-                // Audible output now flows through the gain node instead, so a
-                // muted chunk (local-speaker mirror) can still feed the
-                // lip-sync analyser without doubling the sound.
-                if (muted) {
-                    source.connect(this.analyser);
-                    gainNode.connect(this.audioContext.destination);
-                    gainNode.gain.value = 0;
-                } else {
-                    gainNode.connect(this.analyser);
-                }
+                // Analyse the source before the mute gain so local-speaker mirrors
+                // still drive the mouth. Only the destination path is muted.
+                source.connect(this.analyser);
+                gainNode.connect(this.audioContext.destination);
+                gainNode.gain.value = muted ? 0 : 1;
 
                 // Schedule start time: either now or at the previously planned end
                 const now = this.audioContext.currentTime;
                 const startTime = Math.max(this._nextStartTime, now);
                 const chunkDuration = float32Array.length / sr;
                 const crossfade = this._crossfadeMs / 1000;
+
+                // A transcript sentence boundary resets the viseme phase, but its
+                // clock can start only when that sentence's first PCM is scheduled.
+                // Network latency between the two notifications must not accumulate.
+                if (this._visemeSentencePending) {
+                    this._visemeSentencePending = false;
+                    this._utteranceStartCtx = startTime;
+                    this._knownDuration = 0;
+                }
+                // The backend repeats the complete sentence duration on every PCM
+                // chunk. Prefer it over a running sum so the first chunk already
+                // maps the full text schedule to the full audio timeline.
+                this._knownDuration = durationSeconds > 0 ? durationSeconds : this._knownDuration + chunkDuration;
+                if (this.onChunkScheduled) this.onChunkScheduled(this._knownDuration);
 
                 if (muted) {
                     // Silent mirror: keep the exact chunk timing (viseme
@@ -283,6 +284,7 @@ class AudioPlayer {
     }
 
     stop() {
+        this._generation++;
         this.queue = [];
         // Stop all active sources
         for (const src of this._activeSources) {
@@ -295,6 +297,15 @@ class AudioPlayer {
         this._utteranceStartCtx = null;
         this._knownDuration = 0;
         this._nextStartTime = 0;
+        this._visemeSentencePending = false;
+        if (this.onSpeakingEnd) this.onSpeakingEnd();
+    }
+
+    // Begin a new sentence on the existing turn's audio timeline. The backend
+    // announces each sentence immediately before its PCM, so the text-derived
+    // schedule must be normalized to that sentence rather than the whole reply.
+    beginVisemeUtterance() {
+        this._visemeSentencePending = true;
     }
 
     // ── Lip-sync playback clock ──
