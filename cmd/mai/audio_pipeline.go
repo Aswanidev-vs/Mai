@@ -41,6 +41,16 @@ const (
 	// 300 ms ASR decode is the design working, a continuous stream of them
 	// means the consumer cannot keep up at all.
 	audioDropLogInterval = 5 * time.Second
+
+	// audioDropWarnMin is how many frames must be lost within one
+	// audioDropLogInterval window before the loss counts as sustained. At a
+	// 16 kHz period of ~25 ms a window carries ~200 frames, so this is a ~2.5%
+	// loss floor. Anything below it is scheduler jitter — the queue absorbing a
+	// single long frame — which is the design working, not a stall. Without a
+	// floor, one unlucky decode every few seconds re-arms the warning forever
+	// and the log reads as a permanent failure while capture is losing well
+	// under 1% of the microphone.
+	audioDropWarnMin = 5
 )
 
 // audioPipeline is the staging ring between the capture callback and the single
@@ -149,10 +159,17 @@ func (p *audioPipeline) run() {
 	}
 }
 
-// warnIfSustained logs once per interval while frames are being lost. A
-// permanently full queue means the processing goroutine cannot keep up, and
-// silently dropping the user's microphone is not an acceptable default — the
-// drop counter is the evidence, and someone has to read it.
+// warnIfSustained logs once per interval while frames are being lost at a rate
+// that means something. A permanently full queue means the processing goroutine
+// cannot keep up, and silently dropping the user's microphone is not an
+// acceptable default — the drop counter is the evidence, and someone has to read
+// it.
+//
+// The baseline rolls every interval whether or not anything is logged, so the
+// threshold measures the loss *rate* rather than the session total. Counting
+// cumulatively would let a slow drip of isolated frames eventually cross any
+// fixed line and then report itself as a permanent stall, which is the same
+// false alarm the floor exists to remove.
 func (p *audioPipeline) warnIfSustained() {
 	total := p.dropped.Load()
 	if total == p.warned.Load() {
@@ -161,9 +178,12 @@ func (p *audioPipeline) warnIfSustained() {
 	if !rateLimit(&p.warnAt, audioDropLogInterval) {
 		return
 	}
-	prev := p.warned.Swap(total)
-	log.Printf("[AUDIO-PIPELINE] Capture queue overflowing: %d frames dropped (%d more since last warning) — audio processing is not keeping up with the mic.",
-		total, total-prev)
+	lost := total - p.warned.Swap(total)
+	if lost < audioDropWarnMin {
+		return
+	}
+	log.Printf("[AUDIO-PIPELINE] Capture queue overflowing: %d frames dropped (%d in the last %v — about %.1f frames/sec at a 25 ms period) — audio processing is not keeping up with the mic.",
+		total, lost, audioDropLogInterval, float64(lost)/audioDropLogInterval.Seconds())
 }
 
 // Stop ends the pipeline and waits for the processing goroutine to finish the

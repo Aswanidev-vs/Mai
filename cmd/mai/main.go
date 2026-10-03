@@ -138,6 +138,11 @@ func main() {
 	// covers typical room reverb + browser playback tail.
 	const postTTSAECWindow = 2500 * time.Millisecond
 
+	// How often the standing mic-level line is repainted. It shares the
+	// pipeline goroutine with the serial capture drain, so it must not write on
+	// every frame — see levelPrintAt.
+	const levelPrintInterval = 250 * time.Millisecond
+
 	// Barge-in tuning (while TTS is playing). A real interruption is a loud,
 	// sustained voice; a one-frame echo leak or a noise/reverb spike must not
 	// cut Mai off mid-sentence. Detection only arms after the AEC warmup
@@ -1834,6 +1839,14 @@ func main() {
 		}
 	}
 
+	// levelPrintAt rate-limits the standing mic-level line. An unbuffered
+	// stdout write per frame (every ~25 ms at a 16 kHz period) contends with the
+	// pipeline goroutine and the timestamped stderr logs, and the stall it
+	// causes lands on the one goroutine that must drain the capture queue
+	// serially — showing up as sporadic dropped frames. The line is a
+	// diagnostic, so 4/sec is more than enough to read a level.
+	var levelPrintAt atomic.Int64
+
 	// handleAudioFrame processes one audio frame.
 	// fromBrowser=true  → browser mic (skips wake word, goes straight to listening)
 	// fromBrowser=false → local system mic (full state machine: wake word + follow-up + listening)
@@ -2125,7 +2138,13 @@ func main() {
 			// Dropped-frames is part of the standing status line, not just a debug
 			// aid: it is the only evidence that the capture thread has never been
 			// stalled by audio processing. Zero here is the duplex property holding.
-			fmt.Printf("\r[AUDIO] Level: %.4f  dropped: %d ", rms, micPipe.Load().Dropped())
+			//
+			// Rate-limited because this runs on the pipeline goroutine: an
+			// unbuffered write per frame competes with the serial drain and shows
+			// up as dropped frames.
+			if rateLimit(&levelPrintAt, levelPrintInterval) {
+				fmt.Printf("\r[AUDIO] Level: %.4f  dropped: %d ", rms, micPipe.Load().Dropped())
+			}
 
 			if time.Since(lastDetected) < time.Duration(cfg.KWS.CooldownMs)*time.Millisecond {
 				return
