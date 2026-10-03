@@ -3,7 +3,9 @@ package main
 import (
 	"math"
 	"math/rand"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -365,4 +367,125 @@ func TestEchoCanceller_PreservesConvergenceAcrossSentences(t *testing.T) {
 
 	assert.Less(t, resRMS, origRMS*0.4, "converged filter must keep residual well below original echo at sentence transition")
 }
+
+// TestEchoCanceller_ResetRacesProcessCleanlyAndStillConverges is the regression
+// for the unsynchronised filter weights. Capture never stops, so Process runs on
+// the pipeline goroutine on every frame while Reset is driven from the TTS /
+// barge-in goroutine; before the lock they zeroed and updated the same slice at
+// once.
+//
+// Silence under -race is only half of what is being asserted. A lock that merely
+// serialised the two — or one that took the weight out of the NLMS update
+// entirely — would also be race free while leaving a canceller that cannot
+// learn. So the filter is re-converged after the hammering and has to actually
+// cancel the echo.
+func TestEchoCanceller_ResetRacesProcessCleanlyAndStillConverges(t *testing.T) {
+	const (
+		n, L     = 1600, 4096
+		frames   = 24
+		converge = 15 * n
+	)
+	// Own reference ring so this cannot interleave with the tests sharing refBuffer.
+	ref := newSpeakerRef(4 * 16000)
+	ec := &EchoCanceller{ref: ref, L: L, w: make([]float32, L), mu: 0.5, eps: 1e-4}
+
+	span := frames * n
+	sig := randomSignal(L+span+converge+n, 7, 0.3)
+	ref.Push(make([]float32, L)) // prime the ring past the tap window
+
+	var resets atomic.Int64
+	processed := make(chan struct{})
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+	go func() { // the capture pipeline goroutine: one Process per frame
+		defer wg.Done()
+		for f := 0; f < frames; f++ {
+			t0 := f * n
+			ref.Push(sig[t0:t0+n])
+			ec.Process(syntheticEcho(sig, t0, n))
+		}
+		close(processed)
+	}()
+	go func() { // the TTS / barge-in goroutine: Reset while capture is live
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			ec.Reset()
+			resets.Add(1)
+			runtime.Gosched()
+		}
+	}()
+
+	<-processed
+	close(stop)
+	wg.Wait()
+
+	// The two sides genuinely overlapped, for the whole of the racing phase
+	// rather than a lucky moment. Without this the concurrent phase could pass
+	// by never racing at all and prove nothing.
+	assert.Greater(t, resets.Load(), int64(1000),
+		"the reset goroutine barely ran, so this test exercised no concurrency")
+
+	// Now re-converge, with no further Resets: the fix must not have cost the
+	// filter its update.
+	var echo, residual []float32
+	for t0 := span; t0 < span+converge; t0 += n {
+		ref.Push(sig[t0:t0+n])
+		echo = syntheticEcho(sig, t0, n)
+		residual = ec.Process(echo)
+	}
+
+	assert.Less(t, rmsOf(residual), rmsOf(echo)*0.4,
+		"the canceller must still converge after Reset raced it")
+}
+
+// TestResampler_ResetClearsHistoryWithoutMovingTheTimeline pins the two
+// properties the barge-in flush leans on: the spline stops reaching back across
+// the cut, and the output stays aligned with the input timeline.
+func TestResampler_ResetClearsHistoryWithoutMovingTheTimeline(t *testing.T) {
+	rs := newResampler(44100, 16000)
+	rs.resample(tone(4410, 0.7))
+	require.Equal(t, float32(0.7), rs.p1, "the fixture must prime real audio as history")
+
+	phase, step := rs.phase, rs.step
+	rs.reset()
+
+	assert.Zero(t, rs.p0)
+	assert.Zero(t, rs.p1)
+	assert.Zero(t, rs.p2)
+	assert.Equal(t, phase, rs.phase, "reset must not move the output timeline")
+	assert.Equal(t, step, rs.step, "reset must not change the conversion ratio")
+}
+
+// TestResampler_SilenceRunIsExactlySilence is the regression for the flushed
+// barge-in window. An all-zero buffer used to be shaped against the real
+// speaker samples still held in the interpolation history, so the reference the
+// AEC learned from began with a tail of the audio that had just been thrown
+// away. The resampler here has already streamed a second of playback first,
+// which is how it lives in production.
+func TestResampler_SilenceRunIsExactlySilence(t *testing.T) {
+	const gap = 4410 // 100 ms at 44.1 kHz, routed as literal zeros
+
+	cut := newResampler(44100, 16000)
+	cut.resample(tone(44100, 0.7))
+	// A second resampler with the identical history, left alone, to show the
+	// reset costs no samples and therefore no phase.
+	continuous := newResampler(44100, 16000)
+	continuous.resample(tone(44100, 0.7))
+
+	out := cut.resample(make([]float32, gap))
+	require.NotEmpty(t, out)
+	for i, s := range out {
+		require.Zero(t, s, "flushed sample %d is a tail of audio the speaker no longer holds", i)
+	}
+	assert.Len(t, out, len(continuous.resample(make([]float32, gap))),
+		"clearing the history must not consume input samples or shift the timeline")
+}
+
 
