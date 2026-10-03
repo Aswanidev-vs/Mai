@@ -39,6 +39,7 @@ import (
 	"github.com/user/mai/internal/perception"
 	"github.com/user/mai/internal/personality"
 	"github.com/user/mai/internal/server"
+	"github.com/user/mai/internal/session"
 	"github.com/user/mai/internal/tools"
 	"github.com/user/mai/internal/tools/adapters"
 	"github.com/user/mai/internal/tools/mcp"
@@ -169,12 +170,53 @@ func main() {
 	var companionServer *server.Server
 	var browserMicActive int32
 	companionHasClient := func() bool { return companionServer != nil && companionServer.ClientCount() > 0 }
-	var capture *audioCapture                  // forward-declared; assigned later
-	var handleAudioFrame func([]float32, bool) // forward-declared; assigned later
+	var capture *audioCapture // forward-declared; assigned later
+
+	// Every captured frame — local mic and browser mic alike — enters here and
+	// nowhere else. The pipeline holds it and hands it to the one goroutine
+	// that owns the AEC, the VAD, the ASR streams and the state machine; the
+	// miniaudio callback and the bus subscriber both come back immediately.
+	//
+	// The pointer is atomic because the browser subscriber is wired by the
+	// companion server *before* the pipeline exists: a browser client that
+	// connects and speaks during startup would otherwise read the pointer
+	// while it is being written. Frames submitted before the pipeline is
+	// installed are dropped — there is nothing listening yet — but they are
+	// dropped from the publisher's goroutine, never from the capture callback.
+	var micPipe atomic.Pointer[audioPipeline]
+	submitAudioFrame := func(samples []float32, fromBrowser bool) {
+		p := micPipe.Load()
+		if p == nil || len(samples) == 0 {
+			return
+		}
+		p.push(micFrame{samples: samples, fromBrowser: fromBrowser})
+	}
 
 	// Echo cancellation for genuine barge-in: subtracts Mai's own TTS (echoed
 	// through the mic) so only a real second speaker survives in the residual.
 	echoCanceller := NewEchoCanceller(4096)
+
+	// The queue depth is not a free parameter: it is latency, and the echo
+	// canceller spends part of it. EchoCanceller.Process correlates a mic
+	// frame against the newest L+n reference samples, so a frame that waited δ
+	// in the queue is a frame whose speaker reference has already moved δ
+	// samples ahead — the adaptive filter then has to model an echo path δ
+	// longer than the real one. Report the observed capture period once, so
+	// that budget is measured rather than assumed: nothing sets the device
+	// period from config.capture_buffer_ms, so the frame length actually in use
+	// is whatever the audio backend picked.
+	var reportFrameLen sync.Once
+	reportFrame := func(n int) {
+		reportFrameLen.Do(func() {
+			lag := audioQueueDepth * n
+			log.Printf("[AUDIO] Capture frame %d samples (%.0f ms); pipeline queue lag budget %d samples against a %d-tap canceller window.",
+				n, float64(n)/16.0, lag, echoCanceller.L)
+			if lag >= echoCanceller.L {
+				log.Printf("[AUDIO] WARNING: the queue lag budget (%d samples) reaches the echo canceller's %d-tap window. Barge-in coherence degrades once frames queue longer than the canceller can model — shorten the capture period or the queue depth.",
+					lag, echoCanceller.L)
+			}
+		})
+	}
 
 	// Background-noise suppression: the mic is streamed through Sherpa-ONNX's
 	// DPDFNet speech enhancer so stationary noise (laptop fans, HVAC, mains
@@ -186,6 +228,16 @@ func main() {
 
 	var bargeStartNano atomic.Int64 // when the residual first crossed the barge-in gate (0 = idle)
 	var ttsStartedNano atomic.Int64 // UnixNano when current TTS playback started
+
+	// Duplex session state. This is NOT yet the owner of isSpeaking /
+	// ttsPlaying / stopPlayback — those atomics stay authoritative for this
+	// wave and the migration that replaces them is later work. What the audio
+	// path uses sessions for today is the one thing it can see for itself: that
+	// a user is talking over Mai's audio. session.Classify labels that burst
+	// (echo / noise / backchannel / barge-in) and Manager accumulates the
+	// overlap lengths, which is the distribution a later wave needs in order to
+	// stop treating "mm-hmm" and "wait, no" identically.
+	sessions := session.NewManager()
 
 	// waitForMicSilence blocks until the mic stays quiet (RMS < 0.0015 for 3 consecutive checks)
 	// or a 500ms deadline is reached. Returns true if silence was detected, false if timed out.
@@ -1386,10 +1438,18 @@ func main() {
 		})
 
 		// Browser mic audio frames → same VAD/ASR pipeline as local mic.
+		//
+		// The bus dispatches subscribers synchronously on the publisher's
+		// goroutine, so this handler *is* the WebSocket read loop. It used to
+		// run the whole front end inline, which parked the socket for as long
+		// as the ASR took; now it only hands the frame to the pipeline and
+		// returns, so browser audio can never stall the publisher and still
+		// reaches the same single processing goroutine as the local mic —
+		// one stream, one AEC, one VAD, one ASR state.
 		bus.Subscribe("perception.audio.frame", func(event interfaces.Event) {
 			samples, _ := event.Payload["samples"].([]float32)
 			if len(samples) > 0 {
-				handleAudioFrame(samples, true)
+				submitAudioFrame(samples, true)
 			}
 		})
 
@@ -1526,14 +1586,40 @@ func main() {
 	var prosodySamples []float32
 	const prosodyMaxSamples = 16000 * 3 // 3 seconds
 
+	// resetVAD discards all VAD state for the finished turn: the queued
+	// segments, the circular buffer, and the detector's own internal
+	// speech/silence machine.
+	//
+	// Popping the queue is not enough. The detector keeps its internal state
+	// machine, so a tail that was mid-"silence" when the turn ended survives and
+	// the next turn inherits it — the follow-up gate (IsEmpty + RMS) would then
+	// trip on leftover state and jump straight to listening before the user has
+	// said anything. That is the same bug class as never resetting Silero VAD
+	// at all, which is why this exists rather than a bare drain.
+	resetVAD := func() {
+		vadDetector.Reset()
+		vadBuffer.Reset()
+	}
+
 	// finalizeTurn routes the accumulated utterance to the agent/legacy
-	// pipeline and resets all per-turn state. Called by both VAD segment-end
-	// and the streaming-ASR endpoint path.
+	// pipeline and resets all per-turn state.
+	//
+	// On the streaming path this is reached ONLY from the recognizer endpoint
+	// (see runListening). On the offline path it is reached from the VAD
+	// segment end. The two cannot share a trigger: GetResult returns the WHOLE
+	// utterance since the last Reset, not a per-segment delta, so a VAD-driven
+	// finalizer on the streaming path would append the full transcript once per
+	// VAD segment and end the turn on Silero's 0.5s silence — duplicating the
+	// text and cutting the speaker off mid-sentence.
 	finalizeTurn := func() {
 		// Display-only transcript of what the user said. Never fed back into
 		// ASR/turn input anywhere else — routing below is the single consumer.
-		if trimmed := strings.TrimSpace(sessionText); trimmed != "" {
-			log.Printf("[USER] %s", trimmed)
+		finalText := strings.TrimSpace(sessionText)
+		if finalText != "" {
+			log.Printf("[USER] %s", finalText)
+			// The authoritative transcript, superseding every interim the
+			// browser is currently rendering for this turn.
+			publishASRTranscript(bus, finalText, true)
 		}
 		if agentBridge != nil {
 			log.Println("[AGENT] Routing to cognitive orchestrator...")
@@ -1558,14 +1644,22 @@ func main() {
 		if recognizer != nil {
 			recognizer.Reset(asrStream)
 		}
+		resetVAD()
 		lastText = ""
 	}
 
 	// updateLiveASR decodes one frame already pushed to asrStream, returns the
-	// partial transcript, and logs it. Shared by the listening and wake-word
-	// states so the user sees live captions in real time in either state.
+	// partial transcript, and publishes it. Shared by the listening and
+	// wake-word states so the user sees live captions in real time in either
+	// state.
 	// Uses log (stderr) rather than fmt.Printf("\r") so the line isn't clobbered
 	// by the timestamped stderr logs.
+	//
+	// Publishing happens only when the text actually changes. GetResult is the
+	// full utterance-so-far and is revised wholesale each chunk, so the caption
+	// is replaceable, not appendable — which is exactly the contract
+	// PartialTranscriptParams documents. One publish per revised chunk is about
+	// 2/sec, cheap enough for the synchronous bus dispatch this runs under.
 	updateLiveASR := func() string {
 		if asrStream == nil {
 			return ""
@@ -1577,6 +1671,7 @@ func main() {
 		if text != "" && text != lastText {
 			lastText = text
 			log.Printf("[ASR] Live: %s%s", sessionText, text)
+			publishASRTranscript(bus, text, false)
 		}
 		return text
 	}
@@ -1602,20 +1697,45 @@ func main() {
 		}
 
 		if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
+			// A dropped frame (audioPipeline overflow) loses audio but cannot
+			// corrupt stream state: AcceptWaveform takes any sample block, the
+			// feature extractor chunks to its own window, and IsReady/Decode is
+			// drained to exhaustion every frame. So the worst a drop causes is a
+			// shorter word; the decoder state, the trailing-blank counter the
+			// endpoint rules read, and the reset between turns all stay coherent.
+			// That is the same guarantee the AEC depends on, and it is why
+			// frames may be dropped here but the stream must still be Reset on
+			// every turn boundary.
 			asrStream.AcceptWaveform(16000, samples)
 			text := updateLiveASR()
 			// Finalize when the recognizer's own endpoint rules fire (e.g.
-			// rule1/rule2 trailing silence). Silero VAD alone is unreliable as
-			// the sole end-of-turn signal — with streaming ASR live text keeps
-			// flowing with no VAD involvement, so a missed VAD segment would
-			// leave the turn stuck at "[ASR] Live:" forever.
+			// rule1/rule2 trailing silence). This is the ONLY thing that ends a
+			// turn on the streaming path.
+			//
+			// The recognizer's rules are the right authority because they measure
+			// trailing BLANKS in the decoder's own best path, which is the only
+			// signal that knows whether the user actually stopped. Silero cannot
+			// substitute: its min_silence_duration is 0.5s, which fires inside a
+			// natural mid-sentence pause and cuts the user off. Conversely the
+			// endpoint cannot be left to run alone either, and the guard below is
+			// what makes it safe:
+			//
+			//  * rule1 carries must_contain_nonsilence=false and a 0s utterance
+			//    floor, so it fires on 2.4s of pure silence EVEN WHEN NOTHING WAS
+			//    DECODED (measured). Without this guard a silent room would end a
+			//    turn every 2.4s and Mai would answer nothing forever.
+			//  * rule2 additionally requires that some non-silence was decoded,
+			//    so once anything has been said it fires at 1.2s of trailing
+			//    silence (measured: 1.66s of silence to the next chunk boundary).
+			//  * rule3 caps the utterance at 20s so a continuously talking user
+			//    still turns over.
+			//
+			// rule1 is therefore the guarantee that a turn always ends: no
+			// combination of silence and VAD behaviour can leave Mai mute.
 			if text != "" && recognizer.IsEndpoint(asrStream) {
 				log.Printf("\n[ASR] Endpoint detected, finalizing (text=%q)", text)
 				sessionText += text + " "
 				finalizeTurn()
-				for !vadDetector.IsEmpty() {
-					vadDetector.Pop()
-				}
 				return
 			}
 		} else {
@@ -1667,16 +1787,21 @@ func main() {
 			vadDetector.Pop()
 
 			if asrStream != nil {
-				// DRAIN: Run any remaining decode cycles before GetResult
-				// so trailing words aren't lost when VAD ends slightly early.
-				for recognizer.IsReady(asrStream) {
-					recognizer.Decode(asrStream)
-				}
-				text := recognizer.GetResult(asrStream).Text
-				if text != "" {
-					sessionText += text + " "
-				}
-				sessionSamples = nil
+				// Streaming path: drain the queue and NOTHING else.
+				//
+				// The VAD is not the turn boundary here, so it must not append
+				// text and must not finalize. It cannot append: GetResult
+				// returns the whole utterance since the last Reset, not a
+				// per-segment delta, so every VAD segment would append the
+				// entire transcript again and Mai would answer the same words
+				// two or three times. It must not finalize either: Silero's
+				// 0.5s min_silence_duration fires inside a natural mid-sentence
+				// pause, which is precisely the cut-off the endpoint rules exist
+				// to avoid.
+				//
+				// Draining is still required — an unpopped segment keeps the
+				// follow-up gate armed against stale state.
+				continue
 			} else if offlineRecognizer != nil {
 				log.Printf("\n[ASR] Processing segment with %s...\n", cfg.ASR.ActiveModel)
 				offlineStream := sherpa.NewOfflineStream(offlineRecognizer)
@@ -1709,17 +1834,31 @@ func main() {
 		}
 	}
 
-	// handleAudioFrame: entry point for audio frames from any source.
+	// handleAudioFrame processes one audio frame.
 	// fromBrowser=true  → browser mic (skips wake word, goes straight to listening)
 	// fromBrowser=false → local system mic (full state machine: wake word + follow-up + listening)
-	handleAudioFrame = func(samples []float32, fromBrowser bool) {
+	//
+	// It is the body of audioPipeline.process and runs ONLY on that pipeline's
+	// one goroutine, which is what makes it safe to touch the AEC weights, the
+	// speech enhancer, the VAD, both ASR streams and the local state variables
+	// without a single additional lock. Do not call it from anywhere else: a
+	// second caller would race all of them at once. Sources go through
+	// submitAudioFrame, which only queues.
+	handleAudioFrame := func(samples []float32, fromBrowser bool) {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("[AUDIO] Panic recovered in audio callback: %v", r)
+				log.Printf("[AUDIO] Panic recovered while processing an audio frame: %v", r)
 			}
 		}()
+		// sherpaMu still matters, but no longer for ordering against the other
+		// audio sources — the pipeline already serialises those. It guards the
+		// sherpa C calls against the *other* goroutines that use them: the
+		// denoiseGate worker drives the speech enhancer's sherpa handles
+		// concurrently, and the offline ASR path in runListening creates and
+		// deletes streams from here.
 		sherpaMu.Lock()
 		defer sherpaMu.Unlock()
+		reportFrame(len(samples))
 
 		var sum float32
 		for _, s := range samples {
@@ -1814,7 +1953,26 @@ func main() {
 					if start == 0 {
 						bargeStartNano.Store(time.Now().UnixNano())
 					} else if held := time.Since(time.Unix(0, start)); held >= bargeInSustain {
-						log.Printf("[BARGE-IN] Real speech over TTS detected (residual RMS=%.4f, mic RMS=%.4f, echo corr=%.2f, held %v). Stopping playback.", crms, rms, coherence, held)
+						// The manager does not own the duplex state yet — this
+						// branch only runs while ttsPlaying is set, so reporting
+						// the transition from here is honest, and it is the one
+						// place on the audio path that knows an overlap is
+						// happening. Label the burst and close the episode:
+						// observation only, the gate above has already decided,
+						// so nothing below can change what Mai does.
+						sessions.SetState(session.StateSpeaking)
+						sessions.ObserveOverlap()
+						class := session.Classify(session.Features{
+							ResidualRMS:       crms,
+							Coherence:         coherence,
+							Speech:            voiced,
+							Overlap:           held,
+							AssistantSpeaking: true,
+						})
+						overlap := sessions.Overlap()
+						log.Printf("[BARGE-IN] Real speech over TTS detected (residual RMS=%.4f, mic RMS=%.4f, echo corr=%.2f, held %v, class=%s, overlaps=%d). Stopping playback.",
+							crms, rms, coherence, held, class, overlap.Count)
+						sessions.SetState(session.StateIdle)
 						bargeStartNano.Store(0)
 						atomic.StoreInt32(&stopPlayback, 1)
 						if interruptCurrent != nil {
@@ -1826,8 +1984,15 @@ func main() {
 						lastText = ""
 						sessionSamples = nil
 						if recognizer != nil {
+							// Drop any half-heard utterance Mai was transcribing
+							// before she was cut off. Without this the user's
+							// interrupting words would continue the abandoned
+							// stream and get prefixed to the old one.
 							recognizer.Reset(asrStream)
 						}
+						// Same reason for the VAD: whatever it queued while Mai
+						// was speaking belongs to her audio, not to this turn.
+						resetVAD()
 						// Feed the user's (echo-free) words to VAD + ASR and keep listening.
 						vadBuffer.Push(clean)
 						for vadBuffer.Size() >= cfg.VAD.WindowSize {
@@ -1938,9 +2103,9 @@ func main() {
 						if recognizer != nil {
 							recognizer.Reset(asrStream)
 						}
-						for !vadDetector.IsEmpty() {
-							vadDetector.Pop()
-						}
+						// Entering a new turn: drop the VAD state that armed this
+						// one, or the next turn inherits the pause it just saw.
+						resetVAD()
 						return
 					}
 				}
@@ -1957,7 +2122,10 @@ func main() {
 				updateLiveASR()
 			}
 
-			fmt.Printf("\r[AUDIO] Level: %.4f ", rms)
+			// Dropped-frames is part of the standing status line, not just a debug
+			// aid: it is the only evidence that the capture thread has never been
+			// stalled by audio processing. Zero here is the duplex property holding.
+			fmt.Printf("\r[AUDIO] Level: %.4f  dropped: %d ", rms, micPipe.Load().Dropped())
 
 			if time.Since(lastDetected) < time.Duration(cfg.KWS.CooldownMs)*time.Millisecond {
 				return
@@ -1980,6 +2148,7 @@ func main() {
 					sessionSamples = nil
 					sherpa.DeleteCircularBuffer(vadBuffer)
 					vadBuffer = sherpa.NewCircularBuffer(10 * 16000)
+					resetVAD()
 					if recognizer != nil {
 						recognizer.Reset(asrStream)
 					}
@@ -1993,8 +2162,15 @@ func main() {
 		}
 	}
 
+	micPipe.Store(newAudioPipeline(func(f micFrame) { handleAudioFrame(f.samples, f.fromBrowser) }))
+
+	// The capture callback. This runs on miniaudio's device thread and must do
+	// as close to nothing as possible: a bounded queue hand-off is the whole
+	// job. Every millisecond spent in here is audio the microphone did not
+	// capture, so there is no RMS scan, no echo cancellation, no logging and
+	// no lock that anything else could hold — the pipeline's push never blocks.
 	capture.onSamples = func(samples []float32) {
-		handleAudioFrame(samples, false)
+		submitAudioFrame(samples, false)
 	}
 
 	// Start capture
@@ -2012,6 +2188,15 @@ func main() {
 
 	cancel() // Cancel the background context (stops Ollama requests, etc.)
 	capture.Stop()
+	// Stop the audio pipeline *before* closing workerChan, and after stopping
+	// capture. The processing goroutine sends finalized turns into workerChan
+	// from inside handleAudioFrame, so joining it first is what keeps a frame
+	// that was already in flight from sending on a closed channel during
+	// shutdown.
+	if dropped := micPipe.Load().Dropped(); dropped > 0 {
+		log.Printf("[AUDIO-PIPELINE] Shutting down after dropping %d frame(s) to queue pressure.", dropped)
+	}
+	micPipe.Load().Stop()
 	close(workerChan)
 
 	// Stop speech and join every goroutine that may be inside sherpa's
@@ -2238,6 +2423,36 @@ func publishTranscript(bus interfaces.EventBus, text string, done bool) {
 		Payload: map[string]interface{}{
 			"text": text,
 			"done": done,
+		},
+	})
+}
+
+// publishASRTranscript forwards one live ASR result to the browser companion as
+// asr.partial (final=false) or asr.final (final=true).
+//
+// It publishes to the bus rather than holding a *server.Bridge because the
+// voice path has no bridge handle, and because the bridge already subscribes to
+// this topic. Cost on the audio goroutine matters: internal/events dispatches
+// subscribers synchronously on the caller's goroutine, so this is only safe
+// because the handler is a single non-blocking hub broadcast.
+//
+// Callers must therefore publish on CHANGES, not per frame. The streaming
+// recognizer only produces new text every 560ms chunk, so one publish per
+// revised result is ~2/sec.
+func publishASRTranscript(bus interfaces.EventBus, text string, final bool) {
+	if bus == nil || text == "" {
+		return
+	}
+	// turn_id is intentionally left unset: internal/server/protocol.go documents
+	// that clients must treat a missing turn_id as "current utterance" until the
+	// turn coordinator lands. Inventing an ID scheme here would only create a
+	// second one for that wave to reconcile against.
+	bus.Publish(interfaces.Event{
+		Type:   "perception.audio.partial",
+		Source: "main.asr",
+		Payload: map[string]interface{}{
+			"text":  text,
+			"final": final,
 		},
 	})
 }

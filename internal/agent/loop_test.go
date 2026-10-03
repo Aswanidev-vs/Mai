@@ -526,6 +526,7 @@ func TestPublishTTSDropsUnspeakableFragments(t *testing.T) {
 	o := &Orchestrator{
 		emotion:    personality.NewEmotionDetector(),
 		ttsAdapter: personality.NewTTSAdapter(1.25, 1, 1),
+		interrupts: NewInterruptManager(),
 	}
 	var got []ttsEvent
 	o.TTSFunc = func(text string, _ personality.TTSParams, seq int64, final bool) {
@@ -557,6 +558,7 @@ func TestTTSTurnLifecycle(t *testing.T) {
 	o := &Orchestrator{
 		emotion:    personality.NewEmotionDetector(),
 		ttsAdapter: personality.NewTTSAdapter(1.25, 1, 1),
+		interrupts: NewInterruptManager(),
 	}
 	var got []ttsEvent
 	o.TTSFunc = func(text string, _ personality.TTSParams, seq int64, final bool) {

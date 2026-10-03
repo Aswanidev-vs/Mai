@@ -64,6 +64,12 @@ vad:
 
 asr:
   # Active model: "qwen3" | "nemotron" | "omnilingual" | "transducer"
+  #
+  # "nemotron" is the streaming transducer: it decodes while the user is still
+  # talking, so partial transcripts exist mid-sentence and a turn can end
+  # ~1.7s after they stop instead of after the whole utterance is re-decoded.
+  # "qwen3" remains available and is still the offline path — it decodes one
+  # complete utterance and emits exactly one final transcript.
   active_model: "qwen3"
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
@@ -94,12 +100,34 @@ asr:
     decoder: "decoder.int8.onnx"
     joiner: "joiner.int8.onnx"
     tokens: "tokens.txt"
-    language: "en"  # or "auto" for auto-detection
+    # "auto" is not a quality preference, it is the difference between a
+    # transcript and silence. This model is prompt-based: measured against the
+    # shipped test wavs, pinning "en" while the speaker used another language
+    # produced an EMPTY result (zero tokens) rather than a mislabelled one —
+    # a silent no-audio failure with no error anywhere. Auto-detection returns
+    # the same text as no prompt at all, so it costs nothing and cannot fail
+    # this way. Set a specific code ("en", "hi", ...) only to pin a language.
+    language: "auto"
     decoding_method: "greedy_search"
     max_active_paths: 4
     enable_endpoint: 1
+    # Endpoint rules decide when a turn is over. They are read as
+    # (trailing silence, utterance length) pairs, both in SECONDS:
+    #   rule1 — 2.4s of trailing silence, regardless of what was decoded. This
+    #           is the guarantee that a turn always eventually ends.
+    #   rule2 — trailing silence of 1.2s, but only once something was decoded.
+    #           This is the prompt path, and the one that must not fire early.
+    #   rule3 — a 20s utterance, i.e. a longest-utterance backstop, not a floor.
+    #
+    # rule2 was measured at 0.8, 1.2 and 2.4 on a real 6.3s utterance:
+    # 0.8 and 1.2 both ended the turn after 1.66s of trailing silence (the
+    # decoder only emits new trailing blanks on its 560ms chunk boundary, so
+    # anything in that range rounds up to the same chunk), and 2.4 took 2.78s.
+    # 0.8 bought no latency and did cut the speaker off mid-sentence — an
+    # endpoint fired before a 0.8s pause inside the utterance. 1.2 tolerated
+    # that same pause. Identical latency, no cut, so rule2 stays at 1.2.
     rule1_min_trailing_silence: 2.4
-    rule2_min_trailing_silence: 0.8
+    rule2_min_trailing_silence: 1.2
     rule3_min_utterance_length: 20
 
   # Omnilingual ASR (offline CTC, 1600+ languages incl. Malayalam)

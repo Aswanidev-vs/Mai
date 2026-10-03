@@ -77,6 +77,35 @@ func newResampler(inRate, outRate int) *resampler {
 	return &resampler{step: float64(inRate) / float64(outRate)}
 }
 
+// allZero reports whether a buffer is exact digital silence.
+func allZero(in []float32) bool {
+	for _, s := range in {
+		if s != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// reset clears the interpolation history, so the next output is shaped only by
+// samples that arrive after the call rather than by a spline reaching back
+// across a gap.
+//
+// It deliberately leaves phase alone. Phase is the resampler's position on the
+// output timeline, and dropping it would shift every later output sample
+// relative to the room — the echo reference exists to stay sample-aligned with
+// what the speaker actually emitted.
+//
+// The history is seeded to exact zero and marked full (has=3) rather than left
+// empty (has=0) for two reasons. An exact zero then interpolates to an exact
+// zero, instead of ringing through the step of a zero-order hold; and no input
+// samples are consumed re-seeding it, so the output length — and therefore the
+// timeline — is bit-for-bit what it would have been without the reset.
+func (r *resampler) reset() {
+	r.p0, r.p1, r.p2 = 0, 0, 0
+	r.has = 3
+}
+
 func (r *resampler) resample(in []float32) []float32 {
 	if len(in) == 0 {
 		return nil
@@ -86,6 +115,38 @@ func (r *resampler) resample(in []float32) []float32 {
 		copy(out, in)
 		return out
 	}
+
+	// An all-zero buffer is a cut in the signal, not a continuation of it:
+	// nothing before it is adjacent to anything after it, so the spline must
+	// not reach across it.
+	//
+	// This is what makes markFlushedSilence's contract real. That function
+	// routes a barge-in's discarded duration through this resampler as literal
+	// zeros in order to advance the echo reference by the skipped time, and the
+	// whole point of advancing it with silence is that the flushed window is
+	// exactly silence. Carrying the interpolation history into it instead put a
+	// Catmull-Rom tail of Mai's last real samples at the head of that window:
+	// the AEC was then handed a phantom of the audio just flushed, and the
+	// main.go comment about the flushed window being exactly silence was not
+	// true. Production never noticed because resamplers start their life with
+	// has==0, so the first flush in a process is the only one that ever worked.
+	//
+	// Exact silence beats a correctly continuous tail here, and the reason is
+	// specific to this consumer. The flushed window is a real discontinuity in
+	// the speaker's output — she stopped — so there is no correct continuation
+	// to preserve, and the tail's only contribution is the phantom. Re-convergence
+	// is also not the cost it looks like: after a barge-in the speaker is silent,
+	// so there is no echo to cancel until the next utterance, which starts a
+	// fresh reference anyway.
+	//
+	// The other callers are unaffected in kind. An exact-zero chunk reaching the
+	// browser playback resampler or the pitch shifter is digital silence spliced
+	// into the stream, and cutting it hard is a more faithful rendering than
+	// letting the spline ring across the step edge.
+	if allZero(in) {
+		r.reset()
+	}
+
 	out := make([]float32, 0, int(float64(len(in))/r.step)+4)
 	start := 0
 
@@ -133,8 +194,27 @@ func (r *resampler) resample(in []float32) []float32 {
 // EchoCanceller performs adaptive (NLMS) acoustic echo cancellation. It
 // estimates the speaker→mic echo path from the reference and subtracts it,
 // leaving the residual (near-end / user) speech.
+//
+// Capture never stops, so Process runs on every incoming frame for the whole
+// life of the program, while Reset is driven from the TTS/barge-in side. The
+// weights are therefore shared across goroutines and are guarded.
 type EchoCanceller struct {
 	ref *speakerRef
+
+	// wmu guards w, the adaptive weights.
+	//
+	// The contenders are Process (which both reads and writes them, in the NLMS
+	// update) and Reset (which zeroes them). Both are writers, so an RWMutex
+	// buys nothing here and costs more: every Process would take the write lock
+	// anyway, and the reader side has no member on the audio path at all — the
+	// only other reader, EchoCoherence, touches just the immutable slice header.
+	// A plain Mutex is therefore both simpler and cheaper. It is uncontended in
+	// normal operation: one lock/unlock per 25 ms frame, ~20 ns against the
+	// ~8000 multiply-adds Process already performs, so the hot path is
+	// unaffected. The lock is taken once per frame and never inside the tap
+	// loop, because the whole frame has to see one consistent set of weights.
+	wmu sync.Mutex
+
 	L   int
 	w   []float32
 	mu  float32
@@ -157,10 +237,13 @@ func NewEchoCanceller(L int) *EchoCanceller {
 // Reset clears the adaptive filter weights so the canceller re-learns
 // the echo path from scratch. Call after barge-in or when the acoustic
 // environment changes significantly.
+//
+// Safe to call while Process is running on the capture goroutine: the weights
+// are swapped out under the same lock Process's NLMS update takes.
 func (e *EchoCanceller) Reset() {
-	for k := range e.w {
-		e.w[k] = 0
-	}
+	e.wmu.Lock()
+	defer e.wmu.Unlock()
+	clear(e.w)
 }
 
 // Process returns the echo-cancelled residual for a mic frame. The reference
@@ -168,7 +251,7 @@ func (e *EchoCanceller) Reset() {
 // delay within L samples, so any room/capture latency below L is absorbed.
 //
 // This is the per-frame hot path and deliberately does no coherence analysis —
-// see EchoCoherence for that.
+// see EchoCoherence for that. It may run concurrently with Reset.
 func (e *EchoCanceller) Process(frame []float32) []float32 {
 	n := len(frame)
 	if n == 0 {
@@ -181,6 +264,12 @@ func (e *EchoCanceller) Process(frame []float32) []float32 {
 		copy(out, frame)
 		return out
 	}
+
+	// Held for the whole frame: the estimate and the update both read the same
+	// weights, and a Reset landing between them would teach the filter from a
+	// mixture of two different models.
+	e.wmu.Lock()
+	defer e.wmu.Unlock()
 
 	var norm float32
 	for k := 0; k < L; k++ {
@@ -245,6 +334,8 @@ const coherenceDecim = 4
 // that costs ~1.6M multiply-adds, it is meant to be called only when a cheaper
 // energy gate has already fired, not on every frame.
 func (e *EchoCanceller) EchoCoherence(residual []float32) float64 {
+	// No weight lock is taken here: this reads only L and the slice header of
+	// w, both fixed at construction. The weights themselves are never touched.
 	n := len(residual)
 	if n == 0 {
 		return 0

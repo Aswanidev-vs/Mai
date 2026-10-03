@@ -106,6 +106,19 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		})
 	})
 
+	// Live ASR results → WS clients so the browser can render interim text
+	// instead of waiting for the utterance to finish.
+	bus.Subscribe("perception.audio.partial", func(event interfaces.Event) {
+		text, _ := event.Payload["text"].(string)
+		final, _ := event.Payload["final"].(bool)
+		turnID, _ := event.Payload["turn_id"].(string)
+		b.PublishPartialTranscript(PartialTranscriptParams{
+			Text:   text,
+			Final:  final,
+			TurnID: turnID,
+		})
+	})
+
 	// Dance request from the orchestrator → browser tells the avatar to dance.
 	bus.Subscribe("companion.dance", func(event interfaces.Event) {
 		log.Println("[BRIDGE] Dance request → browser")
@@ -155,6 +168,23 @@ func (b *Bridge) startStatusPoller(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// PublishPartialTranscript sends a live ASR result to every connected client,
+// selecting asr.partial or asr.final from params.Final. cmd/mai calls this
+// directly from its ASR decode path (the live result currently only reaches
+// log.Printf), and any producer holding an event bus may instead publish
+// "perception.audio.partial" with text/final/turn_id in the payload. Safe to
+// call from any goroutine: the hub serializes broadcasts over its channel.
+func (b *Bridge) PublishPartialTranscript(params PartialTranscriptParams) {
+	if params.Text == "" {
+		return
+	}
+	method := NotifPartialTranscript
+	if params.Final {
+		method = NotifFinalTranscript
+	}
+	b.hub.BroadcastNotification(method, params)
 }
 
 func (b *Bridge) Stop() {

@@ -3,6 +3,7 @@ package server
 import (
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -26,12 +27,12 @@ type Client struct {
 
 // Hub manages all connected WebSocket clients.
 type Hub struct {
-	clients      map[*Client]bool
-	broadcast    chan []byte
-	register     chan *Client
-	unregister   chan *Client
-	mu           sync.RWMutex
-	eventBus     interfaces.EventBus
+	clients       map[*Client]bool
+	broadcast     chan []byte
+	register      chan *Client
+	unregister    chan *Client
+	mu            sync.RWMutex
+	eventBus      interfaces.EventBus
 	getStatusFunc func() string
 	onClientGone  func() // called after a client fully disconnects
 }
@@ -96,9 +97,46 @@ func (h *Hub) Run() {
 	}
 }
 
+// broadcastDrops counts notifications shed since the last report, and
+// broadcastLastReport is the UnixNano of that report. Drops are only worth
+// saying out loud when they are sustained — the publishers that matter here
+// (interim ASR transcripts) run at roughly ten per second, so a log line per
+// drop would cost more than the drops themselves.
+var (
+	broadcastDrops       atomic.Int64
+	broadcastLastReport  atomic.Int64
+	broadcastReportEvery = 30 * time.Second
+)
+
+// reportBroadcastDrops logs the accumulated drop count at most once per
+// broadcastReportEvery. It is called only on the drop path, which is already
+// the slow path, so it stays lock-free.
+func reportBroadcastDrops() {
+	now := time.Now().UnixNano()
+	last := broadcastLastReport.Load()
+	if now-last < int64(broadcastReportEvery) || !broadcastLastReport.CompareAndSwap(last, now) {
+		return
+	}
+	if n := broadcastDrops.Swap(0); n > 0 {
+		log.Printf("[WS] Hub not draining: dropped %d notification(s) in the last %v", n, broadcastReportEvery)
+	}
+}
+
 // BroadcastToAll sends a message to every connected client.
+//
+// The send is deliberately non-blocking, matching SendToClient above. The
+// event bus dispatches subscribers on the *publisher's* goroutine, so a blocking
+// send here would stall whatever produced the notification — for interim ASR
+// transcripts that is the audio pipeline, where a stall drops microphone frames.
+// Shedding a notification is always preferable to that: the next one supersedes
+// it, and Run() above already evicts clients that cannot keep up.
 func (h *Hub) BroadcastToAll(data []byte) {
-	h.broadcast <- data
+	select {
+	case h.broadcast <- data:
+	default:
+		broadcastDrops.Add(1)
+		reportBroadcastDrops()
+	}
 }
 
 // SendToClient sends a message to a specific client.

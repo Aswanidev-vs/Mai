@@ -38,6 +38,10 @@ const (
 	NotifMemoryUpdate  = "memory.update"
 	NotifDance         = "companion.dance"
 	NotifAction        = "companion.action"
+	// NotifPartialTranscript carries an in-progress ASR result (final=false) and
+	// NotifFinalTranscript the authoritative one for the utterance (final=true).
+	NotifPartialTranscript = "asr.partial"
+	NotifFinalTranscript   = "asr.final"
 )
 
 // ChatInputParams is the payload for chat.input.
@@ -98,4 +102,20 @@ type ConfigChangedParams struct {
 type AudioInputParams struct {
 	Audio      string `json:"audio"`
 	SampleRate int    `json:"sample_rate"`
+}
+
+// PartialTranscriptParams carries one live ASR result for the utterance the user
+// is currently speaking. Interim results (Final=false) are provisional: the
+// recognizer may revise or replace the whole string, so a client should render
+// them as a single replaceable caption rather than as appended tokens. The
+// authoritative result arrives as NotifFinalTranscript with Final=true.
+type PartialTranscriptParams struct {
+	Text  string `json:"text"`
+	Final bool   `json:"final"`
+	// TurnID ties every interim and final result to the utterance it belongs to,
+	// so a client can discard partials left over from a turn it already finished.
+	// The server may leave this at its zero value until the turn coordinator
+	// lands; until then clients must treat a missing turn_id as "current
+	// utterance" rather than assuming the ID never changes.
+	TurnID string `json:"turn_id,omitempty"`
 }

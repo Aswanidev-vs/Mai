@@ -23,13 +23,13 @@ type InterruptRequest struct {
 }
 
 type InterruptManager struct {
-	mu              sync.RWMutex
-	currentLevel    InterruptLevel
-	isSpeaking      bool
-	isProcessing    bool
-	queue           []InterruptRequest
-	onInterrupt     func(message string)
-	onQueueProcess  func(message string)
+	mu             sync.RWMutex
+	currentLevel   InterruptLevel
+	isSpeaking     bool
+	isProcessing   bool
+	queue          []InterruptRequest
+	onInterrupt    func(message string)
+	onQueueProcess func(message string)
 }
 
 func NewInterruptManager() *InterruptManager {
@@ -46,11 +46,64 @@ func (im *InterruptManager) SetCallbacks(onInterrupt func(string), onQueueProces
 	im.onQueueProcess = onQueueProcess
 }
 
+// SetState pushes the authoritative pipeline flags in one call. The audio
+// pipeline owns them (it knows when playback actually starts and stops), so
+// this is the entry point cmd/mai uses from its speaking/processing
+// transitions.
 func (im *InterruptManager) SetState(speaking, processing bool) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 	im.isSpeaking = speaking
 	im.isProcessing = processing
+}
+
+// SetSpeaking and SetProcessing update one flag at a time, so a turn that only
+// knows about one side of the pipeline cannot clobber the other.
+func (im *InterruptManager) SetSpeaking(speaking bool) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.isSpeaking = speaking
+}
+
+func (im *InterruptManager) SetProcessing(processing bool) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.isProcessing = processing
+}
+
+func (im *InterruptManager) State() (speaking, processing bool) {
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+	return im.isSpeaking, im.isProcessing
+}
+
+// InterruptPolicy is how an interruption is carried out, per
+// DUPLEX_IMPLEMENTATION_PLAN.md §8.4.
+type InterruptPolicy int
+
+const (
+	// PolicySoft finishes the sentence in flight, then stops generation.
+	PolicySoft InterruptPolicy = iota
+	// PolicyHard stops playback and cancels generation immediately.
+	PolicyHard
+	// PolicyProviderManaged leaves cancellation and truncation to the realtime
+	// session, which owns its own response lifecycle.
+	PolicyProviderManaged
+)
+
+// PolicyFor maps a classified utterance onto an interruption policy. The
+// level alone decides: HIGH and above is the existing hard barge-in gate,
+// which the plan keeps as the safe default, and everything below it is a
+// backchannel or short correction.
+func PolicyFor(level InterruptLevel, providerManaged bool) InterruptPolicy {
+	switch {
+	case providerManaged:
+		return PolicyProviderManaged
+	case level >= InterruptHigh:
+		return PolicyHard
+	default:
+		return PolicySoft
+	}
 }
 
 func (im *InterruptManager) CanInterrupt(level InterruptLevel) bool {
@@ -78,45 +131,44 @@ func (im *InterruptManager) CanInterrupt(level InterruptLevel) bool {
 
 func (im *InterruptManager) RequestInterrupt(req InterruptRequest) bool {
 	im.mu.Lock()
-	defer im.mu.Unlock()
-
-	if req.Level >= InterruptCritical {
+	var notify func(string)
+	accepted := true
+	fireCallback := false
+	switch {
+	case req.Level >= InterruptCritical:
 		log.Printf("[Interrupt] CRITICAL interrupt from %s: %s", req.Source, req.Message)
 		im.currentLevel = req.Level
-		if req.Callback != nil {
-			req.Callback()
-		}
-		if im.onInterrupt != nil {
-			im.onInterrupt(req.Message)
-		}
-		return true
-	}
-
-	if req.Level >= InterruptHigh && (im.isSpeaking || im.isProcessing) {
+		notify = im.onInterrupt
+		fireCallback = true
+	case req.Level >= InterruptHigh && (im.isSpeaking || im.isProcessing):
 		log.Printf("[Interrupt] HIGH interrupt from %s: %s", req.Source, req.Message)
 		im.currentLevel = req.Level
-		if im.onInterrupt != nil {
-			im.onInterrupt(req.Message)
-		}
-		return true
-	}
-
-	if !im.isSpeaking && !im.isProcessing {
+		notify = im.onInterrupt
+	case im.isSpeaking || im.isProcessing:
+		log.Printf("[Interrupt] Queued %s interrupt from %s", levelName(req.Level), req.Source)
+		im.queue = append(im.queue, req)
+		accepted = false
+	default:
 		log.Printf("[Interrupt] Accepted %s interrupt from %s", levelName(req.Level), req.Source)
 		im.currentLevel = req.Level
-		return true
 	}
+	im.mu.Unlock()
 
-	log.Printf("[Interrupt] Queued %s interrupt from %s", levelName(req.Level), req.Source)
-	im.queue = append(im.queue, req)
-	return false
+	// Fired outside the lock: onInterrupt cancels the turn and publishes
+	// agent.interrupt, which can come straight back here through Speak().
+	if fireCallback && req.Callback != nil {
+		req.Callback()
+	}
+	if notify != nil {
+		notify(req.Message)
+	}
+	return accepted
 }
 
 func (im *InterruptManager) ProcessQueue() {
 	im.mu.Lock()
-	defer im.mu.Unlock()
-
 	if len(im.queue) == 0 || im.isSpeaking || im.isProcessing {
+		im.mu.Unlock()
 		return
 	}
 
@@ -129,10 +181,12 @@ func (im *InterruptManager) ProcessQueue() {
 
 	req := im.queue[highest]
 	im.queue = append(im.queue[:highest], im.queue[highest+1:]...)
+	notify := im.onQueueProcess
+	im.mu.Unlock()
 
 	log.Printf("[Interrupt] Processing queued interrupt from %s: %s", req.Source, req.Message)
-	if im.onQueueProcess != nil {
-		im.onQueueProcess(req.Message)
+	if notify != nil {
+		notify(req.Message)
 	}
 }
 

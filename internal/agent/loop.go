@@ -48,7 +48,9 @@ type Orchestrator struct {
 	turnMu        sync.Mutex
 	currentCancel context.CancelFunc // cancels the in-flight LLM stream (barge-in)
 
-	status       interfaces.AgentStatus
+	// status is read from the server's request goroutines while HandleInput
+	// writes it, so it is stored atomically rather than as a plain field.
+	status       atomic.Value // interfaces.AgentStatus
 	cancel       context.CancelFunc
 	lastUserTime time.Time
 	lastSpoken   string
@@ -103,6 +105,11 @@ type Orchestrator struct {
 	ttsTurnOpen bool
 
 	skillsRunner *skills.Runner
+
+	// softStop is armed by a soft interrupt. The stream loop then stops
+	// handing sentences to TTS and cancels the turn, so audio stops at a
+	// sentence boundary instead of mid-word.
+	softStop atomic.Bool
 }
 
 func NewOrchestrator(
@@ -134,10 +141,10 @@ func NewOrchestrator(
 		interrupts:   NewInterruptManager(),
 		prosody:      personality.NewProsodyAnalyzer(),
 		ttsAdapter:   personality.NewTTSAdapter(1.25, 1.0, 1.0),
-		status:       interfaces.StatusIdle,
 		skillsRunner: skillsRunner,
 		genOpts:      genOpts,
 	}
+	o.setStatus(interfaces.StatusIdle)
 
 	// Real context compression: when working memory drops old entries, the
 	// LLM summarizes them and the summary is re-injected, so long sessions
@@ -289,7 +296,7 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 	}()
 
 	log.Println("[Agent] Orchestrator started with JARVIS-level capabilities")
-	o.status = interfaces.StatusIdle
+	o.setStatus(interfaces.StatusIdle)
 
 	<-agentCtx.Done()
 	return nil
@@ -312,7 +319,7 @@ func (o *Orchestrator) analyzePatterns(ctx context.Context) {
 }
 
 func (o *Orchestrator) proactiveMonitor(ctx context.Context) {
-	if o.status != interfaces.StatusIdle {
+	if o.statusValue() != interfaces.StatusIdle {
 		return
 	}
 
@@ -456,11 +463,13 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return &interfaces.AgentResponse{Text: resp, Success: true}, nil
 	}
 
-	o.status = interfaces.StatusThinking
+	o.setStatus(interfaces.StatusThinking)
+	o.interrupts.SetProcessing(true)
 	o.lastUserTime = time.Now()
 	startTime := time.Now()
 	defer func() {
-		o.status = interfaces.StatusIdle
+		o.setStatus(interfaces.StatusIdle)
+		o.interrupts.SetProcessing(false)
 		o.meta.RecordLatency("handle_input", time.Since(startTime))
 	}()
 
@@ -918,6 +927,7 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	// answer exists; compatibility mode defers TTS until the stream completes.
 	ctx, cancel := context.WithCancel(ctx)
 	o.setTurnCancel(cancel)
+	o.softStop.Store(false)
 	defer func() {
 		cancel()
 		o.setTurnCancel(nil)
@@ -937,6 +947,12 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	var spokenChars int
 
 	onChunk := func(chunk string) {
+		if o.softStop.Load() {
+			// Soft interrupt: whatever the player already has queued finishes,
+			// and the rest of the answer is dropped instead of spoken.
+			o.stopAtBoundary()
+			return
+		}
 		full.WriteString(chunk)
 		pending.WriteString(chunk)
 		// The spoken transcript is the single transcript source: publishTTS
@@ -1470,6 +1486,51 @@ func (o *Orchestrator) InterruptCurrent() {
 	}
 }
 
+// stopAtBoundary performs the soft half of an interrupt: the audio already
+// queued keeps playing to the end of its current sentence, and only then is
+// the turn cancelled. One-shot, so a provider that keeps sending tokens after
+// cancellation cannot loop here.
+func (o *Orchestrator) stopAtBoundary() {
+	if o.softStop.CompareAndSwap(true, false) {
+		log.Println("[Interrupt] Soft interrupt — stopping at the next sentence boundary")
+		o.InterruptCurrent()
+	}
+}
+
+// HandleInterrupt classifies a user utterance — or, for a barge-in caught before
+// ASR finished, whatever partial transcript exists — and applies the matching
+// duplex policy. Hard interrupts already stop the turn and tell the player to
+// halt; a soft interrupt arms the sentence-boundary stop. The returned policy
+// tells the caller what is left to do, which under a provider-managed session
+// is everything: stop local playback and let the provider cancel its own
+// response.
+func (o *Orchestrator) HandleInterrupt(text string, providerManaged bool) InterruptPolicy {
+	level := ClassifyInterrupt(text)
+	policy := PolicyFor(level, providerManaged)
+	switch policy {
+	case PolicyHard:
+		o.interrupts.RequestInterrupt(InterruptRequest{
+			Level: level, Source: "user", Message: text,
+		})
+	case PolicySoft:
+		speaking, processing := o.interrupts.State()
+		if speaking || processing {
+			o.softStop.Store(true)
+			log.Printf("[Interrupt] Soft interrupt from user (speaking=%v processing=%v)", speaking, processing)
+		}
+	}
+	return policy
+}
+
+// SetPipelineState publishes the audio pipeline's authoritative speaking and
+// processing flags to the interrupt manager. The pipeline knows when playback
+// really starts and stops; the orchestrator only infers it from the moment it
+// hands text to the player, so cmd/mai calls this from its playback and turn
+// transitions to keep the manager's view accurate.
+func (o *Orchestrator) SetPipelineState(speaking, processing bool) {
+	o.interrupts.SetState(speaking, processing)
+}
+
 func (o *Orchestrator) AnalyzeProsody(samples []float32, sampleRate int) personality.EmotionState {
 	features := o.prosody.Analyze(samples, sampleRate)
 	return o.prosody.DetectEmotion(features)
@@ -1534,6 +1595,7 @@ func (o *Orchestrator) ttsTurnID() int64 {
 	if !o.ttsTurnOpen {
 		o.ttsTurnSeq = o.ttsSeq.Add(1)
 		o.ttsTurnOpen = true
+		o.interrupts.SetSpeaking(true)
 	}
 	return o.ttsTurnSeq
 }
@@ -1548,7 +1610,14 @@ func (o *Orchestrator) endTTSTurn() {
 	seq, open := o.ttsTurnSeq, o.ttsTurnOpen
 	o.ttsTurnOpen = false
 	o.ttsTurnMu.Unlock()
-	if !open || o.TTSFunc == nil {
+	if !open {
+		return
+	}
+	// Output is over the moment the turn closes, not when the last chunk was
+	// generated: until this, every interrupt manager decision saw Mai as
+	// speaking while the player was still draining its queue.
+	o.interrupts.SetSpeaking(false)
+	if o.TTSFunc == nil {
 		return
 	}
 	o.TTSFunc("", personality.TTSParams{}, seq, true)
@@ -1647,7 +1716,21 @@ func (o *Orchestrator) Speak(text string) {
 }
 
 func (o *Orchestrator) GetStatus() interfaces.AgentStatus {
-	return o.status
+	return o.statusValue()
+}
+
+// setStatus / statusValue publish and read the turn state across goroutines:
+// HandleInput writes it, the event bridge and the proactive ticker read it.
+func (o *Orchestrator) setStatus(s interfaces.AgentStatus) {
+	o.status.Store(s)
+}
+
+func (o *Orchestrator) statusValue() interfaces.AgentStatus {
+	s, _ := o.status.Load().(interfaces.AgentStatus)
+	if s == "" {
+		return interfaces.StatusIdle
+	}
+	return s
 }
 
 func (o *Orchestrator) handleTranscription(event interfaces.Event) {
