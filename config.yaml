@@ -154,7 +154,15 @@ asr:
 
 tts:
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
-  num_threads: 6   # was 2: Supertonic synthesis ~2.5x realtime @2 threads caused inter-sentence gaps; 6 cuts synthesis time (12 logical cores available)
+  num_threads: 4   # was 6, was 2: @2 Supertonic synthesis ran ~2.5x realtime and
+                    # left inter-sentence gaps; @6 fixed that but oversubscribed
+                    # the box. Audio is continuous (denoise 2 + kws 2 + asr 2 +
+                    # vad 2 = 8 ONNX threads that never idle) while TTS is bursty,
+                    # so 6 pushed the total to 14 native threads on 12 logical
+                    # cores. ONNX intra-op pools sit outside GOMAXPROCS, so the Go
+                    # runtime still believed audio had headroom while the OS was
+                    # descheduling its goroutine — which showed up as capture
+                    # queue overflow, not as slow speech. 4 + 8 = 12 = core count.
   debug: 0
   output_sample_rate: 44100  # Supertonic outputs 44.1kHz, Pocket/ZipVoice may differ
 

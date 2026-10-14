@@ -1847,6 +1847,14 @@ func main() {
 	// diagnostic, so 4/sec is more than enough to read a level.
 	var levelPrintAt atomic.Int64
 
+	// levelPeak is the loudest frame since the meter was last repainted.
+	// Reporting the peak of the window rather than whichever single frame
+	// happened to land on the repaint is what makes the readout legible: a
+	// 25 ms frame's RMS swings by orders of magnitude between a syllable and
+	// the pause after it, so sampling one of every ten showed noise floor,
+	// then a full vowel, then noise floor again.
+	var levelPeak float64
+
 	// handleAudioFrame processes one audio frame.
 	// fromBrowser=true  → browser mic (skips wake word, goes straight to listening)
 	// fromBrowser=false → local system mic (full state machine: wake word + follow-up + listening)
@@ -2142,8 +2150,12 @@ func main() {
 			// Rate-limited because this runs on the pipeline goroutine: an
 			// unbuffered write per frame competes with the serial drain and shows
 			// up as dropped frames.
+			if rms > levelPeak {
+				levelPeak = rms
+			}
 			if rateLimit(&levelPrintAt, levelPrintInterval) {
-				fmt.Printf("\r[AUDIO] Level: %.4f  dropped: %d ", rms, micPipe.Load().Dropped())
+				fmt.Printf("\r[AUDIO] Level: %.4f  dropped: %d ", levelPeak, micPipe.Load().Dropped())
+				levelPeak = 0
 			}
 
 			if time.Since(lastDetected) < time.Duration(cfg.KWS.CooldownMs)*time.Millisecond {
