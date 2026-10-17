@@ -351,87 +351,235 @@ class CharacterRenderer {
         this.pixiApp.view.style.left = '0';
         this.pixiApp.view.style.zIndex = '0';
 
-        const stage = this.pixiApp.stage;
+        this._buildPixiScene();
+
+        if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+        this._parallax = { x: 0, y: 0 };
+        this.container.addEventListener('pointermove', (e) => {
+            const rect = this.container.getBoundingClientRect();
+            this._parallax.x = ((e.clientX - rect.left) / rect.width - 0.5) * 2;
+            this._parallax.y = ((e.clientY - rect.top) / rect.height - 0.5) * 2;
+        });
+        this.container.addEventListener('pointerleave', () => {
+            this._parallax.x = 0;
+            this._parallax.y = 0;
+        });
+        this.pixiApp.ticker.add(() => this._tickPixiBackground(performance.now() / 1000));
+    }
+
+    // Rebuilds the room scene for the current panel size (init + resize).
+    _buildPixiScene() {
         const w = this.container.clientWidth;
         const h = this.container.clientHeight;
+        if (!this.pixiApp || w === 0 || h === 0) return;
 
-        // ── Warm gradient background ──
-        const bg = new PIXI.Graphics();
-        bg.beginFill(0xf5e6d3);
-        bg.drawRect(0, 0, w, h);
-        bg.endFill();
-        // Gradient overlay via a tall sprite
-        const gradCanvas = document.createElement('canvas');
-        gradCanvas.width = 1;
-        gradCanvas.height = 256;
-        const gCtx = gradCanvas.getContext('2d');
-        const grad = gCtx.createLinearGradient(0, 0, 0, 256);
-        grad.addColorStop(0, 'rgba(245,230,211,0)');
-        grad.addColorStop(0.4, 'rgba(232,213,192,0.3)');
-        grad.addColorStop(1, 'rgba(212,196,168,0.6)');
-        gCtx.fillStyle = grad;
-        gCtx.fillRect(0, 0, 1, 256);
-        const gradTex = PIXI.Texture.from(gradCanvas);
-        const gradSprite = new PIXI.Sprite(gradTex);
-        gradSprite.width = w;
-        gradSprite.height = h;
-        bg.addChild(gradSprite);
-        stage.addChild(bg);
+        if (this._pixiScene) {
+            this._pixiScene.destroy({ children: true, texture: true, baseTexture: true });
+        }
+        this._pixiSceneW = w;
+        this._pixiSceneH = h;
+        this._pixiScene = new PIXI.Container();
+        this.pixiApp.stage.addChild(this._pixiScene);
 
-        // ── Window ──
-        const winX = w * 0.72;
-        const winY = h * 0.18;
-        const winW = w * 0.18;
-        const winH = h * 0.45;
-        // Frame
+        const back = new PIXI.Container();
+        const mid = new PIXI.Container();
+        const front = new PIXI.Container();
+        this._bgLayers = [back, mid, front];
+
+        const tex = (canvas) => PIXI.Texture.from(canvas);
+        const radialTex = (size, inner, outer) => {
+            const c = document.createElement('canvas');
+            c.width = size;
+            c.height = size;
+            const ctx = c.getContext('2d');
+            const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+            g.addColorStop(0, inner);
+            g.addColorStop(1, outer);
+            ctx.fillStyle = g;
+            ctx.fillRect(0, 0, size, size);
+            return tex(c);
+        };
+
+        // ── Back: wall, floor, window, sunlight ──
+        const wallCanvas = document.createElement('canvas');
+        wallCanvas.width = 1;
+        wallCanvas.height = 512;
+        const wallCtx = wallCanvas.getContext('2d');
+        const wallGrad = wallCtx.createLinearGradient(0, 0, 0, 512);
+        wallGrad.addColorStop(0, '#f7ede1');
+        wallGrad.addColorStop(0.4, '#f1e0c9');
+        wallGrad.addColorStop(0.72, '#e7d0af');
+        wallGrad.addColorStop(1, '#d8bf99');
+        wallCtx.fillStyle = wallGrad;
+        wallCtx.fillRect(0, 0, 1, 512);
+        const wall = new PIXI.Sprite(tex(wallCanvas));
+        wall.position.set(-16, -16);
+        wall.width = w + 32;
+        wall.height = h + 32;
+        back.addChild(wall);
+
+        const bloom = new PIXI.Sprite(radialTex(256, 'rgba(255,238,214,0.5)', 'rgba(255,238,214,0)'));
+        bloom.anchor.set(0.5);
+        bloom.position.set(w * 0.5, h * 0.5);
+        bloom.width = w * 0.95;
+        bloom.height = h * 0.75;
+        back.addChild(bloom);
+
+        const floorCanvas = document.createElement('canvas');
+        floorCanvas.width = 1;
+        floorCanvas.height = 64;
+        const floorCtx = floorCanvas.getContext('2d');
+        const floorGrad = floorCtx.createLinearGradient(0, 0, 0, 64);
+        floorGrad.addColorStop(0, 'rgba(214,186,150,0)');
+        floorGrad.addColorStop(1, 'rgba(188,155,115,0.6)');
+        floorCtx.fillStyle = floorGrad;
+        floorCtx.fillRect(0, 0, 1, 64);
+        const floor = new PIXI.Sprite(tex(floorCanvas));
+        floor.position.set(0, h * 0.74);
+        floor.width = w;
+        floor.height = h * 0.26;
+        back.addChild(floor);
+
+        // The chat panel is a fixed-width glass overlay on the container's
+        // right edge, so compose the room inside the zone that stays visible.
+        const chatRect = document.querySelector('.chat-panel')?.getBoundingClientRect();
+        const contRect = this.container.getBoundingClientRect();
+        const visibleW = chatRect
+            ? Math.max(w * 0.3, Math.min(w, chatRect.left - contRect.left))
+            : w;
+
+        // ── Window (right side of the visible zone, behind the character) ──
+        const winW = Math.min(w * 0.19, visibleW * 0.28);
+        const winH = h * 0.44;
+        const winX = visibleW - winW - visibleW * 0.05;
+        const winY = h * 0.16;
         const frame = new PIXI.Graphics();
         frame.beginFill(0x8b7355);
-        frame.drawRect(winX - 6, winY - 6, winW + 12, winH + 12);
+        frame.drawRect(winX - 7, winY - 7, winW + 14, winH + 14);
         frame.endFill();
-        stage.addChild(frame);
-        // Pane gradient
-        const winCanvas = document.createElement('canvas');
-        winCanvas.width = 128;
-        winCanvas.height = 192;
-        const wCtx = winCanvas.getContext('2d');
-        const wGrad = wCtx.createLinearGradient(0, 0, 0, 192);
-        wGrad.addColorStop(0, '#b8d4e8');
-        wGrad.addColorStop(0.6, '#d4e8f0');
-        wGrad.addColorStop(1, '#f0e8d8');
-        wCtx.fillStyle = wGrad;
-        wCtx.fillRect(0, 0, 128, 192);
-        wCtx.strokeStyle = '#8b7355';
-        wCtx.lineWidth = 3;
-        wCtx.beginPath();
-        wCtx.moveTo(64, 0); wCtx.lineTo(64, 192);
-        wCtx.moveTo(0, 96); wCtx.lineTo(128, 96);
-        wCtx.stroke();
-        const winTex = PIXI.Texture.from(winCanvas);
-        const winSprite = new PIXI.Sprite(winTex);
-        winSprite.x = winX;
-        winSprite.y = winY;
-        winSprite.width = winW;
-        winSprite.height = winH;
-        stage.addChild(winSprite);
-        // Warm glow
-        const glowCanvas = document.createElement('canvas');
-        glowCanvas.width = 128;
-        glowCanvas.height = 128;
-        const glCtx = glowCanvas.getContext('2d');
-        const glGrad = glCtx.createRadialGradient(64, 64, 0, 64, 64, 64);
-        glGrad.addColorStop(0, 'rgba(255,230,180,0.2)');
-        glGrad.addColorStop(1, 'rgba(255,230,180,0)');
-        glCtx.fillStyle = glGrad;
-        glCtx.fillRect(0, 0, 128, 128);
-        const glowTex = PIXI.Texture.from(glowCanvas);
-        const glowSprite = new PIXI.Sprite(glowTex);
-        glowSprite.x = winX - winW * 0.3;
-        glowSprite.y = winY - winH * 0.2;
-        glowSprite.width = winW * 1.6;
-        glowSprite.height = winH * 1.4;
-        stage.addChild(glowSprite);
+        back.addChild(frame);
 
-        // ── Side table + plant ──
+        // Glow sits under the pane so it blooms onto the wall without
+        // washing out the sky itself
+        this._bgGlow = new PIXI.Sprite(radialTex(128, 'rgba(255,230,180,0.35)', 'rgba(255,230,180,0)'));
+        this._bgGlow.anchor.set(0.5);
+        this._bgGlow.position.set(winX + winW / 2, winY + winH / 2);
+        this._bgGlow.width = winW * 1.9;
+        this._bgGlow.height = winH * 1.5;
+        back.addChild(this._bgGlow);
+
+        const skyCanvas = document.createElement('canvas');
+        skyCanvas.width = 128;
+        skyCanvas.height = 192;
+        const skyCtx = skyCanvas.getContext('2d');
+        const skyGrad = skyCtx.createLinearGradient(0, 0, 0, 192);
+        skyGrad.addColorStop(0, '#a7c7e4');
+        skyGrad.addColorStop(0.55, '#cfe3ef');
+        skyGrad.addColorStop(1, '#f4ecd9');
+        skyCtx.fillStyle = skyGrad;
+        skyCtx.fillRect(0, 0, 128, 192);
+        const sky = new PIXI.Sprite(tex(skyCanvas));
+        sky.position.set(winX, winY);
+        sky.width = winW;
+        sky.height = winH;
+        back.addChild(sky);
+
+        const paneMask = new PIXI.Graphics();
+        paneMask.beginFill(0xffffff);
+        paneMask.drawRect(winX, winY, winW, winH);
+        paneMask.endFill();
+        back.addChild(paneMask);
+
+        const cloudCanvas = document.createElement('canvas');
+        cloudCanvas.width = 100;
+        cloudCanvas.height = 50;
+        const cloudCtx = cloudCanvas.getContext('2d');
+        cloudCtx.fillStyle = 'rgba(255,255,255,0.92)';
+        cloudCtx.beginPath();
+        cloudCtx.arc(30, 30, 16, 0, Math.PI * 2);
+        cloudCtx.arc(52, 24, 20, 0, Math.PI * 2);
+        cloudCtx.arc(74, 32, 14, 0, Math.PI * 2);
+        cloudCtx.fill();
+        cloudCtx.fillRect(16, 30, 72, 16);
+        const cloudTex = tex(cloudCanvas);
+        this._bgClouds = [];
+        for (const [scale, yFrac, vx] of [[0.62, 0.2, 0.04], [0.4, 0.52, 0.025]]) {
+            const cloud = new PIXI.Sprite(cloudTex);
+            cloud.width = winW * scale;
+            cloud.height = winH * 0.14;
+            cloud.position.set(winX - cloud.width + Math.random() * winW, winY + winH * yFrac);
+            cloud.alpha = 0.9;
+            cloud._vx = vx;
+            cloud._cloudLeft = winX - cloud.width;
+            cloud._cloudRight = winX + winW;
+            cloud.mask = paneMask;
+            back.addChild(cloud);
+            this._bgClouds.push(cloud);
+        }
+
+        const mullions = new PIXI.Graphics();
+        mullions.lineStyle(Math.max(2, w * 0.0035), 0x8b7355, 1);
+        mullions.moveTo(winX + winW / 2, winY);
+        mullions.lineTo(winX + winW / 2, winY + winH);
+        mullions.moveTo(winX, winY + winH * 0.52);
+        mullions.lineTo(winX + winW, winY + winH * 0.52);
+        back.addChild(mullions);
+
+        const sill = new PIXI.Graphics();
+        sill.beginFill(0x9c8464);
+        sill.drawRect(winX - 10, winY + winH + 5, winW + 20, Math.max(5, h * 0.012));
+        sill.endFill();
+        back.addChild(sill);
+
+        // Sun patch where the shaft lands on the floor (shaft geometry below)
+        const fL = winX / w;
+        const fR = (winX + winW) / w;
+        const fT = (winY + winH * 0.85) / h;
+        const fShift = 0.32;
+        const patch = new PIXI.Sprite(radialTex(256, 'rgba(255,235,190,0.55)', 'rgba(255,235,190,0)'));
+        patch.anchor.set(0.5);
+        patch.position.set(((fL + fR) / 2 - fShift / 2) * w, h * 0.9);
+        patch.width = w * 0.5;
+        patch.height = h * 0.16;
+        back.addChild(patch);
+
+        // God-ray shaft from the window down to the floor
+        const shaftCanvas = document.createElement('canvas');
+        shaftCanvas.width = 256;
+        shaftCanvas.height = 256;
+        const sCtx = shaftCanvas.getContext('2d');
+        sCtx.beginPath();
+        sCtx.moveTo(fL * 256, fT * 256);
+        sCtx.lineTo(fR * 256, fT * 256);
+        sCtx.lineTo(Math.max(0, fR - fShift) * 256, 256);
+        sCtx.lineTo(Math.max(0, fL - fShift) * 256, 256);
+        sCtx.closePath();
+        const shaftGrad = sCtx.createLinearGradient(0, fT * 256, 0, 256);
+        shaftGrad.addColorStop(0, 'rgba(255,242,214,0.55)');
+        shaftGrad.addColorStop(1, 'rgba(255,242,214,0)');
+        sCtx.fillStyle = shaftGrad;
+        sCtx.fill();
+        this._bgShaft = new PIXI.Sprite(tex(shaftCanvas));
+        this._bgShaft.width = w;
+        this._bgShaft.height = h;
+        this._bgShaft.alpha = 0.5;
+        back.addChild(this._bgShaft);
+
+        // ── Mid: furniture, rug, character contact shadow ──
+        const rug = new PIXI.Graphics();
+        rug.beginFill(0xc9a882, 0.5);
+        rug.drawEllipse(w * 0.45, h * 0.92, w * 0.35, h * 0.06);
+        rug.endFill();
+        mid.addChild(rug);
+
+        const shadow = new PIXI.Sprite(radialTex(256, 'rgba(60,40,24,0.4)', 'rgba(60,40,24,0)'));
+        shadow.anchor.set(0.5);
+        shadow.position.set(w * 0.5, h * 0.935);
+        shadow.width = w * 0.5;
+        shadow.height = h * 0.13;
+        mid.addChild(shadow);
+
         const tableX = w * 0.1;
         const tableY = h * 0.7;
         const table = new PIXI.Graphics();
@@ -441,14 +589,19 @@ class CharacterRenderer {
         table.beginFill(0x8b6940);
         table.drawRect(tableX - w * 0.01, tableY - h * 0.01, w * 0.1, h * 0.012);
         table.endFill();
-        stage.addChild(table);
-        // Pot
+        mid.addChild(table);
+
         const pot = new PIXI.Graphics();
         pot.beginFill(0xc4956a);
         pot.drawRect(tableX + w * 0.02, tableY - h * 0.04, w * 0.04, h * 0.035);
         pot.endFill();
-        stage.addChild(pot);
-        // Leaves
+        mid.addChild(pot);
+
+        this._bgPlant = new PIXI.Container();
+        const plantX = tableX + w * 0.04;
+        const plantY = tableY - h * 0.04;
+        this._bgPlant.pivot.set(plantX, plantY);
+        this._bgPlant.position.set(plantX, plantY);
         const leaf = new PIXI.Graphics();
         leaf.beginFill(0x6b9b6b);
         for (let i = 0; i < 5; i++) {
@@ -458,45 +611,74 @@ class CharacterRenderer {
             leaf.drawEllipse(lx, ly, w * 0.008, h * 0.035);
         }
         leaf.endFill();
-        stage.addChild(leaf);
+        this._bgPlant.addChild(leaf);
+        mid.addChild(this._bgPlant);
 
-        // ── Floor rug ──
-        const rug = new PIXI.Graphics();
-        rug.beginFill(0xc9a882, 0.5);
-        rug.drawEllipse(w * 0.45, h * 0.92, w * 0.35, h * 0.06);
-        rug.endFill();
-        stage.addChild(rug);
-
-        // ── Ambient particles (floating dust in window light) ──
+        // ── Front: dust motes drifting through the light ──
+        this._bgDust = {
+            topY: winY * 0.6,
+            bottomY: h * 0.97,
+            shaftTop: h * 0.55,
+            cxTop: (fL + fR) / 2 * w,
+            cxBottom: ((fL + fR) / 2 - fShift / 2) * w,
+            spread: w * 0.34,
+        };
         this.pixiParticles = [];
-        for (let i = 0; i < 12; i++) {
+        for (let i = 0; i < 26; i++) {
             const p = new PIXI.Graphics();
-            p.beginFill(0xffe8c8, 0.3 + Math.random() * 0.3);
-            p.drawCircle(0, 0, 1 + Math.random() * 1.5);
+            p.beginFill(0xffe8c8, 0.4);
+            p.drawCircle(0, 0, 1 + Math.random() * 1.6);
             p.endFill();
-            p.x = winX + Math.random() * winW;
-            p.y = winY + Math.random() * winH;
-            p._vx = (Math.random() - 0.5) * 0.15;
-            p._vy = -0.05 - Math.random() * 0.1;
-            p._life = Math.random() * 200;
-            stage.addChild(p);
+            p._vx = (Math.random() - 0.5) * 0.06;
+            p._vy = 0.02 + Math.random() * 0.05;
+            front.addChild(p);
             this.pixiParticles.push(p);
+            this._spawnDust(p, this._bgDust);
         }
 
-        // Animate particles
-        this.pixiApp.ticker.add(() => {
-            for (const p of this.pixiParticles) {
-                p.x += p._vx;
-                p.y += p._vy;
-                p._life++;
-                p.alpha = 0.3 * Math.sin((p._life % 200) / 200 * Math.PI);
-                if (p.y < winY - 10 || p._life > 200) {
-                    p.x = winX + Math.random() * winW;
-                    p.y = winY + winH * 0.8 + Math.random() * winH * 0.2;
-                    p._life = 0;
-                }
-            }
-        });
+        const vig = new PIXI.Sprite(radialTex(256, 'rgba(30,20,14,0)', 'rgba(30,20,14,0.5)'));
+        vig.width = w;
+        vig.height = h;
+
+        this._pixiScene.addChild(back, mid, front, vig);
+    }
+
+    _spawnDust(p, d) {
+        const y = d.topY + Math.random() * (d.bottomY - d.topY);
+        const prog = clamp((y - d.shaftTop) / Math.max(1, d.bottomY - d.shaftTop), 0, 1);
+        p.x = lerp(d.cxTop, d.cxBottom, prog) + (Math.random() - 0.5) * d.spread;
+        p.y = y;
+        p._life = Math.random() * 200;
+    }
+
+    _tickPixiBackground(t) {
+        if (!this._bgLayers) return;
+
+        // Parallax: foreground layers drift further than the wall
+        const factors = [4, 9, 14];
+        for (let i = 0; i < this._bgLayers.length; i++) {
+            const layer = this._bgLayers[i];
+            layer.x += (this._parallax.x * factors[i] - layer.x) * 0.06;
+            layer.y += (this._parallax.y * factors[i] * 0.5 - layer.y) * 0.06;
+        }
+
+        this._bgPlant.rotation = Math.sin(t * 1.1) * 0.05;
+        this._bgGlow.alpha = 0.85 + Math.sin(t * 0.6) * 0.15;
+        this._bgShaft.alpha = 0.5 + Math.sin(t * 0.45) * 0.12;
+
+        for (const c of this._bgClouds) {
+            c.x += c._vx;
+            if (c.x > c._cloudRight) c.x = c._cloudLeft;
+        }
+
+        const d = this._bgDust;
+        for (const p of this.pixiParticles) {
+            p._life++;
+            p.x += p._vx + Math.sin(p._life * 0.03) * 0.05;
+            p.y += p._vy;
+            p.alpha = 0.12 + 0.38 * Math.abs(Math.sin(p._life * 0.025));
+            if (p.y > d.bottomY || p.x < -4) this._spawnDust(p, d);
+        }
     }
 
     _resize() {
@@ -511,6 +693,15 @@ class CharacterRenderer {
             this.pixiApp.view.style.zIndex = '0';
             this.renderer.domElement.style.position = 'relative';
             this.renderer.domElement.style.zIndex = '1';
+        }
+        // Room layout is drawn at fixed proportions, so rebuild it when the
+        // panel size actually changes. Debounced: ResizeObserver fires on
+        // every pixel while a window is being dragged.
+        if (this.pixiApp && (w !== this._pixiSceneW || h !== this._pixiSceneH)) {
+            this._pixiSceneW = w;
+            this._pixiSceneH = h;
+            clearTimeout(this._pixiRebuildTimer);
+            this._pixiRebuildTimer = setTimeout(() => this._buildPixiScene(), 120);
         }
     }
 
