@@ -265,43 +265,25 @@ class CharacterRenderer {
     _smoothstep(t) { return t * t * (3 - 2 * t); }
 
     async _init() {
-        // ── Rendering Backend: WebGPU → WebGL fallback ──
-        this.renderBackend = 'webgl'; // default
-        this.renderer = null;
+        // ── Rendering backend ──
+        // WebGPU is deliberately not used here: 'three' resolves to the WebGL build
+        // (see the importmap in index.html), so THREE.WebGPURenderer is undefined and
+        // the previous WebGPU attempt always threw. MToonMaterial is also a WebGL
+        // ShaderMaterial — under WebGPU it would need MToonNodeMaterial from
+        // '@pixiv/three-vrm/nodes' plus the 'three/webgpu' build.
+        this.renderBackend = 'webgl';
+        this.renderer = new THREE.WebGLRenderer({
+            antialias: true,          // MSAA — without it every silhouette is a hard jaggied edge
+            alpha: true,
+            powerPreference: 'high-performance',
+        });
+        console.log('[VRM] Using WebGL renderer');
 
-        // Try WebGPU first
-        if (navigator.gpu) {
-            try {
-                const adapter = await navigator.gpu.requestAdapter();
-                if (adapter) {
-                    const device = await adapter.requestDevice();
-                    if (device) {
-                        this.renderer = new THREE.WebGPURenderer({ antialias: false, alpha: true });
-                        this.renderBackend = 'webgpu';
-                        console.log('[VRM] Using WebGPU renderer');
-                    }
-                }
-            } catch (e) {
-                console.warn('[VRM] WebGPU unavailable, falling back to WebGL:', e.message);
-            }
-        }
-
-        // Fallback to WebGL
-        if (!this.renderer) {
-            this.renderer = new THREE.WebGLRenderer({
-                antialias: false,
-                alpha: true,
-                powerPreference: 'high-performance',
-            });
-            this.renderBackend = 'webgl';
-            console.log('[VRM] Using WebGL renderer');
-        }
-
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
         this.renderer.setClearColor(0x000000, 0); // Transparent — PixiJS handles background
         this.renderer.outputColorSpace = THREE.SRGBColorSpace;
         this.renderer.toneMapping = THREE.LinearToneMapping;
-        this.renderer.toneMappingExposure = 1.15;
+        this.renderer.toneMappingExposure = 0.80;
         this.renderer.shadowMap.enabled = false;
         this.container.appendChild(this.renderer.domElement);
         
@@ -312,11 +294,18 @@ class CharacterRenderer {
         this.scene = new THREE.Scene();
         this.camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.01, 100);
 
-        // Warm lighting for VRM character
-        this.scene.add(new THREE.AmbientLight(0xfff0e0, 0.9));
-        const ptLight = new THREE.PointLight(0xffe8c8, 0.5, 20);
-        ptLight.position.set(2, 2, -2);
-        this.scene.add(ptLight);
+        // Three-point rig. MToon needs a directional key to produce form: with only
+        // ambient light the limbs and hair collapse into flat, faceted silhouettes.
+        this.scene.add(new THREE.AmbientLight(0xfff0e0, 0.26));
+        const keyLight = new THREE.DirectionalLight(0xfff4e8, 0.70);
+        keyLight.position.set(1.1, 1.6, 1.4);
+        this.scene.add(keyLight);
+        const fillLight = new THREE.DirectionalLight(0xd8e4ff, 0.25);
+        fillLight.position.set(-1.2, 0.6, 0.9);
+        this.scene.add(fillLight);
+        const rimLight = new THREE.DirectionalLight(0xffffff, 0.22);
+        rimLight.position.set(-0.6, 1.0, -1.6);
+        this.scene.add(rimLight);
 
         // ── PixiJS 2D Background Layer ──
         this._initPixiBackground();
@@ -799,6 +788,48 @@ class CharacterRenderer {
         this.camera.lookAt(this.baseLookAt.x + this.cameraOffsetX, this.baseLookAt.y + this.cameraOffsetY, this.baseLookAt.z);
     }
 
+    // ── Material & shading tuning ──
+    // three-vrm replaces `mesh.material` with an ARRAY [surface, outline] for every
+    // material that gets an MToon outline, so each material has to be visited
+    // individually — touching `mesh.material` directly only mutates the array.
+    _tuneMaterials(vrm) {
+        const maxAnisotropy = this.renderer.capabilities.getMaxAnisotropy();
+        vrm.scene.traverse((obj) => {
+            obj.frustumCulled = false;
+            if (!obj.isMesh || !obj.material) return;
+
+            const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+            for (const mat of materials) {
+                // Keep textures crisp at grazing angles instead of a blurry, hard-edged surface
+                if (mat.map) mat.map.anisotropy = Math.min(8, maxAnisotropy);
+
+                if (!mat.isMToonMaterial) continue;
+
+                // The MToon shader honours FLAT_SHADED (it switches to derivative
+                // normals), so smooth shading must be asserted explicitly and the
+                // material recompiled for the define to change.
+                if (mat.flatShading) {
+                    mat.flatShading = false;
+                    mat.needsUpdate = true;
+                }
+
+                // VRoid ships shadingToonyFactor ~0.95, which makes the light/shade
+                // terminator nearly binary. That hard band is what reads as faceting
+                // on arms, legs and hair — soften it into a gradient.
+                mat.shadingToonyFactor = 0.55;
+
+                // The matcap is a toon-banded view-space ramp; at full strength it
+                // re-introduces hard view-dependent bands on top of the soft terminator.
+                mat.matcapFactor.setScalar(0.15);
+
+                // Outlines are inverted hulls expanded along the (smooth) vertex
+                // normals. At VRoid's default 0.5 mm they alias into a hard 1 px
+                // fringe around every limb and hair strand.
+                if (mat.isOutline) mat.outlineWidthFactor = 0.00025;
+            }
+        });
+    }
+
     // ── Cozy Background System ──
     _loadModel() {
         const loader = new GLTFLoader();
@@ -820,16 +851,7 @@ class CharacterRenderer {
 
             VRMUtils.removeUnnecessaryVertices(vrm.scene);
             VRMUtils.combineSkeletons(vrm.scene);
-            vrm.scene.traverse((obj) => { 
-                obj.frustumCulled = false; 
-                // Aggressive optimization for performance
-                if (obj.isMesh && obj.material) {
-                    obj.material.flatShading = false; // Keep smooth shading for quality
-                    if (obj.material.map) {
-                        obj.material.map.anisotropy = 1; // Reduce texture filtering
-                    }
-                }
-            });
+            this._tuneMaterials(vrm);
 
             this.vrmGroup = new THREE.Group();
             this.vrmGroup.add(vrm.scene);

@@ -70,7 +70,7 @@ asr:
   # ~1.7s after they stop instead of after the whole utterance is re-decoded.
   # "qwen3" remains available and is still the offline path — it decodes one
   # complete utterance and emits exactly one final transcript.
-  active_model: "qwen3"
+  active_model: "nemotron"
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
