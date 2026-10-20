@@ -210,12 +210,16 @@ func main() {
 	// that budget is measured rather than assumed: nothing sets the device
 	// period from config.capture_buffer_ms, so the frame length actually in use
 	// is whatever the audio backend picked.
+	//
+	// The budget has two values, not one: the narrow one above is the budget
+	// while the canceller is live, and the wide one is what the consumer gets
+	// while Mai is silent (see audioIdleLagFrames).
 	var reportFrameLen sync.Once
 	reportFrame := func(n int) {
 		reportFrameLen.Do(func() {
 			lag := audioQueueDepth * n
-			log.Printf("[AUDIO] Capture frame %d samples (%.0f ms); pipeline queue lag budget %d samples against a %d-tap canceller window.",
-				n, float64(n)/16.0, lag, echoCanceller.L)
+			log.Printf("[AUDIO] Capture frame %d samples (%.0f ms); pipeline queue lag budget %d samples while playing and %d samples while idle, against a %d-tap canceller window.",
+				n, float64(n)/16.0, lag, audioIdleLagFrames*n, echoCanceller.L)
 			if lag >= echoCanceller.L {
 				log.Printf("[AUDIO] WARNING: the queue lag budget (%d samples) reaches the echo canceller's %d-tap window. Barge-in coherence degrades once frames queue longer than the canceller can model — shorten the capture period or the queue depth.",
 					lag, echoCanceller.L)
@@ -1165,6 +1169,9 @@ func main() {
 			atomic.StoreInt32(&isSpeaking, 0)
 			atomic.StoreInt32(&ttsPlaying, 0)
 			atomic.StoreInt32(&stopPlayback, 0)
+			// Nothing is playing now, so the consumer may fall as far behind as
+			// the streaming ASR decoder's chunk decode needs it to.
+			micPipe.Load().SetMaxLag(audioIdleLagFrames)
 			lastTTSEndNano.Store(time.Now().UnixNano())
 			publishTTSAudioChunk(bus, nil, 44100, true, mirrored)
 			publishTranscript(bus, "", true)
@@ -1220,6 +1227,11 @@ func main() {
 				if !turnOpen {
 					refBuffer.Clear()
 					echoCanceller.Reset()
+					// The echo canceller is live from this point, so the capture
+					// queue goes back to the tight budget that fits its tap
+					// window. Any backlog beyond it is discarded here: those
+					// frames' speaker reference is already stale.
+					micPipe.Load().SetMaxLag(audioQueueDepth)
 					ttsStartedNano.Store(time.Now().UnixNano())
 					bargeStartNano.Store(0)
 				}
@@ -1547,6 +1559,9 @@ func main() {
 			atomic.StoreInt32(&ttsPlaying, 1)
 			refBuffer.Clear()
 			echoCanceller.Reset()
+			// The echo canceller is live from this point, so the capture queue
+			// has to go back to the tight budget that fits its tap window.
+			micPipe.Load().SetMaxLag(audioQueueDepth)
 			ttsStartedNano.Store(time.Now().UnixNano())
 			bargeStartNano.Store(0)
 			atomic.StoreInt32(&stopPlayback, 0)
@@ -1560,6 +1575,9 @@ func main() {
 				log.Printf("[TTS] Play error: %v", playErr)
 			}
 			atomic.StoreInt32(&ttsPlaying, 0)
+			// Nothing is playing now, so the consumer may fall as far behind as
+			// the streaming ASR decoder's chunk decode needs it to.
+			micPipe.Load().SetMaxLag(audioIdleLagFrames)
 
 			// If barge-in was triggered, skip silence wait
 			if atomic.LoadInt32(&stopPlayback) == 0 {
@@ -2194,6 +2212,11 @@ func main() {
 	}
 
 	micPipe.Store(newAudioPipeline(func(f micFrame) { handleAudioFrame(f.samples, f.fromBrowser) }))
+	// Nothing is playing at startup, so the consumer gets the wide budget: the
+	// streaming ASR decoder's chunk decode blocks it for far longer than the
+	// echo canceller's budget would tolerate, and there is no echo to model
+	// while Mai is silent.
+	micPipe.Load().SetMaxLag(audioIdleLagFrames)
 
 	// The capture callback. This runs on miniaudio's device thread and must do
 	// as close to nothing as possible: a bounded queue hand-off is the whole

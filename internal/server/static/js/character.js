@@ -283,7 +283,7 @@ class CharacterRenderer {
         this.renderer.setClearColor(0x000000, 0); // Transparent — PixiJS handles background
         this.renderer.outputColorSpace = THREE.SRGBColorSpace;
         this.renderer.toneMapping = THREE.LinearToneMapping;
-        this.renderer.toneMappingExposure = 0.80;
+        this.renderer.toneMappingExposure = 0.88;
         this.renderer.shadowMap.enabled = false;
         this.container.appendChild(this.renderer.domElement);
         
@@ -296,14 +296,14 @@ class CharacterRenderer {
 
         // Three-point rig. MToon needs a directional key to produce form: with only
         // ambient light the limbs and hair collapse into flat, faceted silhouettes.
-        this.scene.add(new THREE.AmbientLight(0xfff0e0, 0.26));
-        const keyLight = new THREE.DirectionalLight(0xfff4e8, 0.70);
+        this.scene.add(new THREE.AmbientLight(0xffe8d4, 0.30));
+        const keyLight = new THREE.DirectionalLight(0xffedda, 0.85);
         keyLight.position.set(1.1, 1.6, 1.4);
         this.scene.add(keyLight);
-        const fillLight = new THREE.DirectionalLight(0xd8e4ff, 0.25);
+        const fillLight = new THREE.DirectionalLight(0xd6dff0, 0.22);
         fillLight.position.set(-1.2, 0.6, 0.9);
         this.scene.add(fillLight);
-        const rimLight = new THREE.DirectionalLight(0xffffff, 0.22);
+        const rimLight = new THREE.DirectionalLight(0xfff2e0, 0.25);
         rimLight.position.set(-0.6, 1.0, -1.6);
         this.scene.add(rimLight);
 
@@ -792,6 +792,12 @@ class CharacterRenderer {
     // three-vrm replaces `mesh.material` with an ARRAY [surface, outline] for every
     // material that gets an MToon outline, so each material has to be visited
     // individually — touching `mesh.material` directly only mutates the array.
+    //
+    // VRoid's MToon parameters are deliberately left exactly as exported.
+    // shadingToonyFactor ~0.95 and the full-strength matcap are what make the
+    // cel-shaded anime look; softening them (0.55 / 0.15) turns the model into
+    // plain Lambert and throws the VRoid sheen away. The faceting came from the
+    // flat, ambient-only lighting and the missing MSAA, not from the material.
     _tuneMaterials(vrm) {
         const maxAnisotropy = this.renderer.capabilities.getMaxAnisotropy();
         vrm.scene.traverse((obj) => {
@@ -812,20 +818,6 @@ class CharacterRenderer {
                     mat.flatShading = false;
                     mat.needsUpdate = true;
                 }
-
-                // VRoid ships shadingToonyFactor ~0.95, which makes the light/shade
-                // terminator nearly binary. That hard band is what reads as faceting
-                // on arms, legs and hair — soften it into a gradient.
-                mat.shadingToonyFactor = 0.55;
-
-                // The matcap is a toon-banded view-space ramp; at full strength it
-                // re-introduces hard view-dependent bands on top of the soft terminator.
-                mat.matcapFactor.setScalar(0.15);
-
-                // Outlines are inverted hulls expanded along the (smooth) vertex
-                // normals. At VRoid's default 0.5 mm they alias into a hard 1 px
-                // fringe around every limb and hair strand.
-                if (mat.isOutline) mat.outlineWidthFactor = 0.00025;
             }
         });
     }

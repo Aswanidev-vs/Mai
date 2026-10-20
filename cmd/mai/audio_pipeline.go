@@ -36,6 +36,30 @@ const (
 	// every scheduling hiccup in the consumer into a dropped frame.
 	audioQueueDepth = 3
 
+	// audioIdleLagFrames is the lag budget used when the echo canceller is NOT
+	// running. The budget above is a hard constraint only while Mai is speaking:
+	// EchoCanceller.Process correlates a frame against the *newest* L+n samples
+	// of the speaker reference, so a frame that waited δ in the queue asks the
+	// adaptive filter to model an echo path δ longer than the real one, and
+	// with L = 4096 taps (256 ms) the budget has to stay well inside that
+	// window. When nothing is playing there is no echo path to model, and the
+	// consumer is free to fall much further behind — and it must, because the
+	// streaming ASR decoder blocks the consumer for a few hundred milliseconds
+	// every time the recogniser's chunk completes (the Nemotron model is a
+	// 560 ms chunk model, and one chunk decode costs ~250 ms of wall clock).
+	// A 75 ms budget cannot absorb a 250 ms burst, so the queue overflowed and
+	// the capture thread shed a frame at every chunk boundary.
+	//
+	// Sixteen frames is 400 ms: enough to absorb the chunk decode and the drain
+	// behind it, and still bounded so a genuinely stuck consumer cannot grow
+	// the backlog without limit.
+	audioIdleLagFrames = 16
+
+	// audioQueueCapacity is the channel's capacity. It is sized for the widest
+	// budget so that the *lag budget*, not the channel, is what limits how far
+	// the consumer may fall behind. See SetMaxLag.
+	audioQueueCapacity = audioIdleLagFrames
+
 	// audioDropLogInterval rate-limits the sustained-drop warning. Drops are
 	// only interesting while they keep happening — one dropped frame during a
 	// 300 ms ASR decode is the design working, a continuous stream of them
@@ -91,6 +115,11 @@ type audioPipeline struct {
 	// not take them in time. It is the keystone's own health metric: at zero,
 	// capture has never been stalled by audio processing.
 	dropped atomic.Int64
+	// maxLag is the effective lag budget in frames. The channel is sized for
+	// the widest budget the pipeline ever uses, so the budget itself — not the
+	// channel — is what bounds how far the consumer may fall behind. See
+	// SetMaxLag.
+	maxLag  atomic.Int64
 	warned  atomic.Int64 // total as of the last sustained-drop warning
 	warnAt  atomic.Int64 // UnixNano of the last warning, for rate limiting
 }
@@ -99,13 +128,55 @@ type audioPipeline struct {
 // once per frame, in arrival order, never concurrently with itself.
 func newAudioPipeline(process func(micFrame)) *audioPipeline {
 	p := &audioPipeline{
-		frames:  make(chan micFrame, audioQueueDepth),
+		frames:  make(chan micFrame, audioQueueCapacity),
 		process: process,
 		stop:    make(chan struct{}),
 	}
+	p.maxLag.Store(audioQueueDepth)
 	p.wg.Add(1)
 	go p.run()
 	return p
+}
+
+// SetMaxLag changes how far the processing goroutine may fall behind, counted
+// in frames.
+//
+// The two budgets serve two different consumers of the same audio. While the
+// echo canceller is running, a queued frame is a frame whose speaker reference
+// has already moved on, so the budget must stay inside the canceller's tap
+// window — that is what audioQueueDepth is for. When nothing is playing there
+// is no echo path to model and the only thing the budget protects is the
+// consumer's own burstiness, which is dominated by the streaming ASR decoder's
+// chunk decode. A budget wide enough to absorb that burst (audioIdleLagFrames)
+// is what keeps the capture thread from shedding a frame at every chunk
+// boundary.
+//
+// Narrowing the budget discards whatever backlog exceeds it, and those frames
+// are counted as dropped: their speaker reference would be stale, so the
+// canceller genuinely cannot use them.
+func (p *audioPipeline) SetMaxLag(frames int) {
+	if p == nil || frames <= 0 {
+		return
+	}
+	p.maxLag.Store(int64(frames))
+	p.trimToLag(frames, 0)
+}
+
+// trimToLag discards the oldest queued frames until at most limit frames are
+// queued, counting the incoming frames that are about to be added.
+//
+// It is safe to call from any goroutine: it only receives from the channel,
+// and a concurrent consumer taking a frame just makes the loop stop one
+// iteration earlier.
+func (p *audioPipeline) trimToLag(limit, incoming int) {
+	for len(p.frames)+incoming > limit {
+		select {
+		case <-p.frames:
+			p.dropped.Add(1)
+		default:
+			return
+		}
+	}
 }
 
 // push hands a frame to the processing goroutine. It never blocks and never
@@ -120,6 +191,14 @@ func (p *audioPipeline) push(f micFrame) {
 	if p == nil || p.closed.Load() {
 		return
 	}
+
+	// Enforce the lag budget before the send. The channel is sized for the
+	// widest budget, so when the budget is narrower the channel still has room
+	// and would not shed a frame on its own.
+	if limit := int(p.maxLag.Load()); limit > 0 {
+		p.trimToLag(limit, 1)
+	}
+
 	select {
 	case p.frames <- f:
 		return
