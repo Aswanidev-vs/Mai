@@ -164,6 +164,70 @@ func TestAudioPipeline_DropsOldestNotNewest(t *testing.T) {
 	assert.Equal(t, int64(total-1-audioQueueDepth), p.Dropped())
 }
 
+// TestAudioPipeline_WideBudgetAbsorbsTheASRDecodeBurst is the regression test
+// for the sustained "capture queue overflowing" warning.
+//
+// The streaming ASR recogniser is a 560 ms chunk model: every time its chunk
+// completes it runs a decode that blocks the processing goroutine for a few
+// hundred milliseconds. With the echo canceller's 3-frame budget (75 ms) the
+// queue could not absorb that burst, so the capture thread shed a frame at
+// every chunk boundary — about one dropped frame per 560 ms, forever, even
+// while the microphone was silent.
+//
+// The wide idle budget exists for exactly that burst. Nothing is playing, so
+// there is no echo path to model and the budget can be as wide as the decode
+// needs.
+func TestAudioPipeline_WideBudgetAbsorbsTheASRDecodeBurst(t *testing.T) {
+	p, entered, unblock := blockingPipeline()
+	defer unblock()
+
+	p.push(micFrame{samples: []float32{0}}) // the frame the consumer parks on
+	<-entered
+
+	// The consumer is now stuck inside a decode. Widen the budget the way the
+	// app does while nothing is playing.
+	p.SetMaxLag(audioIdleLagFrames)
+
+	// A decode that blocks for ~250 ms is ten capture periods of backlog.
+	const backlog = 10
+	for i := 1; i <= backlog; i++ {
+		p.push(micFrame{samples: []float32{float32(i)}})
+	}
+
+	assert.Zero(t, p.Dropped(),
+		"the idle budget must absorb a decode-sized burst without shedding a frame")
+}
+
+// TestAudioPipeline_NarrowingTheBudgetDropsTheStaleBacklog is the other half.
+//
+// When playback starts, the echo canceller becomes live and its budget is the
+// tight one. A frame that sat in the queue while playback advanced has a stale
+// speaker reference, so the canceller genuinely cannot use it — narrowing the
+// budget has to discard that backlog, and has to count it, or the drop metric
+// would quietly under-report real audio loss.
+func TestAudioPipeline_NarrowingTheBudgetDropsTheStaleBacklog(t *testing.T) {
+	p, entered, unblock := blockingPipeline()
+	defer unblock()
+
+	p.push(micFrame{samples: []float32{0}}) // consumed by the parked consumer
+	<-entered
+
+	p.SetMaxLag(audioIdleLagFrames)
+	const backlog = 10
+	for i := 1; i <= backlog; i++ {
+		p.push(micFrame{samples: []float32{float32(i)}})
+	}
+	require.Zero(t, p.Dropped(), "the wide budget must not shed frames")
+
+	// Playback starts: the budget narrows to the canceller's window.
+	p.SetMaxLag(audioQueueDepth)
+
+	assert.Equal(t, int64(backlog-audioQueueDepth), p.Dropped(),
+		"narrowing the budget must discard, and count, the stale backlog")
+	assert.Len(t, p.frames, audioQueueDepth,
+		"the queue must be left inside the canceller's lag budget")
+}
+
 // TestAudioPipeline_OneGoroutineAtATime is the other half of the contract.
 // Concurrent producers are the real shape (capture thread + browser socket),
 // and the stateful consumers behind process depend on never overlapping.
