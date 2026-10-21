@@ -10,8 +10,8 @@ require (
 	github.com/k2-fsa/sherpa-onnx-go v1.13.5
 	github.com/mattn/go-sqlite3 v1.14.44
 	github.com/stretchr/testify v1.11.1
-	github.com/yalue/onnxruntime_go v1.27.0
 	github.com/tggo/goSentencePiece v1.1.0
+	github.com/yalue/onnxruntime_go v1.27.0
 	go.uber.org/goleak v1.3.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -41,7 +41,7 @@ require (
 	github.com/k2-fsa/sherpa-onnx-go-linux v1.13.5 // indirect
 	github.com/k2-fsa/sherpa-onnx-go-macos v1.13.5 // indirect
 	github.com/k2-fsa/sherpa-onnx-go-windows v1.13.5 // indirect
-	github.com/klauspost/compress v1.18.3 // indirect
+	github.com/klauspost/compress v1.18.7 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260324052639-156f7da3f749 // indirect
 	github.com/otiai10/gosseract/v2 v2.4.1 // indirect
