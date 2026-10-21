@@ -10,8 +10,8 @@ require (
 	github.com/k2-fsa/sherpa-onnx-go v1.13.5
 	github.com/mattn/go-sqlite3 v1.14.44
 	github.com/stretchr/testify v1.11.1
-	github.com/yalue/onnxruntime_go v1.27.0
 	github.com/tggo/goSentencePiece v1.1.0
+	github.com/yalue/onnxruntime_go v1.27.0
 	go.uber.org/goleak v1.3.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -36,6 +36,8 @@ require (
 	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/icholy/digest v1.1.0 // indirect
 	github.com/imroc/req/v3 v3.57.0 // indirect
+	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808 // indirect
+	github.com/jchv/go-winloader v0.0.0-20250406163304-c1995be93bd1 // indirect
 	github.com/jezek/xgb v1.3.0 // indirect
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a // indirect
 	github.com/k2-fsa/sherpa-onnx-go-linux v1.13.5 // indirect

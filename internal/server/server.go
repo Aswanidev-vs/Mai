@@ -84,6 +84,17 @@ func (s *Server) Start() error {
 	nodeModulesDir := filepath.Join(".", "node_modules")
 	mux.Handle("/node_modules/", http.StripPrefix("/node_modules/", http.FileServer(http.Dir(nodeModulesDir))))
 
+	// The transparent desktop overlay's page. It has to be served from here
+	// rather than loaded from disk: the websocket's origin check only accepts
+	// localhost, and the page's import map needs /node_modules on the same
+	// origin.
+	mux.Handle("/virtual/", http.StripPrefix("/virtual/", http.FileServer(http.Dir(filepath.Join(".", "transparent", "web")))))
+
+	// VRM 1.0 animations. The vrma/ set is not specVersion-tagged and may not
+	// load under three-vrm v3; the VRMA_MotionPack set is the reliable one.
+	mux.Handle("/vrma/", http.StripPrefix("/vrma/", http.FileServer(http.Dir(filepath.Join(".", "vrma")))))
+	mux.Handle("/vrpack/", http.StripPrefix("/vrpack/", http.FileServer(http.Dir(filepath.Join(".", "VRMA_MotionPack", "vrma")))))
+
 	var handler http.Handler = mux
 	handler = loggingMiddleware(handler)
 	if s.cfg.Token != "" {
