@@ -84,6 +84,82 @@ Voice Input (Mic)                   Streaming Audio Chunks
 
 ---
 
+## Desktop Overlay (Windows)
+
+Mai can present the companion as a transparent, always-on-top desktop overlay instead of a browser tab. `transparent.exe` embeds the companion page at `http://localhost:8080/virtual/` in a borderless WebView2 window, so the VRM avatar floats over other applications. The overlay is Windows-only and requires the WebView2 runtime; the page is served by the companion server, so that server must be running.
+
+### Overlay Behavior
+
+- **Transparent, always-on-top window** — a layered Win32 tool window with no border or taskbar button, 320×480 logical pixels by default near the bottom-right of the screen. The WebView2 background is made fully transparent with `ICoreWebView2Controller2::put_DefaultBackgroundColor`; the Three.js canvas renders with per-pixel alpha, giving smooth transparency against the desktop instead of a color key.
+- **Native host-side dragging** — pointer-down sends `beginDrag` to the Go host, which captures the cursor and moves the window directly from `WM_MOUSEMOVE`. Dragging does not round-trip every movement through the page, so the avatar tracks the pointer without a per-move round-trip.
+- **Click-through toggle** — `Ctrl+Alt+C` toggles `WS_EX_TRANSPARENT`, letting mouse clicks pass through the overlay to the application underneath.
+- **Perch and quit** — `Ctrl+Alt+P` (or double-clicking the avatar) places Mai on the bottom edge of the foreground window. `Ctrl+Alt+Q` quits the overlay; the companion server keeps running.
+
+> These shortcuts are page-level handlers in `transparent/web/js/virtual.js`. The native host does not register system-wide hotkeys, so they require the WebView2 to receive keyboard focus.
+
+### Directional Walking
+
+Walking is host-driven: `walkTo`, `walkToForeground`, and `walkToTaskbar` animate the overlay window and emit `walkStart` with the movement delta. The page selects one of five imported VRMA clips from that delta, loops it while the window moves, and returns to idle on `walkEnd`.
+
+| Movement on screen | Clip |
+|--------------------|------|
+| Mostly vertical, stationary, or away from the camera | `walk-front` |
+| Diagonal up/down-left | `walk-three-quarter-left` |
+| Mostly horizontal left | `walk-left-profile` |
+| Diagonal up/down-right | `walk-three-quarter-right` |
+| Mostly horizontal right | `walk-right-profile` |
+
+There is no back-facing clip. When Mai walks straight away from the camera (mostly upward on screen), the forward/front clip is used. The selector treats movement as a profile when the horizontal component is at least 1.5× the vertical, as front when the vertical is at least 1.5× the horizontal, and as three-quarter otherwise. If a walk clip fails to load, the overlay falls back to its procedural walk cycle.
+
+### WhatsApp Message Workflow
+
+WhatsApp automation is a prepare/confirm workflow. It starts only from an explicit user request in the voice pipeline (ASR) or the companion chat box. The recipient and message come from that request; there is no hardcoded contact and no startup task, timer, or automatic send. If the contact or message is missing, Mai asks for it before opening WhatsApp.
+
+The deterministic action parser is the primary path. The LLM also has a `whatsapp_send` fallback tool for phrasings the parser does not recognize. That tool is callable only while `HandleInput` is processing an explicit ASR/chat turn; startup, timers, and proactive tasks cannot invoke it. It prepares a draft and still requires confirmation.
+
+1. If WhatsApp Desktop is not running, Mai opens it through the taskbar/search choreography (`Win+S`, type `WhatsApp`, Enter) and falls back to the Start Menu AppID. It does not use WhatsApp Web.
+2. Mai walks the overlay to the taskbar while launching, then to the WhatsApp window once it is in the foreground.
+3. Mai focuses WhatsApp, presses `Ctrl+F`, clears the previous search, types the contact name, and presses Enter.
+4. Mai verifies that a chat composer appeared. If WhatsApp cannot be opened, or the contact/chat cannot be found, the overlay plays the `not_found` (sad) expression and Mai does not send anything.
+5. Mai clicks the composer, clears any existing draft, and types the requested message.
+6. Mai waits for confirmation. **The draft is prepared, not sent, until the user confirms.**
+7. On confirmation, Mai re-checks that WhatsApp and the chat are still open, returns the caret to the composer, and only then presses Enter.
+
+| Intent | Confirmation commands |
+|--------|-----------------------|
+| Send | `yes`, `ok`, `send it`, `confirm` |
+| Cancel | `no`, `cancel`, `stop`, `don't send` |
+
+Other close variants such as `send`, `go ahead`, `nope`, and `never mind` are also accepted. Cancelling clears the pending state but leaves the typed draft in the composer so it can be edited or sent manually. The `whatsapp_send` adapter is registered as a guarded fallback: `Automation.PrepareMessage` rejects calls outside an active user turn, and only `ConfirmSend` presses Enter after an explicit confirmation. The recipient is always taken from the user's request.
+
+### Build, Run, and Stop
+
+`make companion-virtual` builds `mai.exe` and `transparent.exe`, starts the companion server on port 8080, waits for `/api/health`, and launches the overlay at `http://localhost:8080/virtual/`. `make companion` starts the companion server/web UI without the overlay (`make companion-open` also opens the browser). This assumes `agentic.enabled: true` in `config.yaml`, because the companion server is started from the agentic initialization path.
+
+```bash
+# Build both binaries, start the server, and launch the overlay
+make companion-virtual
+
+# Stop only the overlay; the companion server keeps running
+make stop-overlay
+
+# Stop the overlay first, then the companion server
+make stop
+```
+
+`make stop` depends on `make stop-overlay` on purpose. Killing the server first would leave the overlay open on WebView2's connection-refused page; stopping the overlay first avoids that. `make stop-overlay` terminates only `transparent.exe`.
+
+To run the pieces manually:
+
+```bash
+go build -o mai.exe ./cmd/mai
+go build -o transparent.exe ./transparent
+./mai.exe --companion
+./transparent.exe --url http://localhost:8080/virtual/
+```
+
+---
+
 ## Operating Modes
 
 Mai operates in three modes, selected through configuration and runtime flags:
@@ -93,6 +169,8 @@ Mai operates in three modes, selected through configuration and runtime flags:
 | **Legacy Mode** | Classic wake word → ASR → regex/LLM → TTS pipeline | Fast, simple commands with minimal overhead |
 | **Agentic Mode** | Full cognitive loop with memory, ReAct tool use, and proactivity | Complex multi-step tasks, autonomous monitoring |
 | **Companion Mode** | Web-based 3D character with voice interaction | Real-time conversational companion |
+
+The desktop overlay described above is a presentation mode for Companion Mode, not a separate operating mode.
 
 In **Agentic Mode**, Mai features:
 - **Unified Prompt Engine**: Single prompt template with JARVIS personality — consistent across all task types
@@ -579,10 +657,12 @@ Mai's agentic mode includes a universal tool registry with category-based discov
 | `deep_search` | web | Snippet-only web search results | `"Research quantum computing"` |
 | `web_research` | web | Search + fetch + condense into a cited Markdown dossier | `"Research who is Mai Sakurajima"` |
 | `youtube_play` | media | Play YouTube videos | `"Play Perfect on YouTube"` |
-| `whatsapp_send` | communication | Send WhatsApp messages | `"Send hello to Manu on WhatsApp"` |
 | `get_system_time` | query | Get current time/date | `"What time is it?"` |
 | `file_write` | file | Write to files | `"Save this note to todo.txt"` |
 | `ui_automation` | automation | UI control (click, type) | `"Press Ctrl+F"` |
+| `whatsapp_send` | communication | Prepare a WhatsApp draft (explicit user turn only; confirmation required) | `"Message Priya on WhatsApp saying I'll be late"` |
+
+`whatsapp_send` is a guarded fallback, not an autonomous sender. The regex action parser handles common message requests first; if it misses a phrasing, the LLM may call the tool during an explicit ASR/chat turn. `Automation.PrepareMessage` rejects calls outside that turn, and the workflow always waits for confirmation before pressing Enter. See [WhatsApp Message Workflow](#whatsapp-message-workflow).
 
 **`web_research`** is Mai's deep-research tool — free, no API keys. It runs a web search, then fetches and reads the top result pages via [retrieval-go](https://github.com/free-llms-foundation/retrieval-go) (DuckDuckGo + readability extraction), condenses the most query-relevant passages, and returns a Markdown dossier with sources numbered `[1]…[n]` and their URLs. It over-fetches (~2× the requested `num_sources`) so blocked pages (robots/403/rate-limit) don't shrink the result, and notes how many pages were unreadable. The dossier is capped to fit Mai's `num_ctx` context window — bump `num_ctx` (and the tool's cap) for richer research. Cite sources as `[n]` in text replies; in spoken replies, attribute naturally without bracket markers (see the system-prompt citation block).
 
@@ -758,7 +838,14 @@ cmd/mai/
 ├── audio.go         # Audio capture (malgo), playback, streaming TTS
 ├── automation.go    # UI automation via RobotGo
 ├── actions.go       # Regex-based action parser
+├── message_workflow.go # WhatsApp prepare/confirm workflow
+├── tool_registry.go # LLM tool registration; WhatsApp guarded fallback
 └── vision.go        # Vision processing via Ollama
+
+transparent/
+├── main.go          # Windows overlay host (WebView2 transparency, dragging, walking)
+└── web/             # Overlay page, directional walk selection
+
 internal/
 ├── agent/           # Orchestrator, user model, proactive engine, interrupt manager
 ├── cognition/       # Unified prompt engine, ReAct loop (natural language reasoning)

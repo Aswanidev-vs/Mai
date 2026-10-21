@@ -38,6 +38,7 @@ const (
 	NotifMemoryUpdate  = "memory.update"
 	NotifDance         = "companion.dance"
 	NotifAction        = "companion.action"
+	NotifAutomation    = "companion.automation"
 	// NotifPartialTranscript carries an in-progress ASR result (final=false) and
 	// NotifFinalTranscript the authoritative one for the utterance (final=true).
 	NotifPartialTranscript = "asr.partial"
@@ -53,6 +54,18 @@ type ChatInputParams struct {
 type ActionParams struct {
 	Action   string  `json:"action"`
 	Duration float64 `json:"duration,omitempty"`
+}
+
+// AutomationPhaseParams drives the companion overlay through a desktop
+// automation workflow. It deliberately carries no message body: the overlay
+// only needs the phase and the semantic target.
+type AutomationPhaseParams struct {
+	Phase      string `json:"phase"`
+	Target     string `json:"target,omitempty"`
+	App        string `json:"app,omitempty"`
+	Contact    string `json:"contact,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	DurationMS int    `json:"duration_ms,omitempty"`
 }
 
 // ChatResponseChunk is streamed back for chat.response.

@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	neturl "net/url"
 	"os"
@@ -84,6 +85,7 @@ var (
 	procGetWindowRect   = user32.NewProc("GetWindowRect")
 	procGetForeground   = user32.NewProc("GetForegroundWindow")
 	procSetForeground   = user32.NewProc("SetForegroundWindow")
+	procFindWindow      = user32.NewProc("FindWindowW")
 	procGetSystemMetric = user32.NewProc("GetSystemMetrics")
 	procSetWindowLong   = user32.NewProc("SetWindowLongW")
 	procGetWindowLong   = user32.NewProc("GetWindowLongW")
@@ -180,6 +182,11 @@ type overlayHost struct {
 	dragLast     point
 	quit         chan struct{}
 	once         sync.Once
+
+	// Scripted walk state. All fields are touched on the UI thread except the
+	// stop channel, which the walk goroutine closes via cancelWalk.
+	walkStop   chan struct{}
+	walkActive bool
 
 	mu      sync.Mutex
 	pending []func()
@@ -496,6 +503,7 @@ func (h *overlayHost) moveTo(x, y int) {
 
 // moveBy moves the window by a pixel delta.
 func (h *overlayHost) moveBy(dx, dy int) {
+	h.cancelWalk("drag")
 	var r rect
 	procGetWindowRect.Call(h.hwnd, uintptr(unsafe.Pointer(&r)))
 	procSetWindowPos.Call(h.hwnd, hwndTopmost,
@@ -504,10 +512,192 @@ func (h *overlayHost) moveBy(dx, dy int) {
 	h.emitToPage(map[string]any{"event": "moved"})
 }
 
+// walkTo animates the overlay window from its current position to x,y. The
+// host owns the motion so the page only has to select the matching directional
+// walk clip when it receives walkStart.
+func (h *overlayHost) walkTo(x, y, durationMs int) {
+	h.cancelWalk("replaced")
+
+	var r rect
+	procGetWindowRect.Call(h.hwnd, uintptr(unsafe.Pointer(&r)))
+	sx, sy := int(r.Left), int(r.Top)
+	dx, dy := x-sx, y-sy
+	dist := math.Hypot(float64(dx), float64(dy))
+	if dist < 2 {
+		h.emitToPage(map[string]any{"event": "walkEnd", "reason": "done"})
+		return
+	}
+	if durationMs <= 0 {
+		speed := 220 * h.scale
+		if speed < 1 {
+			speed = 220
+		}
+		durationMs = int(dist / speed * 1000)
+	}
+	if durationMs < 250 {
+		durationMs = 250
+	}
+	if durationMs > 15000 {
+		durationMs = 15000
+	}
+
+	stop := make(chan struct{})
+	h.walkStop = stop
+	h.walkActive = true
+	h.emitToPage(map[string]any{
+		"event":      "walkStart",
+		"dx":         dx,
+		"dy":         dy,
+		"durationMs": durationMs,
+		"targetX":    x,
+		"targetY":    y,
+	})
+
+	go func() {
+		ticker := time.NewTicker(33 * time.Millisecond)
+		defer ticker.Stop()
+		start := time.Now()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-h.quit:
+				return
+			case <-ticker.C:
+				t := float64(time.Since(start)) / float64(time.Duration(durationMs)*time.Millisecond)
+				if t > 1 {
+					t = 1
+				}
+				eased := t * t * (3 - 2*t)
+				nx := sx + int(float64(dx)*eased)
+				ny := sy + int(float64(dy)*eased)
+				done := t >= 1
+				h.dispatch(func() {
+					if h.walkStop != stop {
+						return
+					}
+					h.moveTo(nx, ny)
+					if done {
+						h.walkStop = nil
+						h.walkActive = false
+						h.emitToPage(map[string]any{"event": "walkEnd", "reason": "done"})
+					}
+				})
+				if done {
+					return
+				}
+			}
+		}
+	}()
+}
+
+func (h *overlayHost) cancelWalk(reason string) {
+	if h.walkStop != nil {
+		close(h.walkStop)
+		h.walkStop = nil
+	}
+	if h.walkActive {
+		h.walkActive = false
+		h.emitToPage(map[string]any{"event": "walkEnd", "reason": reason})
+	}
+}
+
+// walkToForeground parks the overlay at the left edge of the focused app. The
+// left edge keeps the avatar clear of WhatsApp's composer, which the screenshot
+// verification samples on the right-hand side.
+func (h *overlayHost) walkToForeground(durationMs int) {
+	fg, _, _ := procGetForeground.Call()
+	var target rect
+	ok := false
+	if fg != 0 && fg != h.hwnd {
+		procGetWindowRect.Call(fg, uintptr(unsafe.Pointer(&target)))
+		ok = target.Right > target.Left && target.Bottom > target.Top
+	}
+
+	var r rect
+	procGetWindowRect.Call(h.hwnd, uintptr(unsafe.Pointer(&r)))
+	winW, winH := int(r.Right-r.Left), int(r.Bottom-r.Top)
+	margin := int(18 * h.scale)
+	x, y := 0, 0
+	if ok {
+		x = int(target.Left) + margin
+		y = int(target.Bottom) - winH - margin
+	} else {
+		sw, _, _ := procGetSystemMetric.Call(smCXScreen)
+		sh, _, _ := procGetSystemMetric.Call(smCYScreen)
+		x = int(sw)/2 - winW/2
+		y = int(sh) - winH - int(64*h.scale)
+	}
+	h.walkToClamped(x, y, durationMs)
+}
+
+// walkToTaskbar walks to the search area of the primary taskbar. The actual
+// search is opened with Win+S; the walk is the visual choreography.
+func (h *overlayHost) walkToTaskbar(durationMs int) {
+	var r rect
+	procGetWindowRect.Call(h.hwnd, uintptr(unsafe.Pointer(&r)))
+	winW, winH := int(r.Right-r.Left), int(r.Bottom-r.Top)
+
+	taskbar, ok := taskbarRect()
+	x, y := 0, 0
+	if ok {
+		taskbarW := int(taskbar.Right - taskbar.Left)
+		x = int(taskbar.Left) + int(float64(taskbarW)*0.38) - winW/2
+		y = int(taskbar.Top) - winH + int(10*h.scale)
+	} else {
+		sw, _, _ := procGetSystemMetric.Call(smCXScreen)
+		sh, _, _ := procGetSystemMetric.Call(smCYScreen)
+		x = int(sw)*38/100 - winW/2
+		y = int(sh) - int(64*h.scale) - winH
+	}
+	h.walkToClamped(x, y, durationMs)
+}
+
+func (h *overlayHost) walkToClamped(x, y, durationMs int) {
+	var r rect
+	procGetWindowRect.Call(h.hwnd, uintptr(unsafe.Pointer(&r)))
+	winW, winH := int(r.Right-r.Left), int(r.Bottom-r.Top)
+	sw, _, _ := procGetSystemMetric.Call(smCXScreen)
+	sh, _, _ := procGetSystemMetric.Call(smCYScreen)
+	maxX := int(sw) - winW
+	maxY := int(sh) - winH
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
+	if maxX > 0 && x > maxX {
+		x = maxX
+	}
+	if maxY > 0 && y > maxY {
+		y = maxY
+	}
+	h.walkTo(x, y, durationMs)
+}
+
+func taskbarRect() (rect, bool) {
+	className, err := utf16("Shell_TrayWnd")
+	if err != nil {
+		return rect{}, false
+	}
+	hwnd, _, _ := procFindWindow.Call(0, uintptr(unsafe.Pointer(className)))
+	if hwnd == 0 {
+		return rect{}, false
+	}
+	var r rect
+	procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&r)))
+	if r.Right <= r.Left || r.Bottom <= r.Top {
+		return rect{}, false
+	}
+	return r, true
+}
+
 // beginDrag takes the mouse capture so the host can move the window directly
 // from WM_MOUSEMOVE. Round-tripping every move through the page adds a
 // frame of latency and makes the drag feel like it is fighting the cursor.
 func (h *overlayHost) beginDrag() {
+	h.cancelWalk("drag")
 	if h.dragging {
 		return
 	}
@@ -564,6 +754,7 @@ func foregroundRect() (rect, bool) {
 // perchOnForeground places the window on the bottom edge of the focused
 // application window, so the avatar appears to stand on it.
 func (h *overlayHost) perchOnForeground() bool {
+	h.cancelWalk("perch")
 	target, ok := foregroundRect()
 	if !ok {
 		return false
@@ -763,8 +954,34 @@ func (h *overlayHost) onHostCall(method, params string) {
 		}
 		json.Unmarshal([]byte(params), &p)
 		h.dispatch(func() { h.setClickThrough(p.On) })
+	case "walkTo":
+		var p struct {
+			X          int `json:"x"`
+			Y          int `json:"y"`
+			DurationMS int `json:"duration_ms"`
+		}
+		json.Unmarshal([]byte(params), &p)
+		h.dispatch(func() { h.walkTo(p.X, p.Y, p.DurationMS) })
+	case "walkToForeground":
+		var p struct {
+			DurationMS int `json:"duration_ms"`
+		}
+		json.Unmarshal([]byte(params), &p)
+		h.dispatch(func() { h.walkToForeground(p.DurationMS) })
+	case "walkToTaskbar":
+		var p struct {
+			DurationMS int `json:"duration_ms"`
+		}
+		json.Unmarshal([]byte(params), &p)
+		h.dispatch(func() { h.walkToTaskbar(p.DurationMS) })
+	case "cancelWalk":
+		h.dispatch(func() { h.cancelWalk("page") })
 	case "quit":
-		h.shutdown()
+		h.dispatch(func() {
+			h.cancelWalk("quit")
+			h.shutdown()
+			procPostMessage.Call(h.hwnd, wmClose, 0, 0)
+		})
 	}
 }
 

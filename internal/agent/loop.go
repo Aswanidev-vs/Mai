@@ -81,6 +81,12 @@ type Orchestrator struct {
 	lastProsodyAt time.Time
 
 	DirectAction func(text string) (bool, string, error)
+	// UserTurnStart/UserTurnEnd bracket every HandleInput call. Host-only
+	// capabilities (message drafting) use them to prove the call came from an
+	// explicit ASR or typed-chat turn rather than startup, a timer, or a
+	// proactive task. Tool calls run synchronously inside HandleInput.
+	UserTurnStart func()
+	UserTurnEnd   func()
 	// TTSFunc hands one spoken sentence to the player. seq is the turn id:
 	// every sentence of a reply shares it, so the player can tell a superseded
 	// turn from the next sentence of the current one. A final=true call with
@@ -397,6 +403,13 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 	text, ok := input["text"].(string)
 	if !ok {
 		return nil, fmt.Errorf("input must contain 'text' field")
+	}
+
+	if o.UserTurnStart != nil {
+		o.UserTurnStart()
+	}
+	if o.UserTurnEnd != nil {
+		defer o.UserTurnEnd()
 	}
 
 	inputLower := strings.ToLower(text)

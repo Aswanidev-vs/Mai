@@ -41,7 +41,6 @@ import (
 	"github.com/user/mai/internal/server"
 	"github.com/user/mai/internal/session"
 	"github.com/user/mai/internal/tools"
-	"github.com/user/mai/internal/tools/adapters"
 	"github.com/user/mai/internal/tools/mcp"
 	pockettts "github.com/user/mai/internal/tts/pocket"
 	"github.com/user/mai/pkg/interfaces"
@@ -1264,6 +1263,22 @@ func main() {
 
 	// Initialize automation system
 	auto := NewAutomation(cfg.Vision.Model, cfg.Vision.URL, cfg.Vision.Enabled)
+	// Message automation has exactly one entry point, and it requires user
+	// text:
+	//
+	//   voice ASR finalizeTurn / companion WS chat
+	//     -> Orchestrator.HandleInput(text)
+	//     -> DirectAction
+	//     -> ActionExecutor.ParseAndExecute(text)
+	//     -> ActionSendMsg
+	//     -> Automation.PrepareMessage
+	//
+	// Startup, timers (proactiveMonitor/selfImprove/analyzePatterns), and
+	// proactive tasks cannot call PrepareMessage: it requires an active user
+	// turn. The LLM may call the whatsapp_send tool as a fallback, but only
+	// while HandleInput is processing an explicit ASR/chat turn, and it still
+	// only prepares a draft. The recipient and body are always taken from the
+	// parsed user text; there is no default contact.
 	executor := NewActionExecutor(auto)
 
 	// 0. Initialize Agentic Architecture if enabled
@@ -1276,6 +1291,16 @@ func main() {
 	if cfg.Agentic.Enabled {
 		log.Println("[BOOT] Initializing Agentic Architecture...")
 		bus = events.NewBus()
+
+		// Route desktop automation phases to the overlay through the same bus
+		// that carries companion.action and companion.dance.
+		auto.SetEmitter(func(eventType string, payload map[string]interface{}) {
+			bus.Publish(interfaces.Event{
+				Type:    eventType,
+				Source:  "automation",
+				Payload: payload,
+			})
+		})
 
 		// LLM (create first — memory needs it for embeddings)
 		llmFactory := llm.NewFactory(cfg)
@@ -1292,26 +1317,10 @@ func main() {
 		memManager := memory.NewMemoryManager(workingMem, episodicMem, semanticMem, proceduralMem)
 		memManager.SetRAGProvider(llmProvider)
 
-		// Tools
+		// Tools. WhatsApp is registered as a guarded fallback; see
+		// registerBuiltinTools and the message-workflow comment above.
 		registry := tools.NewRegistry()
-		registry.Register(&adapters.ShellTool{})
-		registry.Register(&adapters.WebSearchTool{})
-		registry.Register(&adapters.OpenAppTool{
-			Open: func(name, browser string) error {
-				return auto.OpenAppWithBrowser(name, browser)
-			},
-		})
-		registry.Register(&adapters.YouTubeTool{})
-		registry.Register(adapters.NewDeepSearchTool())
-		registry.Register(adapters.NewWebResearchTool())
-		registry.Register(&adapters.FileWriteTool{})
-		registry.Register(&adapters.ClockTool{})
-		registry.Register(&adapters.WhatsAppTool{
-			Send: func(app, contact, text string) error {
-				return auto.SendMessage(app, contact, text)
-			},
-		})
-		registry.Register(&adapters.AutomationTool{})
+		registerBuiltinTools(registry, auto)
 
 		// MCP — auto-discover tools from configured servers
 		if cfg.MCP.Enabled {
@@ -1375,6 +1384,10 @@ func main() {
 		}
 		interruptCurrent = orch.InterruptCurrent
 		orch.DirectAction = executor.ParseAndExecute // Wire up the legacy highly-reliable regex parser
+		// Message drafting is allowed only while HandleInput is active. These
+		// hooks cover both the regex fast path and the LLM tool fallback.
+		orch.UserTurnStart = auto.BeginUserTurn
+		orch.UserTurnEnd = auto.EndUserTurn
 
 		// Apply TTS voice style from system prompt
 		ttsStyle := cfg.TTS.TTSVoiceStyle
@@ -1499,6 +1512,14 @@ func main() {
 		IsReasoning bool // true if task requires actual reasoning (not just chat)
 	}
 	workerChan := make(chan Task, 10)
+	// The legacy audio pipeline bypasses Orchestrator.HandleInput, but these
+	// tasks still come from finalized ASR turns. Bracket the action parser with
+	// the same user-turn guard so message drafting remains explicit-only.
+	runUserAction := func(text string) (bool, string, error) {
+		auto.BeginUserTurn()
+		defer auto.EndUserTurn()
+		return executor.ParseAndExecute(text)
+	}
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -1513,7 +1534,7 @@ func main() {
 			}
 
 			// Try to parse and execute automation action
-			executed, feedback, actionErr := executor.ParseAndExecute(task.Text)
+			executed, feedback, actionErr := runUserAction(task.Text)
 			if actionErr != nil {
 				log.Printf("[ACTION] Error executing action: %v", actionErr)
 			}

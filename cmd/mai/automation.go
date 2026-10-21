@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-vgo/robotgo"
@@ -19,6 +20,34 @@ type Automation struct {
 	defaultDelay  time.Duration
 	vision        *Vision
 	visionEnabled bool
+
+	// emit publishes companion.automation phases to the overlay. It is nil when
+	// no event bus is available; the workflow still works without the overlay.
+	emit func(eventType string, payload map[string]interface{})
+
+	// pending is the prepared-but-unsent message. The user must confirm before
+	// ConfirmSend presses Enter.
+	pending *pendingMessage
+
+	// userTurns counts HandleInput calls currently in flight. Message drafting
+	// is allowed only while this is positive, so startup, timers, and proactive
+	// work cannot open WhatsApp on their own.
+	userTurns atomic.Int32
+}
+
+// BeginUserTurn marks the start of an explicit ASR or typed-chat turn.
+func (a *Automation) BeginUserTurn() {
+	a.userTurns.Add(1)
+}
+
+// EndUserTurn marks the end of an explicit ASR or typed-chat turn.
+func (a *Automation) EndUserTurn() {
+	a.userTurns.Add(-1)
+}
+
+// InUserTurn reports whether an explicit user turn is currently being handled.
+func (a *Automation) InUserTurn() bool {
+	return a.userTurns.Load() > 0
 }
 
 // NewAutomation creates a new Automation instance with sensible defaults.
@@ -445,7 +474,7 @@ func (a *Automation) waitForAppWindow(keyword string, timeout time.Duration) boo
 // This is a last-resort strategy since it relies on keyboard automation.
 func (a *Automation) openViaWindowsSearch(appName string) error {
 	// Open Windows Search with Win+S
-	robotgo.KeyTap("s", "win")
+	robotgo.KeyTap("s", "cmd")
 	time.Sleep(1200 * time.Millisecond) // Give search more time to open
 
 	// Type the app name character by character for reliability
@@ -509,73 +538,6 @@ func (a *Automation) FocusWindow(title string) error {
 
 	robotgo.ActivePid(int(pid))
 	time.Sleep(a.defaultDelay)
-	return nil
-}
-
-// SendMessage automates sending a message in a specific messaging app.
-// If a contact is provided, it attempts to search for that contact first.
-func (a *Automation) SendMessage(app, contact, text string) error {
-	// Clean up quotes that might have been captured or added by LLM/ASR
-	text = strings.Trim(strings.TrimSpace(text), "\"'")
-	contact = strings.Trim(strings.TrimSpace(contact), "\"'")
-
-	log.Printf("[AUTO] Sending message on %s to %q: %q", app, contact, text)
-	appLower := strings.ToLower(app)
-
-	// Step 1: Ensure app is open and focused
-	if err := a.OpenApp(app); err != nil {
-		return fmt.Errorf("could not open %s: %v", app, err)
-	}
-	time.Sleep(1500 * time.Millisecond) // Give it time to fully come to foreground
-
-	// Resolve the correct window title for focusing
-	windowTitle := app
-	if info, ok := knownApps[strings.ToLower(app)]; ok {
-		windowTitle = info.windowTitle
-	}
-
-	// Step 2: If a contact is specified, search for them
-	if contact != "" {
-		log.Printf("[AUTO] Searching for contact: %s", contact)
-		// Most messaging apps (WhatsApp, Telegram, Discord)
-		if appLower == "whatsapp" || appLower == "telegram" || appLower == "discord" {
-			// Ensure we are focused on the correct window
-			a.FocusWindow(windowTitle)
-			time.Sleep(500 * time.Millisecond)
-
-			// User specifically requested Ctrl+F for search
-			searchKey := "f"
-
-			log.Printf("[AUTO] Triggering search with Ctrl+%s", searchKey)
-			robotgo.KeyTap(searchKey, "ctrl")
-			time.Sleep(1000 * time.Millisecond)
-
-			// Clear any previous search and type contact name
-			log.Printf("[AUTO] Clearing search bar...")
-			robotgo.KeyTap("a", "ctrl")
-			robotgo.KeyTap("backspace")
-			time.Sleep(400 * time.Millisecond)
-
-			log.Printf("[AUTO] Typing contact name: %s", contact)
-			robotgo.TypeStr(contact)
-			time.Sleep(2000 * time.Millisecond) // Wait for search results to populate
-
-			// Press Enter to select the first result
-			log.Printf("[AUTO] Selecting contact and opening chat...")
-			robotgo.KeyTap("enter")
-			time.Sleep(1500 * time.Millisecond) // Wait for chat to open
-		}
-	}
-
-	// Step 3: Type the message
-	log.Printf("[AUTO] Typing message...")
-	robotgo.TypeStr(text)
-	time.Sleep(200 * time.Millisecond)
-
-	// Step 4: Press Enter to send
-	robotgo.KeyTap("enter")
-	log.Printf("[AUTO] Message sent successfully")
-
 	return nil
 }
 

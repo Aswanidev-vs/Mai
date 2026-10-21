@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"regexp"
@@ -118,55 +119,43 @@ func NewActionParser() *ActionParser {
 				confidence: 0.95,
 			},
 
-			// Send message to contact on app: "send hello to john on whatsapp", "sent hello to john on whatsapp"
+			// "send a message to Priya in whatsapp" / "... on whatsapp saying hello".
+			// The recipient is captured from this text; there is no default.
+			// This rule intentionally consumes "a message" as a placeholder, not
+			// as the body. Execute will ask for the real text.
 			{
-				pattern:    regexp.MustCompile(`(?i)^(?:send|sent|message|messaged)\s+(.+?)\s+to\s+(.+?)\s+on\s+(.+)$`),
+				pattern:    regexp.MustCompile(`(?i)^(?:send|sent)\s+(?:a\s+)?(?:message|text)\s+to\s+(.+?)\s+(?:on|in|via)\s+(\w+)(?:\s+(?:saying|that|says)\s+(.+))?$`),
+				actionType: ActionSendMsg,
+				paramKeys:  []string{"contact", "app", "text"},
+				confidence: 0.98,
+			},
+			// "send hello to mom in whatsapp", "sent Hello World to Priya on whatsapp".
+			{
+				pattern:    regexp.MustCompile(`(?i)^(?:send|sent)\s+(.+?)\s+to\s+(.+?)\s+(?:on|in|via)\s+(\w+)$`),
 				actionType: ActionSendMsg,
 				paramKeys:  []string{"text", "contact", "app"},
-				confidence: 0.95,
+				confidence: 0.96,
 			},
-			// Flexible variation: "send a message to john on whatsapp saying hello"
+			// "find John on whatsapp and tell him hello"
 			{
-				pattern:    regexp.MustCompile(`(?i)^(?:send|message)\s+(?:a\s+)?(?:message|text)\s+to\s+(.+?)\s+on\s+(\w+)\s+(?:saying|that|says)\s+(.+)$`),
+				pattern:    regexp.MustCompile(`(?i)^find\s+(.+?)\s+(?:on|in|via)\s+(\w+)\s+(?:and|to)\s+(?:tell|send|message)(?:\s+him|\s+her|\s+them)?\s+(.+)$`),
 				actionType: ActionSendMsg,
 				paramKeys:  []string{"contact", "app", "text"},
 				confidence: 0.98,
 			},
-			// New Pattern: "find john on whatsapp and tell him hello"
+			// "tell John on whatsapp hello" (text may be omitted; Execute asks)
 			{
-				pattern:    regexp.MustCompile(`(?i)^find\s+(.+?)\s+on\s+(\w+)\s+(?:and|to)\s+(?:tell|send|message)(?:\s+him|\s+her|\s+them)?\s+(.+)$`),
+				pattern:    regexp.MustCompile(`(?i)^tell\s+(.+?)\s+(?:on|in|via)\s+(\w+)(?:\s+(?:saying|that|says))?\s*(.*)$`),
 				actionType: ActionSendMsg,
 				paramKeys:  []string{"contact", "app", "text"},
-				confidence: 0.98,
+				confidence: 0.94,
 			},
-			// New Pattern: "tell john on whatsapp hello"
+			// "message Priya on whatsapp hello" (text may be omitted)
 			{
-				pattern:    regexp.MustCompile(`(?i)^tell\s+(.+?)\s+on\s+(\w+)\s+(.+)$`),
+				pattern:    regexp.MustCompile(`(?i)^(?:message|messaged)\s+(.+?)\s+(?:on|in|via)\s+(\w+)(?:\s+(?:saying|that|says))?\s*(.*)$`),
 				actionType: ActionSendMsg,
 				paramKeys:  []string{"contact", "app", "text"},
-				confidence: 0.98,
-			},
-			// Alternative: "message john on whatsapp hello"
-			{
-				pattern:    regexp.MustCompile(`(?i)^(?:message|messaged)\s+(.+?)\s+on\s+(.+?)\s+(.+)$`),
-				actionType: ActionSendMsg,
-				paramKeys:  []string{"contact", "app", "text"},
-				confidence: 0.90,
-			},
-
-			// Simple send: "send hello to whatsapp", "message telegram hello"
-			{
-				pattern:    regexp.MustCompile(`(?i)^(?:send|sent|message|messaged)\s+(.+?)\s+to\s+(.+)$`),
-				actionType: ActionSendMsg,
-				paramKeys:  []string{"text", "app"},
-				confidence: 0.85,
-			},
-			// Alternative send: "message whatsapp hello world"
-			{
-				pattern:    regexp.MustCompile(`(?i)^message\s+(\w+)\s+(.+)$`),
-				actionType: ActionSendMsg,
-				paramKeys:  []string{"app", "text"},
-				confidence: 0.85,
+				confidence: 0.94,
 			},
 			// Mouse click: "click at 100 200", "click 500 300"
 			{
@@ -196,7 +185,8 @@ func NewActionParser() *ActionParser {
 // Parse analyzes user text and returns an Action if a known pattern matches.
 func (p *ActionParser) Parse(text string) Action {
 	text = strings.TrimSpace(text)
-	text = strings.ToLower(text)
+	// Keep the original case: message bodies must not be lowercased. All
+	// patterns use (?i), and fuzzyMatchAppName lowercases only the app name.
 	text = strings.TrimSuffix(text, ".") // Remove trailing period from ASR
 	text = strings.TrimSuffix(text, "?")
 
@@ -261,7 +251,7 @@ func splitSentences(text string) []string {
 
 	// Split on sentence terminators and common command conjunctions
 	var sentences []string
-	
+
 	// First split by punctuation
 	parts := strings.FieldsFunc(text, func(r rune) bool {
 		return r == '.' || r == '?' || r == '!' || r == ';'
@@ -272,8 +262,8 @@ func splitSentences(text string) []string {
 		if part == "" {
 			continue
 		}
-		
-		// Sub-split by common conjunctions like " and " or " then " 
+
+		// Sub-split by common conjunctions like " and " or " then "
 		// which often separate multiple commands in a single ASR stream.
 		subParts := strings.Split(part, " and ")
 		for _, sp := range subParts {
@@ -445,11 +435,34 @@ func fuzzyMatchAppName(heard string) string {
 	return bestMatch
 }
 
+// isPlaceholderMessage rejects the filler phrases that a parser can capture
+// when the user has not actually supplied a message body.
+func isPlaceholderMessage(text string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	normalized = strings.Trim(normalized, " .,!?\"'")
+	switch normalized {
+	case "", "a message", "message", "text", "msg", "something":
+		return true
+	default:
+		return false
+	}
+}
+
+// pendingMessageIntent holds a partially specified message command while Mai
+// asks the user for the missing contact or body.
+type pendingMessageIntent struct {
+	App     string
+	Contact string
+	Text    string
+	Need    string // "contact" or "text"
+}
+
 // ActionExecutor runs parsed actions using the Automation primitives.
 type ActionExecutor struct {
 	auto          *Automation
 	parser        *ActionParser
 	minConfidence float64
+	pending       *pendingMessageIntent
 }
 
 // NewActionExecutor creates an executor with the given automation instance.
@@ -468,7 +481,31 @@ func (e *ActionExecutor) SetMinConfidence(c float64) {
 
 // ParseAndExecute parses text and immediately executes if confidence is high enough.
 // Returns (executed bool, feedback string, err error).
+//
+// This is the primary path to the WhatsApp message workflow. It is called from
+// a user turn only (voice ASR or typed chat -> HandleInput -> DirectAction).
+// The LLM whatsapp_send fallback calls Automation.PrepareMessage directly, but
+// that method also requires an active user turn, so neither startup, timers,
+// nor proactive tasks can open WhatsApp. The recipient and body are always
+// derived from text; no contact is defaulted or hardcoded.
 func (e *ActionExecutor) ParseAndExecute(text string) (bool, string, error) {
+	// A prepared message or a missing contact/body takes priority over parsing
+	// the next utterance as a fresh command. This is what makes the
+	// prepare → confirm workflow conversational.
+	if e.pending != nil {
+		// Do not swallow an unrelated command as a message body. If the new
+		// utterance is itself a recognized non-message action, abandon the
+		// half-finished message and execute the new command instead.
+		if parsed := e.parser.ParseFromAnywhere(text); parsed.Type != ActionNone && parsed.Type != ActionSendMsg {
+			e.pending = nil
+		} else {
+			return e.handlePendingMessage(text)
+		}
+	}
+	if e.auto != nil && e.auto.HasPendingSend() {
+		return e.handleSendConfirmation(text)
+	}
+
 	action := e.parser.ParseFromAnywhere(text)
 
 	if action.Type == ActionNone {
@@ -490,6 +527,120 @@ func (e *ActionExecutor) ParseAndExecute(text string) (bool, string, error) {
 	}
 
 	return true, feedback, nil
+}
+
+func (e *ActionExecutor) handlePendingMessage(text string) (bool, string, error) {
+	input := strings.TrimSpace(text)
+	if isCancelPhrase(input) {
+		e.pending = nil
+		return true, "Okay, I won't send anything.", nil
+	}
+	if input == "" {
+		return true, "I still need a little more detail.", nil
+	}
+
+	intent := e.pending
+	switch intent.Need {
+	case "contact":
+		contact := strings.Trim(input, "\"'")
+		if isPlaceholderMessage(contact) {
+			return true, fmt.Sprintf("Who should I message on %s?", intent.App), nil
+		}
+		intent.Contact = contact
+		if isPlaceholderMessage(intent.Text) {
+			intent.Need = "text"
+			e.pending = intent
+			return true, fmt.Sprintf("What should I say to %s on %s?", contact, intent.App), nil
+		}
+		return e.preparePendingMessage(intent)
+	case "text":
+		if isPlaceholderMessage(input) {
+			return true, fmt.Sprintf("What should I say to %s on %s?", intent.Contact, intent.App), nil
+		}
+		intent.Text = input
+		return e.preparePendingMessage(intent)
+	default:
+		e.pending = nil
+		return false, "", nil
+	}
+}
+
+func (e *ActionExecutor) preparePendingMessage(intent *pendingMessageIntent) (bool, string, error) {
+	e.pending = nil
+	if err := e.auto.PrepareMessage(intent.App, intent.Contact, intent.Text); err != nil {
+		switch {
+		case errors.Is(err, ErrContactNotFound):
+			return true, fmt.Sprintf("I couldn't find %s in %s, so I didn't send anything.", intent.Contact, intent.App), nil
+		case errors.Is(err, ErrAppNotFound):
+			return true, "I couldn't open WhatsApp, so I didn't send anything.", nil
+		default:
+			return true, "", err
+		}
+	}
+	return true, fmt.Sprintf(
+		"I've opened %s's chat on %s and typed your message. Say \"send\" to send it, or \"cancel\" to discard it.",
+		intent.Contact, intent.App,
+	), nil
+}
+
+func (e *ActionExecutor) handleSendConfirmation(text string) (bool, string, error) {
+	input := strings.ToLower(strings.TrimSpace(text))
+	if isAffirmative(input) {
+		if err := e.auto.ConfirmSend(); err != nil {
+			switch {
+			case errors.Is(err, ErrContactNotFound):
+				return true, "The chat is no longer open, so I didn't send the message.", nil
+			case errors.Is(err, ErrAppNotFound):
+				return true, "WhatsApp is no longer open, so I didn't send the message.", nil
+			default:
+				return true, "", err
+			}
+		}
+		return true, "Sent.", nil
+	}
+	if isNegative(input) {
+		e.auto.CancelSend()
+		return true, "Okay, I didn't send it. The draft is still in the chat if you want to edit it.", nil
+	}
+	return true, "Say \"send\" to send it, or \"cancel\" to discard it.", nil
+}
+
+func normalizePhrase(text string) string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	text = strings.ReplaceAll(text, ",", " ")
+	text = strings.Trim(text, " .,!?")
+	return strings.Join(strings.Fields(text), " ")
+}
+
+func isAffirmative(text string) bool {
+	text = normalizePhrase(text)
+	switch text {
+	case "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "send", "send it",
+		"confirm", "go ahead", "do it", "please send", "send please", "yes please":
+		return true
+	}
+	return strings.HasPrefix(text, "yes ") || strings.HasPrefix(text, "yeah ") ||
+		strings.HasPrefix(text, "ok ") || strings.HasPrefix(text, "okay ")
+}
+
+func isNegative(text string) bool {
+	text = normalizePhrase(text)
+	switch text {
+	case "no", "nope", "cancel", "stop", "discard", "don't send", "do not send",
+		"never mind", "nevermind", "forget it":
+		return true
+	}
+	return strings.HasPrefix(text, "no ") || strings.HasPrefix(text, "don't ")
+}
+
+func isCancelPhrase(text string) bool {
+	text = normalizePhrase(text)
+	switch text {
+	case "cancel", "stop", "never mind", "nevermind", "forget it", "no":
+		return true
+	default:
+		return false
+	}
 }
 
 // Execute runs a specific action and returns human-readable feedback.
@@ -543,20 +694,39 @@ func (e *ActionExecutor) Execute(action Action) (string, error) {
 
 	case ActionSendMsg:
 		app, ok1 := action.Params["app"].(string)
-		text, ok2 := action.Params["text"].(string)
-		contact, _ := action.Params["contact"].(string) // Optional contact
-		if !ok1 || !ok2 {
-			return "", fmt.Errorf("missing app or text")
+		text, _ := action.Params["text"].(string)
+		// The recipient is exactly what the parser captured from the user's
+		// utterance. There is intentionally no fallback contact.
+		contact, _ := action.Params["contact"].(string)
+		if !ok1 || strings.TrimSpace(app) == "" {
+			return "", fmt.Errorf("missing app name")
 		}
-		// Fuzzy match app name
 		app = fuzzyMatchAppName(app)
-		if err := e.auto.SendMessage(app, contact, text); err != nil {
-			return "", err
+		if app != "whatsapp" {
+			return "I can choreograph WhatsApp messages right now. Which contact should I message on WhatsApp?", nil
 		}
-		if contact != "" {
-			return fmt.Sprintf("Sent message to %s on %s.", contact, app), nil
+		if strings.TrimSpace(contact) == "" {
+			e.pending = &pendingMessageIntent{App: app, Text: text, Need: "contact"}
+			return "Who should I message on WhatsApp?", nil
 		}
-		return fmt.Sprintf("Sent message to %s.", app), nil
+		if isPlaceholderMessage(text) {
+			e.pending = &pendingMessageIntent{App: app, Contact: contact, Need: "text"}
+			return fmt.Sprintf("What should I say to %s on WhatsApp?", contact), nil
+		}
+		if err := e.auto.PrepareMessage(app, contact, text); err != nil {
+			switch {
+			case errors.Is(err, ErrContactNotFound):
+				return fmt.Sprintf("I couldn't find %s in WhatsApp, so I didn't send anything.", contact), nil
+			case errors.Is(err, ErrAppNotFound):
+				return "I couldn't open WhatsApp, so I didn't send anything.", nil
+			default:
+				return "", err
+			}
+		}
+		return fmt.Sprintf(
+			"I've opened %s's chat on WhatsApp and typed your message. Say \"send\" to send it, or \"cancel\" to discard it.",
+			contact,
+		), nil
 
 	case ActionMouseClick:
 		x, ok1 := action.Params["x"].(string)
