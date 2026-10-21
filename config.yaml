@@ -45,7 +45,7 @@ kws:
   joiner: "joiner-epoch-12-avg-2-chunk-16-left-64.onnx"
   tokens: "tokens.txt"
   keywords: "▁MA I @mai, ▁MY @mai, ▁HE Y ▁MA I @mai"  # Subword token version
-  confidence_threshold: 0.55
+  confidence_threshold: 0.25
   cooldown_ms: 1500
 
 vad:
