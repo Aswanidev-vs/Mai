@@ -285,8 +285,25 @@ func (h *overlayHost) start(url, title string, width, height int, debug, perch b
 	// The overlay must not take focus away from the app the user is working in.
 	h.restoreFocus()
 
+	// The WebView2 profile is disposable, and a stale one is what makes a
+	// start fail after the previous run was killed. Its cache can hold a
+	// virtual.js from an older build that imports a file which no longer
+	// exists, and a killed run can leave the profile in a state where
+	// CreateCoreWebView2Controller fails (go-webview2 then dereferences the
+	// nil controller and panics before the page is navigated to). The
+	// profile holds no user data — only the cache for a page served from
+	// localhost — so starting clean costs nothing.
+	dataPath := filepath.Join(os.Getenv("AppData"), "Mai", "overlay")
+	if err := os.RemoveAll(dataPath); err != nil {
+		// The old browser process may still be shutting down. A separate
+		// profile keeps this start from inheriting its broken state.
+		fallback := filepath.Join(dataPath, fmt.Sprintf("run-%d", os.Getpid()))
+		log.Printf("[OVERLAY] could not clear %s, using %s: %v", dataPath, fallback, err)
+		dataPath = fallback
+	}
+
 	chromium := edge.NewChromium()
-	chromium.DataPath = filepath.Join(os.Getenv("AppData"), "Mai", "overlay")
+	chromium.DataPath = dataPath
 	chromium.MessageCallback = h.onMessage
 	if !chromium.Embed(hwnd) {
 		return fmt.Errorf("could not embed the WebView2")
