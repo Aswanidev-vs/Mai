@@ -52,6 +52,28 @@ type Config struct {
 		NumThreads  int    `yaml:"num_threads"`
 		Debug       int    `yaml:"debug"`
 
+		// Pipeline controls the streaming turn boundary and final transcript
+		// handling. The zero values fall back to the shipped defaults in
+		// cmd/mai; they are explicitly configurable so the two halves can be
+		// A/B tested on a machine where CPU pressure is the limiting factor.
+		Pipeline struct {
+			// VADEndpointSilenceMs finalizes a streaming turn after this much
+			// verified silence, even if the decoder's own trailing-blank rule
+			// has not fired yet. It is a backstop, not a replacement for the
+			// recognizer endpoint: the decoder still owns the normal boundary.
+			VADEndpointSilenceMs int `yaml:"vad_endpoint_silence_ms"`
+			// MaxTurnSeconds caps a single command turn. Without it a decoder
+			// that keeps repeating the last phrase can hold a turn open until
+			// the recognizer's 20s rule3.
+			MaxTurnSeconds float64 `yaml:"max_turn_seconds"`
+			// PostTTSAECMs is how long echo cancellation stays armed after
+			// playback ends. Long windows eat the first words of a follow-up.
+			PostTTSAECMs int `yaml:"post_tts_aec_ms"`
+			// ASRQueueDepth bounds the decoupled ASR worker queue in capture
+			// frames. The audio callback never waits for the decoder.
+			ASRQueueDepth int `yaml:"asr_queue_depth"`
+		} `yaml:"pipeline"`
+
 		// Dual-model: use a secondary offline model for unsupported languages
 		DualMode struct {
 			Enabled           bool     `yaml:"enabled"`

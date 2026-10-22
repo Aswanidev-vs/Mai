@@ -20,9 +20,11 @@ audio:
   thinking_chime: true      # Play a subtle tone during LLM processing
   tts_play_local_always: true  # Voice always on local speakers, even with companion open (no browser autoplay silence)
 
-# Background-noise suppression for the microphone. Stops stationary noise
-# (laptop fans, HVAC, mains hum) from reaching the wake-word spotter, the VAD
-# and ASR as if it were a user utterance. Requires a *streaming* DPDFNet export
+# Background-noise suppression for the microphone. It validates the
+# echo-cancelled residual during barge-in/post-TTS and is *advisory* elsewhere:
+# its verdict never deletes a frame before ASR, because a quiet accented phoneme
+# can be classified as stationary noise. Disable it to A/B whether its verdict is
+# helping on this machine. Requires a *streaming* DPDFNet export
 # (profile "dpdfnet_16khz"), e.g. dpdfnet8.onnx from
 # https://github.com/k2-fsa/sherpa-onnx/releases/tag/speech-enhancement-models
 # If the model is missing the assistant still runs, just without suppression.
@@ -37,7 +39,10 @@ denoise:
 
 kws:
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
-  num_threads: 2
+  # Wake-word spotting is a tiny model. One thread keeps it off the audio
+  # critical path's CPU budget; the old 2 oversubscribed the box once ASR and
+  # TTS were both live.
+  num_threads: 1
   debug: 0
   model_dir: "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
   encoder: "encoder-epoch-12-avg-2-chunk-16-left-64.onnx"
@@ -50,7 +55,10 @@ kws:
 
 vad:
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
-  num_threads: 2
+  # Silero VAD is lighter than the ASR/denoiser models. Reserving one thread
+  # leaves headroom for the capture drain and TTS instead of pinning every
+  # ONNX pool at full width.
+  num_threads: 1
   debug: 0
   sample_rate: 16000
   model: "silero_vad.onnx"
@@ -74,6 +82,24 @@ asr:
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
+
+  # Streaming turn-boundary and transcript cleanup. These are deliberately
+  # separate from the model config so they can be tuned without changing the
+  # acoustic model.
+  pipeline:
+    # Backstop for a decoder that keeps emitting text: end a turn after this
+    # much silence that VAD and the mic level both agree is real. The decoder's
+    # rule2 still normally fires first at 1.2s.
+    vad_endpoint_silence_ms: 1600
+    # Hard cap on one spoken turn. The decoder's rule3 is 20s; a command that
+    # has already repeated itself should not hold the turn that long.
+    max_turn_seconds: 12
+    # Echo cancellation stays armed this long after TTS ends. 2.5s covered
+    # room reverb but also discarded the first words of a quick follow-up.
+    post_tts_aec_ms: 800
+    # Decoupled ASR worker queue, in 25ms capture frames. Bounds the decoder
+    # backlog without ever blocking the capture callback.
+    asr_queue_depth: 128
 
   # Dual-model: use a secondary offline model for unsupported languages
   dual_mode:

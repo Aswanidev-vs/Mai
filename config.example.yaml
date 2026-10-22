@@ -15,9 +15,11 @@ audio:
   thinking_chime: true  # empty = default
 
 # Background-noise suppression for the microphone (Sherpa-ONNX streaming
-# DPDFNet). Stops stationary noise (fans, HVAC, hum) from reaching the
-# wake-word spotter, VAD and ASR as speech. Needs a streaming export with the
-# "dpdfnet_16khz" profile, e.g. dpdfnet8.onnx. Missing model = feature off.
+# DPDFNet). It validates the echo-cancelled residual during barge-in/post-TTS,
+# but is advisory elsewhere: its verdict never deletes a frame before ASR,
+# because a quiet accented phoneme can look like stationary noise. Needs a streaming
+# export with the "dpdfnet_16khz" profile, e.g. dpdfnet8.onnx. Missing model =
+# feature off.
 denoise:
   enabled: true
   model: "dpdfnet8.onnx"
@@ -27,7 +29,7 @@ denoise:
 
 kws:
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
-  num_threads: 2
+  num_threads: 1
   debug: 0
   model_dir: "./sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
   encoder: "encoder-epoch-12-avg-2-chunk-16-left-64.onnx"
@@ -40,7 +42,7 @@ kws:
 
 vad:
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
-  num_threads: 2
+  num_threads: 1
   debug: 0
   sample_rate: 16000
   model: "./silero_vad.onnx"
@@ -58,6 +60,13 @@ asr:
   provider: "cpu"  # "cpu" | "cuda" (NVIDIA GPU) | "coreml" (macOS) | "opencl"
   num_threads: 2
   debug: 0
+
+  # Streaming turn-boundary and transcript cleanup.
+  pipeline:
+    vad_endpoint_silence_ms: 1600  # VAD-backed endpoint backstop
+    max_turn_seconds: 12           # hard cap for one spoken turn
+    post_tts_aec_ms: 800           # shorter than the old 2.5s follow-up guard
+    asr_queue_depth: 128           # decoupled decoder queue, 25ms frames
 
   # Dual-model: use a secondary offline model for unsupported languages
   dual_mode:

@@ -18,21 +18,17 @@ import (
 
 // Background-noise suppression for the microphone path.
 //
-// Everything downstream of the mic (the wake-word spotter, the VAD, ASR, and
-// the follow-up energy check) assumes that anything loud enough is speech. A
-// laptop fan, HVAC vent or mains hum therefore looks like a user utterance and
-// can trigger a turn on its own. The DPDFNet speech enhancer solves exactly
-// that: it is a *streaming* model that keeps speech nearly untouched while
-// attenuating stationary noise by an order of magnitude.
+// The DPDFNet speech enhancer is a *streaming* model that keeps speech nearly
+// untouched while attenuating stationary noise. It is deliberately NOT used as
+// a destructive frame gate: the raw mic remains the ASR input. A quiet or
+// accented phoneme can be classified as stationary noise, and deleting that
+// 25ms frame before ASR was worse than passing some fan noise through.
 //
-// Two things are derived from it:
-//
-//  1. The denoised frame, which replaces the raw mic frame on its way to the
-//     spotter/VAD/ASR.
-//  2. A speech-presence ratio (denoised RMS / raw RMS), used as an extra gate
-//     so noise that still clears an energy threshold can be rejected outright.
-//     Speech keeps most of its energy (ratio ~0.7-1.0); a fan drone loses most
-//     of it (ratio ~0.05-0.2).
+// Its speech-presence verdict (denoised RMS / raw RMS) is used only where a
+// false positive is cheap and reversible: validating the echo-cancelled
+// residual during TTS barge-in and the post-TTS follow-up window. Speech keeps
+// most of its energy (ratio ~0.7-1.0); a fan drone loses most of it
+// (ratio ~0.05-0.2). Elsewhere the verdict is not consulted.
 
 // defaultSpeechRatioMin is the denoised/raw energy ratio below which a frame is
 // treated as stationary noise rather than speech. The margin between speech
@@ -354,10 +350,13 @@ type denoiseJob struct {
 }
 
 const (
-	// denoiseQueueDepth bounds how far the enhancer may fall behind. Two frames
-	// (~200ms) keeps the verdict fresh; on overflow the *oldest* frame is
-	// dropped, because a stale verdict is worse than a missing one.
-	denoiseQueueDepth = 2
+	// denoiseQueueDepth bounds how far the enhancer may fall behind; on
+	// overflow the *oldest* frame is dropped, because a stale verdict is worse
+	// than a missing one. Four 25ms frames = 100ms of hand-off slack. The
+	// enhancer costs roughly 57ms per 100ms of audio, so it can keep up in
+	// steady state; the extra depth absorbs scheduler jitter without dropping
+	// a verdict that a barge-in decision was about to read.
+	denoiseQueueDepth = 4
 	// denoiseStreamGap resets the enhancer when the stream was interrupted for
 	// longer than this, so two non-adjacent stretches of audio are never
 	// spliced into one stream.

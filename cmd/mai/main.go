@@ -125,17 +125,33 @@ func main() {
 	var lastMicMu sync.Mutex
 	var sherpaMu sync.Mutex // Mutex for all other Sherpa-ONNX calls
 
-	// Post-TTS cooldown: suppress mic input briefly after TTS finishes to
-	// prevent room reverberation from reaching ASR as false user input.
-	// Stored as atomic UnixNano so the audio callback goroutine can read
-	// without holding a mutex.
+	// End of the last TTS playback, used by the post-TTS AEC window to keep
+	// room reverberation from reaching ASR as false user input. Stored as
+	// atomic UnixNano so the audio callback goroutine can read it without a
+	// mutex.
 	var lastTTSEndNano atomic.Int64
-	const ttsCooldown = 150 * time.Millisecond
 
 	// Post-TTS AEC window: continue echo cancellation for this long after
-	// TTS finishes, so room reverberation doesn't pass through to ASR. 2.5s
-	// covers typical room reverb + browser playback tail.
-	const postTTSAECWindow = 2500 * time.Millisecond
+	// TTS finishes, so room reverberation doesn't pass through to ASR. It used
+	// to be 2.5s, which also swallowed the first words of a quick follow-up;
+	// 800ms covers the normal reverb tail without turning the guard into a
+	// speech filter.
+	postTTSAECWindow := time.Duration(cfg.ASR.Pipeline.PostTTSAECMs) * time.Millisecond
+	if postTTSAECWindow <= 0 {
+		postTTSAECWindow = 800 * time.Millisecond
+	}
+
+	// VAD-assisted endpoint backstop and hard turn cap. The decoder still
+	// owns the normal endpoint; these only catch the case where a streaming
+	// decoder keeps emitting text after the user has stopped.
+	vadEndpointSilence := time.Duration(cfg.ASR.Pipeline.VADEndpointSilenceMs) * time.Millisecond
+	if vadEndpointSilence <= 0 {
+		vadEndpointSilence = 1600 * time.Millisecond
+	}
+	maxTurnDuration := time.Duration(cfg.ASR.Pipeline.MaxTurnSeconds * float64(time.Second))
+	if maxTurnDuration <= 0 {
+		maxTurnDuration = 12 * time.Second
+	}
 
 	// How often the standing mic-level line is repainted. It shares the
 	// pipeline goroutine with the serial capture drain, so it must not write on
@@ -470,6 +486,20 @@ func main() {
 
 	default:
 		log.Fatalf("[ASR] Unknown active_model: %q (valid: qwen3, nemotron, omnilingual, transducer)", cfg.ASR.ActiveModel)
+	}
+
+	// The streaming recognizer runs on its own goroutine. This is the
+	// decoupling that keeps a 560ms chunk decode from stalling the capture
+	// drain; the audio pipeline only copies a frame into this queue.
+	var streaming *streamingASR
+	if recognizer != nil && asrStream != nil {
+		depth := cfg.ASR.Pipeline.ASRQueueDepth
+		if depth <= 0 {
+			depth = 128
+		}
+		streaming = newStreamingASR(recognizer, asrStream, depth)
+		defer streaming.Stop()
+		log.Printf("[ASR] Decoupled streaming decoder worker ready (queue=%d frames)", depth)
 	}
 
 	// Initialize dual-mode fallback recognizer if enabled
@@ -1168,8 +1198,9 @@ func main() {
 			atomic.StoreInt32(&isSpeaking, 0)
 			atomic.StoreInt32(&ttsPlaying, 0)
 			atomic.StoreInt32(&stopPlayback, 0)
-			// Nothing is playing now, so the consumer may fall as far behind as
-			// the streaming ASR decoder's chunk decode needs it to.
+			// Nothing is playing now, so the consumer gets the idle burst
+			// budget. The ASR decoder is on its own worker, so this is no
+			// longer a chunk-decode window.
 			micPipe.Load().SetMaxLag(audioIdleLagFrames)
 			lastTTSEndNano.Store(time.Now().UnixNano())
 			publishTTSAudioChunk(bus, nil, 44100, true, mirrored)
@@ -1596,8 +1627,9 @@ func main() {
 				log.Printf("[TTS] Play error: %v", playErr)
 			}
 			atomic.StoreInt32(&ttsPlaying, 0)
-			// Nothing is playing now, so the consumer may fall as far behind as
-			// the streaming ASR decoder's chunk decode needs it to.
+			// Nothing is playing now, so the consumer gets the idle burst
+			// budget. The ASR decoder is on its own worker, so this is no
+			// longer a chunk-decode window.
 			micPipe.Load().SetMaxLag(audioIdleLagFrames)
 
 			// If barge-in was triggered, skip silence wait
@@ -1645,79 +1677,193 @@ func main() {
 		vadBuffer.Reset()
 	}
 
+	// Streaming ASR input gate. The recognizer is no longer fed every frame
+	// of an empty room: a short pre-roll is held until VAD/energy says speech
+	// started, then the whole run is submitted. Once speech stops, a bounded
+	// tail of silence is still submitted so the decoder's endpoint rules can
+	// fire, after which the gate closes again.
+	asrGateActive := false
+	asrGateSilenceFrames := 0
+	asrPreRoll := make([][]float32, 0, 16)
+	const (
+		asrPreRollFrames = 12 // ~300ms at 25ms
+		asrTailFrames    = 64 // ~1.6s at 25ms, enough for rule2
+	)
+	lastVoiceAt := time.Now()
+	lastASRTextAt := time.Now()
+	turnStartedAt := time.Time{}
+	var lastASRDropLog time.Time
+
+	resetASR := func() {
+		if streaming != nil {
+			streaming.SetEndpointEnabled(false)
+			streaming.Reset()
+		} else if recognizer != nil && asrStream != nil {
+			recognizer.Reset(asrStream)
+		}
+		lastText = ""
+		asrGateActive = false
+		asrGateSilenceFrames = 0
+		asrPreRoll = asrPreRoll[:0]
+		lastVoiceAt = time.Now()
+		lastASRTextAt = time.Now()
+		turnStartedAt = time.Time{}
+	}
+
+	// submitASRFrame queues audio for the streaming decoder. It is the only
+	// place the capture path touches ASR, so the fast path is a copy plus a
+	// non-blocking channel send. Offline recognizers use sessionSamples and
+	// leave streaming nil, in which case this is a no-op.
+	submitASRFrame := func(samples []float32, speech bool) {
+		if streaming == nil {
+			return
+		}
+		if !asrGateActive {
+			asrPreRoll = append(asrPreRoll, append([]float32(nil), samples...))
+			if len(asrPreRoll) > asrPreRollFrames {
+				asrPreRoll = asrPreRoll[len(asrPreRoll)-asrPreRollFrames:]
+			}
+			if !speech {
+				return
+			}
+			for _, f := range asrPreRoll {
+				streaming.Submit(f)
+			}
+			asrPreRoll = asrPreRoll[:0]
+			asrGateActive = true
+			asrGateSilenceFrames = 0
+			return
+		}
+
+		streaming.Submit(samples)
+		if speech {
+			asrGateSilenceFrames = 0
+			return
+		}
+		asrGateSilenceFrames++
+		if asrGateSilenceFrames > asrTailFrames {
+			asrGateActive = false
+			asrPreRoll = asrPreRoll[:0]
+		}
+	}
+
 	// finalizeTurn routes the accumulated utterance to the agent/legacy
 	// pipeline and resets all per-turn state.
 	//
-	// On the streaming path this is reached ONLY from the recognizer endpoint
-	// (see runListening). On the offline path it is reached from the VAD
-	// segment end. The two cannot share a trigger: GetResult returns the WHOLE
-	// utterance since the last Reset, not a per-segment delta, so a VAD-driven
-	// finalizer on the streaming path would append the full transcript once per
-	// VAD segment and end the turn on Silero's 0.5s silence — duplicating the
-	// text and cutting the speaker off mid-sentence.
+	// On the streaming path this is reached from the recognizer endpoint or
+	// one of its bounded backstops (VAD/energy silence, hard turn cap). On the
+	// offline path it is reached from the VAD segment end. The two cannot share
+	// a trigger: GetResult returns the WHOLE utterance since the last Reset,
+	// not a per-segment delta, so a VAD-driven finalizer on the streaming path
+	// would append the full transcript once per VAD segment and end the turn on
+	// Silero's 0.5s silence — duplicating the text and cutting the speaker off
+	// mid-sentence.
 	finalizeTurn := func() {
-		// Display-only transcript of what the user said. Never fed back into
-		// ASR/turn input anywhere else — routing below is the single consumer.
-		finalText := strings.TrimSpace(sessionText)
-		if finalText != "" {
-			log.Printf("[USER] %s", finalText)
-			// The authoritative transcript, superseding every interim the
-			// browser is currently rendering for this turn.
-			publishASRTranscript(bus, finalText, true)
+		// The display transcript and the routed transcript are the same text.
+		// Strip the wake word that the ASR stream may have retained while KWS
+		// was confirming it, then remove decoder-loop repetition before the
+		// action parser or LLM sees the turn.
+		finalText := strings.TrimSpace(stripWakeWordPrefix(sessionText))
+		cleaned := strings.TrimSpace(dedupeRepeatedTranscript(finalText))
+		// Cleanup can expose a second wake token ("Mai Mai, send ...");
+		// strip once more after collapsing repeats.
+		cleaned = strings.TrimSpace(stripWakeWordPrefix(cleaned))
+		if cleaned != finalText {
+			log.Printf("[ASR] Cleaned repeated transcript: %q -> %q", finalText, cleaned)
+			finalText = cleaned
 		}
-		if agentBridge != nil {
-			log.Println("[AGENT] Routing to cognitive orchestrator...")
-			// Feed the voice-derived emotion to Mai *before* the transcription
-			// event so HandleInput can merge it with the text keywords
-			// ("I'm fine" said flatly vs. stressed).
-			if orch != nil && len(prosodySamples) > 0 {
-				orch.IngestProsody(orch.AnalyzeProsody(prosodySamples, 16000))
+
+		if finalText == "" {
+			resetASR()
+			state = StateWakeWord
+			sessionText = ""
+			sessionSamples = nil
+			prosodySamples = nil
+			resetVAD()
+			return
+		}
+
+		// A decoder that is still repeating itself is not a command and is
+		// not useful conversation. Ask for a repeat instead of letting the LLM
+		// hallucinate an intent from the loop.
+		if isLikelyRepetitiveTranscript(finalText) {
+			log.Printf("[ASR] Rejecting repetitive transcript: %q", finalText)
+			resetASR()
+			state = StateWakeWord
+			sessionText = ""
+			sessionSamples = nil
+			prosodySamples = nil
+			resetVAD()
+			if orch != nil {
+				go orch.Speak("Sorry, I didn't catch that. Could you say it again?")
 			}
-			go agentBridge.PublishTranscription(sessionText)
-		} else {
-			log.Println("[PIPELINE] Routing to legacy pipeline...")
-			// Heuristic: longer inputs (>15 words) are more likely to be
-			// reasoning tasks vs. simple conversational turns.
-			isReasoning := len(strings.Fields(sessionText)) > 15
-			workerChan <- Task{Text: sessionText, IsReasoning: isReasoning}
+			return
 		}
+
+		log.Printf("[USER] %s", finalText)
+		// The authoritative transcript, superseding every interim the browser
+		// is currently rendering for this turn.
+		publishASRTranscript(bus, finalText, true)
+
+		// Feed the voice-derived emotion to Mai *before* the transcription
+		// event so HandleInput can merge it with the text keywords ("I'm fine"
+		// said flatly vs. stressed).
+		if agentBridge != nil && orch != nil && len(prosodySamples) > 0 {
+			orch.IngestProsody(orch.AnalyzeProsody(prosodySamples, 16000))
+		}
+
+		// Leave listening and reset the decoder *before* handing this text to
+		// the agent/legacy worker. Either consumer can start TTS immediately;
+		// if that TTS observed state=Listening, it would treat the response as
+		// a greeting and seed the just-finished command back into ASR as a
+		// phantom follow-up.
 		state = StateWakeWord
 		sessionText = ""
 		sessionSamples = nil
 		prosodySamples = nil
-		if recognizer != nil {
-			recognizer.Reset(asrStream)
-		}
+		resetASR()
 		resetVAD()
-		lastText = ""
+
+		if agentBridge != nil {
+			log.Println("[AGENT] Routing to cognitive orchestrator...")
+			go agentBridge.PublishTranscription(finalText)
+		} else {
+			log.Println("[PIPELINE] Routing to legacy pipeline...")
+			// Heuristic: longer inputs (>15 words) are more likely to be
+			// reasoning tasks vs. simple conversational turns.
+			isReasoning := len(strings.Fields(finalText)) > 15
+			workerChan <- Task{Text: finalText, IsReasoning: isReasoning}
+		}
 	}
 
-	// updateLiveASR decodes one frame already pushed to asrStream, returns the
-	// partial transcript, and publishes it. Shared by the listening and
-	// wake-word states so the user sees live captions in real time in either
-	// state.
-	// Uses log (stderr) rather than fmt.Printf("\r") so the line isn't clobbered
-	// by the timestamped stderr logs.
-	//
-	// Publishing happens only when the text actually changes. GetResult is the
-	// full utterance-so-far and is revised wholesale each chunk, so the caption
-	// is replaceable, not appendable — which is exactly the contract
-	// PartialTranscriptParams documents. One publish per revised chunk is about
-	// 2/sec, cheap enough for the synchronous bus dispatch this runs under.
-	updateLiveASR := func() string {
-		if asrStream == nil {
-			return ""
+	// pollASR publishes the decoder worker's latest partial and reports a
+	// finalized endpoint. The worker owns the recognizer stream, so the audio
+	// goroutine never calls Decode here. Generation checks keep a late snapshot
+	// from the previous turn out of the next one.
+	pollASR := func() (string, bool) {
+		if streaming == nil {
+			return "", false
 		}
-		for recognizer.IsReady(asrStream) {
-			recognizer.Decode(asrStream)
+		if dropped := streaming.Dropped(); dropped > 0 && time.Since(lastASRDropLog) >= 10*time.Second {
+			lastASRDropLog = time.Now()
+			log.Printf("[ASR] Decoder queue pressure: %d frame(s) dropped so far; capture continued.", dropped)
 		}
-		text := recognizer.GetResult(asrStream).Text
-		if text != "" && text != lastText {
-			lastText = text
-			log.Printf("[ASR] Live: %s%s", sessionText, text)
-			publishASRTranscript(bus, text, false)
+		snap := streaming.Snapshot()
+		if snap.Generation != streaming.Generation() {
+			return "", false
 		}
-		return text
+		if snap.Text != lastText {
+			lastText = snap.Text
+			lastASRTextAt = time.Now()
+			if snap.Text != "" {
+				log.Printf("[ASR] Live: %s", snap.Text)
+				publishASRTranscript(bus, snap.Text, false)
+			}
+		}
+		if snap.Endpoint {
+			return snap.Text, true
+		}
+		return snap.Text, false
 	}
 
 	// Audio callback
@@ -1726,6 +1872,19 @@ func main() {
 	runListening := func(samples []float32) {
 		if atomic.LoadInt32(&ttsPlaying) != 0 {
 			return
+		}
+		// Entering the listening path means endpoint detection is allowed.
+		// This matters for the browser mic, which bypasses the local wake
+		// state; the local path has already enabled it at wake detection.
+		streaming.SetEndpointEnabled(true)
+		// Keep the recent-audio ring current during listening too. A greeting
+		// is launched asynchronously, so there can be several frames between
+		// wake detection and the first TTS frame; if the ring stopped at the
+		// wake frame, those first command words would be lost when greeting
+		// playback resets the decoder generation.
+		for _, s := range samples {
+			lookbackBuffer[lookbackIdx] = s
+			lookbackIdx = (lookbackIdx + 1) % lookbackSize
 		}
 		// Accumulate the live utterance for prosody analysis (both ASR paths).
 		prosodySamples = append(prosodySamples, samples...)
@@ -1740,49 +1899,53 @@ func main() {
 			vadDetector.AcceptWaveform(chunk)
 		}
 
-		if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
-			// A dropped frame (audioPipeline overflow) loses audio but cannot
-			// corrupt stream state: AcceptWaveform takes any sample block, the
-			// feature extractor chunks to its own window, and IsReady/Decode is
-			// drained to exhaustion every frame. So the worst a drop causes is a
-			// shorter word; the decoder state, the trailing-blank counter the
-			// endpoint rules read, and the reset between turns all stay coherent.
-			// That is the same guarantee the AEC depends on, and it is why
-			// frames may be dropped here but the stream must still be Reset on
-			// every turn boundary.
-			asrStream.AcceptWaveform(16000, samples)
-			text := updateLiveASR()
-			// Finalize when the recognizer's own endpoint rules fire (e.g.
-			// rule1/rule2 trailing silence). This is the ONLY thing that ends a
-			// turn on the streaming path.
-			//
-			// The recognizer's rules are the right authority because they measure
-			// trailing BLANKS in the decoder's own best path, which is the only
-			// signal that knows whether the user actually stopped. Silero cannot
-			// substitute: its min_silence_duration is 0.5s, which fires inside a
-			// natural mid-sentence pause and cuts the user off. Conversely the
-			// endpoint cannot be left to run alone either, and the guard below is
-			// what makes it safe:
-			//
-			//  * rule1 carries must_contain_nonsilence=false and a 0s utterance
-			//    floor, so it fires on 2.4s of pure silence EVEN WHEN NOTHING WAS
-			//    DECODED (measured). Without this guard a silent room would end a
-			//    turn every 2.4s and Mai would answer nothing forever.
-			//  * rule2 additionally requires that some non-silence was decoded,
-			//    so once anything has been said it fires at 1.2s of trailing
-			//    silence (measured: 1.66s of silence to the next chunk boundary).
-			//  * rule3 caps the utterance at 20s so a continuously talking user
-			//    still turns over.
-			//
-			// rule1 is therefore the guarantee that a turn always ends: no
-			// combination of silence and VAD behaviour can leave Mai mute.
-			if text != "" && recognizer.IsEndpoint(asrStream) {
+		vadSpeech := !vadDetector.IsEmpty()
+		frameRMS := rmsOf(samples)
+		now := time.Now()
+		if vadSpeech || frameRMS > 0.004 {
+			lastVoiceAt = now
+		}
+
+		if streaming != nil {
+			// The decoder worker owns the recognizer. Feed it through the
+			// VAD/energy gate, then poll the worker's latest result. The audio
+			// goroutine never blocks on a chunk decode here.
+			submitASRFrame(samples, vadSpeech || frameRMS > 0.004)
+			text, endpoint := pollASR()
+			if text != "" && turnStartedAt.IsZero() {
+				turnStartedAt = now
+			}
+
+			if endpoint {
 				log.Printf("\n[ASR] Endpoint detected, finalizing (text=%q)", text)
-				sessionText += text + " "
+				sessionText = text
 				finalizeTurn()
 				return
 			}
-		} else {
+
+			// VAD/energy backstop: the decoder's own rule2 is normally 1.2s
+			// of trailing silence, but a repeated/hallucinated path can keep
+			// emitting text and hold the turn open. If the mic has been quiet
+			// for the configured window and the transcript has stopped
+			// changing, end it here.
+			if text != "" &&
+				now.Sub(lastVoiceAt) >= vadEndpointSilence &&
+				now.Sub(lastASRTextAt) >= 300*time.Millisecond {
+				log.Printf("\n[ASR] VAD endpoint backstop, finalizing (text=%q)", text)
+				sessionText = text
+				finalizeTurn()
+				return
+			}
+
+			// Hard cap for a decoder loop. The recognizer's rule3 is 20s;
+			// commands should not hold the floor that long.
+			if text != "" && !turnStartedAt.IsZero() && now.Sub(turnStartedAt) >= maxTurnDuration {
+				log.Printf("\n[ASR] Max turn duration reached, finalizing (text=%q)", text)
+				sessionText = text
+				finalizeTurn()
+				return
+			}
+		} else if offlineRecognizer != nil {
 			// Safety cap: force finalization if buffer grows too large
 			if len(sessionSamples) >= offlineASRMaxSamples {
 				log.Printf("[ASR] WARNING: Offline buffer exceeded %d samples (%.0fs). Forcing finalization.",
@@ -1894,6 +2057,48 @@ func main() {
 	// then a full vowel, then noise floor again.
 	var levelPeak float64
 
+	// Overlap capture. TTS used to be a hard wall: unless the barge-in gate
+	// fired, every frame during playback was discarded. A quiet first syllable
+	// could therefore be lost even though the user was already talking. Keep
+	// the echo-cancelled residual in a short ring and hand it to ASR when
+	// barge-in is confirmed, or when playback ends and the residual contained
+	// verified speech. This is additive: the barge-in path still stops Mai
+	// promptly; it just no longer starts the transcript at the confirmation
+	// instant.
+	var overlapSamples []float32
+	var overlapSpeech bool
+	var wasTTSPlaying bool
+	var bargeInFlushed bool
+	const overlapMaxSamples = 3 * 16000 // 3s: 1.5s lookback + short greeting overlap
+
+	appendOverlap := func(clean []float32) {
+		overlapSamples = append(overlapSamples, clean...)
+		if len(overlapSamples) > overlapMaxSamples {
+			overlapSamples = overlapSamples[len(overlapSamples)-overlapMaxSamples:]
+		}
+	}
+
+	flushOverlap := func(reason string) {
+		if !overlapSpeech || len(overlapSamples) == 0 {
+			overlapSamples = overlapSamples[:0]
+			overlapSpeech = false
+			return
+		}
+		// A new turn starts here. Reset the decoder generation so old
+		// half-heard text cannot merge with the preserved speech, then feed
+		// the overlap as the utterance prefix.
+		resetASR()
+		state = StateListening
+		streaming.SetEndpointEnabled(true)
+		sessionText = ""
+		lastVoiceAt = time.Now()
+		turnStartedAt = time.Time{}
+		submitASRFrame(overlapSamples, true)
+		log.Printf("[TTS] Captured %s speech (%d samples) for ASR.", reason, len(overlapSamples))
+		overlapSamples = overlapSamples[:0]
+		overlapSpeech = false
+	}
+
 	// handleAudioFrame processes one audio frame.
 	// fromBrowser=true  → browser mic (skips wake word, goes straight to listening)
 	// fromBrowser=false → local system mic (full state machine: wake word + follow-up + listening)
@@ -1930,7 +2135,6 @@ func main() {
 		lastMicMu.Unlock()
 
 		playing := atomic.LoadInt32(&ttsPlaying) != 0
-		speaking := atomic.LoadInt32(&isSpeaking) != 0
 		postTTS := false
 		if nano := lastTTSEndNano.Load(); nano > 0 {
 			if time.Since(time.Unix(0, nano)) < postTTSAECWindow {
@@ -1940,16 +2144,48 @@ func main() {
 			}
 		}
 
-		// Ask the noise suppressor about this frame. It analyses on its own
-		// goroutine (the model costs ~0.6 of a core), so Feed only posts a copy
-		// and Speech reads back the latest verdict — the capture callback never
-		// waits for it. It is only fed while the frame is actually heading for
-		// the spotter/VAD/ASR: during playback and the AEC window that follows
-		// it those consumers are gated off anyway, which parks the analysis.
-		noiseFrame := false
-		if denoiser != nil && !playing && !speaking && !postTTS {
-			denoiser.Feed(samples, false)
-			noiseFrame = !denoiser.Speech()
+		// Playback is a capture boundary, not a discard boundary. Start a new
+		// decoder generation when it begins, and flush any speech captured in
+		// the echo-cancelled residual when it ends.
+		if playing && !wasTTSPlaying {
+			wasTTSPlaying = true
+			bargeInFlushed = false
+			resetASR()
+			resetVAD()
+			overlapSamples = overlapSamples[:0]
+			overlapSpeech = false
+			// If this is the wake greeting, the 1.5s lookback already holds
+			// the words spoken around the wake word. Seed the overlap with it
+			// before the decoder generation is reset, so a late ASR result
+			// cannot make the greeting discard the command prefix.
+			if state == StateListening {
+				pre := make([]float32, 0, lookbackSize+len(samples))
+				for i := 0; i < lookbackSize; i++ {
+					pre = append(pre, lookbackBuffer[(lookbackIdx+i)%lookbackSize])
+				}
+				// runListening has not seen this frame yet (TTS starts before
+				// the state machine), and it may contain the first syllable
+				// after wake detection.
+				pre = append(pre, samples...)
+				appendOverlap(pre)
+				overlapSpeech = true
+				log.Printf("[WAKE] Seeded greeting overlap with %.1fs mic lookback.", float64(lookbackSize)/16000)
+			}
+		} else if !playing && wasTTSPlaying {
+			wasTTSPlaying = false
+			if bargeInFlushed {
+				// The barge-in path already reset the decoder and submitted
+				// the overlap. Do not flush the same words a second time.
+				bargeInFlushed = false
+				overlapSamples = overlapSamples[:0]
+				overlapSpeech = false
+			} else {
+				flushOverlap("playback ended")
+			}
+			resetVAD()
+			if state == StateListening {
+				streaming.SetEndpointEnabled(true)
+			}
 		}
 
 		// While Mai is speaking, echo-cancel her own voice against the speaker
@@ -1957,7 +2193,13 @@ func main() {
 		// up in the residual, that's a genuine barge-in — stop playback and hand
 		// the user's echo-free words to ASR.
 		if atomic.LoadInt32(&ttsPlaying) != 0 {
-			if cfg.Audio.BargeInEnabled && echoCanceller != nil {
+			if bargeInFlushed {
+				// The interruption has already been handed to ASR. Playback
+				// may take a few more milliseconds to unwind; do not capture
+				// or flush the same speech again.
+				return
+			}
+			if echoCanceller != nil {
 				// Adapt from the very first playback frame: during the warmup
 				// window the gate below stays closed, so feeding the filter
 				// early is pure training (echo only) and it converges before
@@ -1973,6 +2215,21 @@ func main() {
 				if denoiser != nil {
 					denoiser.Feed(clean, true)
 				}
+
+				// VAD is the second opinion on the residual. The denoiser is
+				// useful, but its 100ms worker verdict can lag or classify a
+				// quiet accented syllable as stationary noise. A Silero speech
+				// segment is a strong enough signal to keep the frame and to
+				// let barge-in proceed.
+				vadBuffer.Push(clean)
+				for vadBuffer.Size() >= cfg.VAD.WindowSize {
+					head := vadBuffer.Head()
+					chunk := vadBuffer.Get(head, cfg.VAD.WindowSize)
+					vadBuffer.Pop(cfg.VAD.WindowSize)
+					vadDetector.AcceptWaveform(chunk)
+				}
+				vadSpeech := !vadDetector.IsEmpty()
+				appendOverlap(clean)
 
 				warm := time.Since(time.Unix(0, ttsStartedNano.Load())) > bargeInWarmup
 				loud := crms > cfg.Audio.BargeInThreshold*bargeInMargin
@@ -1994,7 +2251,22 @@ func main() {
 				//     found speech in it, which rejects a stationary drone that
 				//     clears the energy gate and carries no words.
 				notEcho := coherence < bargeInEchoMax
-				voiced := denoiser.HaveVerdict() && denoiser.Speech()
+				voiced := (denoiser.HaveVerdict() && denoiser.Speech()) || vadSpeech
+				if warm && notEcho && voiced {
+					// Record that the residual contained verified speech even
+					// if the sustain gate has not confirmed barge-in yet. This
+					// is what gets flushed if playback ends first. The ring
+					// already holds the pre-warm frames, so marking only after
+					// the AEC has converged does not lose the onset.
+					overlapSpeech = true
+				}
+				// Capture is independent of barge-in. If the user disabled
+				// interruption, speech over TTS is still preserved and flushed
+				// when playback ends; only the stop-her-now decision below is
+				// gated by barge_in_enabled.
+				if !cfg.Audio.BargeInEnabled {
+					return
+				}
 				switch {
 				case !warm || !loud:
 					bargeStartNano.Store(0)
@@ -2039,34 +2311,13 @@ func main() {
 							interruptCurrent()
 						}
 						echoCanceller.Reset()
-						state = StateListening
-						sessionText = ""
-						lastText = ""
 						sessionSamples = nil
-						if recognizer != nil {
-							// Drop any half-heard utterance Mai was transcribing
-							// before she was cut off. Without this the user's
-							// interrupting words would continue the abandoned
-							// stream and get prefixed to the old one.
-							recognizer.Reset(asrStream)
-						}
-						// Same reason for the VAD: whatever it queued while Mai
-						// was speaking belongs to her audio, not to this turn.
-						resetVAD()
-						// Feed the user's (echo-free) words to VAD + ASR and keep listening.
-						vadBuffer.Push(clean)
-						for vadBuffer.Size() >= cfg.VAD.WindowSize {
-							head := vadBuffer.Head()
-							c := vadBuffer.Get(head, cfg.VAD.WindowSize)
-							vadBuffer.Pop(cfg.VAD.WindowSize)
-							vadDetector.AcceptWaveform(c)
-						}
-						if asrStream != nil {
-							asrStream.AcceptWaveform(16000, clean)
-							for recognizer.IsReady(asrStream) {
-								recognizer.Decode(asrStream)
-							}
-						}
+						// This flushes the 3s residual ring, not just the
+						// frame that confirmed the interruption. The user's
+						// first words and the pre-roll are therefore already
+						// in the new decoder generation.
+						flushOverlap("barge-in")
+						bargeInFlushed = true
 						return
 					}
 				}
@@ -2080,9 +2331,9 @@ func main() {
 		}
 
 		// Post-TTS AEC: after TTS finishes, continue echo cancellation for
-		// postTTSAECWindow so room reverberation doesn't reach ASR. During the
-		// first ttsCooldown the echo canceller settles; after that, only
-		// genuine speech (residual above threshold) passes through.
+		// postTTSAECWindow so room reverberation doesn't reach ASR. The window
+		// covers the echo tail; genuine speech above the residual/noise floor
+		// passes through.
 		if postTTS {
 			if echoCanceller != nil {
 				clean := echoCanceller.Process(samples)
@@ -2090,32 +2341,36 @@ func main() {
 				if denoiser != nil {
 					denoiser.Feed(clean, true)
 				}
-				if crms < cfg.Audio.BargeInThreshold {
+				// A quiet first syllable can have a low AEC residual even
+				// though the raw mic is clearly above the noise floor. Only
+				// drop when neither level supports speech.
+				if crms < cfg.Audio.BargeInThreshold && rms < cfg.Audio.BargeInThreshold*1.5 {
 					return // just echo, drop it
 				}
 				// Reverb check: verify residual is not lingering reverberation from Mai's playback.
 				if echoCanceller.EchoCoherence(clean) >= bargeInEchoMax {
 					return // reverb tail of Mai's playback, drop it
 				}
-				// Above the threshold, but a stationary drone clears the
-				// threshold while carrying no words — so the enhancer must also
-				// agree that this is speech before it reaches ASR.
-				if denoiser.HaveVerdict() && !denoiser.Speech() {
+				// The enhancer can call a quiet, accented syllable stationary
+				// noise. Do not let that verdict alone discard a follow-up when
+				// the raw mic is above the noise floor; only use it as a
+				// tie-breaker for a frame that is otherwise at the floor.
+				if denoiser.HaveVerdict() && !denoiser.Speech() && rms < cfg.Audio.BargeInThreshold {
 					return
 				}
-				// Residual above threshold — genuine speech, fall through
+				// Residual above threshold — genuine speech, fall through.
+				// Downstream VAD/ASR should see the echo-cancelled frame, not
+				// the raw one that still contains Mai's reverb tail.
+				samples = clean
 			} else {
 				return
 			}
 		}
 
-		// A frame the enhancer positively identified as stationary noise is not
-		// user input. Dropping it here is what stops a laptop fan or HVAC drone
-		// from reaching the wake-word spotter, the VAD or ASR — and from
-		// opening a turn of its own.
-		if noiseFrame {
-			return
-		}
+		// The enhancer is not a frame gate. A fan may occasionally reach KWS,
+		// but a quiet accented phoneme must never be deleted before ASR: the
+		// old whole-frame drop here could erase the start of a command while
+		// KWS was still confirming the wake word.
 
 		if fromBrowser {
 			runListening(samples)
@@ -2127,11 +2382,6 @@ func main() {
 		case StateWakeWord:
 			// Follow-up: if the user speaks within the 15s window, skip wake word.
 			if time.Since(lastResponseTime) < 15*time.Second {
-				if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
-					asrStream.AcceptWaveform(16000, samples)
-					updateLiveASR()
-				}
-
 				vadBuffer.Push(samples)
 				var lastChunk []float32
 				for vadBuffer.Size() >= cfg.VAD.WindowSize {
@@ -2150,22 +2400,21 @@ func main() {
 
 					if rms > 0.001 {
 						log.Printf("[FOLLOW-UP] Speech detected (Level %.4f)! Skipping wake word.", rms)
+						// Preserve whatever the streaming decoder already
+						// heard. Resetting here used to throw away the first
+						// word of a follow-up.
+						submitASRFrame(samples, true)
+						lastVoiceAt = time.Now()
 						state = StateListening
+						streaming.SetEndpointEnabled(true)
 
-						preBuffer := make([]float32, lookbackSize)
-						for i := 0; i < lookbackSize; i++ {
-							preBuffer[i] = lookbackBuffer[(lookbackIdx+i)%lookbackSize]
+						if streaming == nil {
+							preBuffer := make([]float32, lookbackSize)
+							for i := 0; i < lookbackSize; i++ {
+								preBuffer[i] = lookbackBuffer[(lookbackIdx+i)%lookbackSize]
+							}
+							sessionSamples = append(preBuffer, lastChunk...)
 						}
-						sessionSamples = append(preBuffer, lastChunk...)
-
-						sessionText = ""
-						lastText = ""
-						if recognizer != nil {
-							recognizer.Reset(asrStream)
-						}
-						// Entering a new turn: drop the VAD state that armed this
-						// one, or the next turn inherits the pause it just saw.
-						resetVAD()
 						return
 					}
 				}
@@ -2177,9 +2426,17 @@ func main() {
 			}
 
 			kwsStream.AcceptWaveform(16000, samples)
-			if asrStream != nil && atomic.LoadInt32(&ttsPlaying) == 0 {
-				asrStream.AcceptWaveform(16000, samples)
-				updateLiveASR()
+			if atomic.LoadInt32(&ttsPlaying) == 0 {
+				// Feed the decoder through the same VAD/energy gate used by
+				// the listening state. This is what preserves the command
+				// prefix: KWS confirmation is often 20-300ms late, and the
+				// ASR stream must already contain those words when it fires.
+				submitASRFrame(samples, rms > 0.004)
+				if rms > 0.004 {
+					lastVoiceAt = time.Now()
+				}
+				// Keep the live caption current while KWS is still confirming.
+				pollASR()
 			}
 
 			// Dropped-frames is part of the standing status line, not just a debug
@@ -2209,20 +2466,38 @@ func main() {
 					lastDetected = time.Now()
 					log.Println("\n[WAKE] Detected! Listening...")
 
-					// Route greeting through the orchestrator so it shares the
-					// turn-sequence space and can be truncated by an interruption.
-					go orch.Speak(pickGreeting())
+					// Do not reset the ASR stream here. The keyword spotter
+					// reports 20-300ms after the phrase starts, so by now the
+					// decoder may already hold "Mai, send a message to ...".
+					// Keeping that stream (and stripping the leading wake word
+					// at finalization) is what preserves the command prefix.
+					snap := streaming.Snapshot()
+					liveText := strings.TrimSpace(stripWakeWordPrefix(snap.Text))
+					// Only the decoder's text can tell us whether the user
+					// already continued past the wake word. VAD is non-empty
+					// for the wake word itself, so it must not suppress the
+					// greeting; the lookback seed covers the case where ASR is
+					// simply a few hundred milliseconds late.
+					speechInProgress := liveText != ""
+					if speechInProgress {
+						log.Printf("[WAKE] Speech already in progress; preserving ASR prefix (%q).", snap.Text)
+					} else if orch != nil {
+						// Route greeting through the orchestrator so it shares
+						// the turn-sequence space and can be truncated by an
+						// interruption. If speech was already present, skip the
+						// greeting entirely: it would talk over the command.
+						go orch.Speak(pickGreeting())
+					}
 
 					state = StateListening
-					sessionText = ""
-					sessionSamples = nil
-					sherpa.DeleteCircularBuffer(vadBuffer)
-					vadBuffer = sherpa.NewCircularBuffer(10 * 16000)
-					resetVAD()
-					if recognizer != nil {
-						recognizer.Reset(asrStream)
+					streaming.SetEndpointEnabled(true)
+					turnStartedAt = time.Time{}
+					// A greeting is only skipped when the decoder already heard
+					// more than the wake word; keep the existing text and let
+					// the turn finalizer clean it.
+					if liveText != "" {
+						lastVoiceAt = time.Now()
 					}
-					lastText = ""
 					return
 				}
 			}
@@ -2233,10 +2508,9 @@ func main() {
 	}
 
 	micPipe.Store(newAudioPipeline(func(f micFrame) { handleAudioFrame(f.samples, f.fromBrowser) }))
-	// Nothing is playing at startup, so the consumer gets the wide budget: the
-	// streaming ASR decoder's chunk decode blocks it for far longer than the
-	// echo canceller's budget would tolerate, and there is no echo to model
-	// while Mai is silent.
+	// Nothing is playing at startup, so the consumer gets the idle burst
+	// budget. There is no echo to model, and ASR decoding is already on its
+	// own worker, so this only absorbs VAD/KWS/denoiser jitter.
 	micPipe.Load().SetMaxLag(audioIdleLagFrames)
 
 	// The capture callback. This runs on miniaudio's device thread and must do

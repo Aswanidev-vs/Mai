@@ -42,17 +42,14 @@ const (
 	// of the speaker reference, so a frame that waited δ in the queue asks the
 	// adaptive filter to model an echo path δ longer than the real one, and
 	// with L = 4096 taps (256 ms) the budget has to stay well inside that
-	// window. When nothing is playing there is no echo path to model, and the
-	// consumer is free to fall much further behind — and it must, because the
-	// streaming ASR decoder blocks the consumer for a few hundred milliseconds
-	// every time the recogniser's chunk completes (the Nemotron model is a
-	// 560 ms chunk model, and one chunk decode costs ~250 ms of wall clock).
-	// A 75 ms budget cannot absorb a 250 ms burst, so the queue overflowed and
-	// the capture thread shed a frame at every chunk boundary.
+	// window. When nothing is playing there is no echo path to model, so the
+	// consumer may fall further behind without corrupting the AEC. The decoder
+	// no longer blocks this goroutine (it has its own worker), but VAD, KWS and
+	// ordinary scheduler jitter still arrive in bursts.
+	// This is headroom for those, not a decode budget.
 	//
-	// Sixteen frames is 400 ms: enough to absorb the chunk decode and the drain
-	// behind it, and still bounded so a genuinely stuck consumer cannot grow
-	// the backlog without limit.
+	// Sixteen frames is 400 ms: enough to absorb a burst, and still bounded so
+	// a genuinely stuck consumer cannot grow the backlog without limit.
 	audioIdleLagFrames = 16
 
 	// audioQueueCapacity is the channel's capacity. It is sized for the widest
@@ -119,9 +116,9 @@ type audioPipeline struct {
 	// the widest budget the pipeline ever uses, so the budget itself — not the
 	// channel — is what bounds how far the consumer may fall behind. See
 	// SetMaxLag.
-	maxLag  atomic.Int64
-	warned  atomic.Int64 // total as of the last sustained-drop warning
-	warnAt  atomic.Int64 // UnixNano of the last warning, for rate limiting
+	maxLag atomic.Int64
+	warned atomic.Int64 // total as of the last sustained-drop warning
+	warnAt atomic.Int64 // UnixNano of the last warning, for rate limiting
 }
 
 // newAudioPipeline starts the single processing goroutine. process is called
@@ -146,10 +143,9 @@ func newAudioPipeline(process func(micFrame)) *audioPipeline {
 // has already moved on, so the budget must stay inside the canceller's tap
 // window — that is what audioQueueDepth is for. When nothing is playing there
 // is no echo path to model and the only thing the budget protects is the
-// consumer's own burstiness, which is dominated by the streaming ASR decoder's
-// chunk decode. A budget wide enough to absorb that burst (audioIdleLagFrames)
-// is what keeps the capture thread from shedding a frame at every chunk
-// boundary.
+// consumer's own burstiness (VAD/KWS work and scheduler jitter). The decoder
+// runs on its own worker, so this is a general burst
+// allowance rather than a chunk-decode window.
 //
 // Narrowing the budget discards whatever backlog exceeds it, and those frames
 // are counted as dropped: their speaker reference would be stale, so the
