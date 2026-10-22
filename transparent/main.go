@@ -121,6 +121,11 @@ const (
 	smCXScreen = 0
 	smCYScreen = 1
 
+	smXVirtualScreen  = 76
+	smYVirtualScreen  = 77
+	smCXVirtualScreen = 78
+	smCYVirtualScreen = 79
+
 	wmDestroy        = 0x0002
 	wmMove           = 0x0003
 	wmSize           = 0x0005
@@ -203,6 +208,30 @@ var current *overlayHost
 // ─────────────────────────────────────────────────────────────────────────────
 // Starting up
 // ─────────────────────────────────────────────────────────────────────────────
+
+// overlayProfilePath returns an absolute path for the disposable WebView2
+// profile. os.UserConfigDir is %AppData% on Windows, but it can fail or return
+// a relative value when the environment is malformed. os.RemoveAll must never
+// receive a relative path, because that would delete a directory under the
+// process's current working directory.
+func overlayProfilePath() string {
+	base, err := os.UserConfigDir()
+	if err != nil || !filepath.IsAbs(base) {
+		base = ""
+		if home, homeErr := os.UserHomeDir(); homeErr == nil && filepath.IsAbs(home) {
+			base = filepath.Join(home, "AppData", "Roaming")
+		}
+	}
+	if !filepath.IsAbs(base) {
+		base = os.TempDir()
+	}
+	if !filepath.IsAbs(base) {
+		if wd, wdErr := os.Getwd(); wdErr == nil && filepath.IsAbs(wd) {
+			base = filepath.Join(wd, ".mai")
+		}
+	}
+	return filepath.Join(base, "Mai", "overlay")
+}
 
 // start creates the window, embeds the WebView2 in it and navigates to the
 // page.
@@ -293,7 +322,10 @@ func (h *overlayHost) start(url, title string, width, height int, debug, perch b
 	// nil controller and panics before the page is navigated to). The
 	// profile holds no user data — only the cache for a page served from
 	// localhost — so starting clean costs nothing.
-	dataPath := filepath.Join(os.Getenv("AppData"), "Mai", "overlay")
+	dataPath := overlayProfilePath()
+	if !filepath.IsAbs(dataPath) {
+		return fmt.Errorf("could not determine an absolute overlay profile path (got %q)", dataPath)
+	}
 	if err := os.RemoveAll(dataPath); err != nil {
 		// The old browser process may still be shutting down. A separate
 		// profile keeps this start from inheriting its broken state.
@@ -501,14 +533,55 @@ func (h *overlayHost) setClickThrough(on bool) {
 	h.emitToPage(map[string]any{"event": "clickThrough", "on": on})
 }
 
-// positionInitial puts the window near the bottom-right of the screen, the way
-// a desktop pet usually starts.
+// virtualScreenBounds returns the full multi-monitor desktop in physical
+// pixels. SM_CXSCREEN/SM_CYSCREEN only cover the primary monitor, so using
+// them to clamp a walk would drag the overlay back from a secondary display.
+func virtualScreenBounds() (left, top, width, height int) {
+	l, _, _ := procGetSystemMetric.Call(smXVirtualScreen)
+	t, _, _ := procGetSystemMetric.Call(smYVirtualScreen)
+	w, _, _ := procGetSystemMetric.Call(smCXVirtualScreen)
+	h, _, _ := procGetSystemMetric.Call(smCYVirtualScreen)
+	if int32(w) <= 0 || int32(h) <= 0 {
+		l, t = 0, 0
+		w, _, _ = procGetSystemMetric.Call(smCXScreen)
+		h, _, _ = procGetSystemMetric.Call(smCYScreen)
+	}
+	return int(int32(l)), int(int32(t)), int(int32(w)), int(int32(h))
+}
+
+// clampToBounds keeps a w×h window inside a rectangular desktop area. If the
+// window is larger than the area, it is pinned to the area's top-left corner
+// rather than being pushed off-screen.
+func clampToBounds(x, y, w, h, left, top, width, height int) (int, int) {
+	maxX := left + width - w
+	maxY := top + height - h
+	if x < left {
+		x = left
+	}
+	if y < top {
+		y = top
+	}
+	if maxX < left {
+		x = left
+	} else if x > maxX {
+		x = maxX
+	}
+	if maxY < top {
+		y = top
+	} else if y > maxY {
+		y = maxY
+	}
+	return x, y
+}
+
+// positionInitial puts the window near the bottom-right of the virtual desktop,
+// the way a desktop pet usually starts.
 func (h *overlayHost) positionInitial(width, height int) {
-	w, _, _ := procGetSystemMetric.Call(smCXScreen)
-	sw, _, _ := procGetSystemMetric.Call(smCYScreen)
+	left, top, sw, sh := virtualScreenBounds()
 	margin := int(48 * h.scale)
-	x := int(w) - width - margin
-	y := int(sw) - height - margin
+	x := left + sw - width - margin
+	y := top + sh - height - margin
+	x, y = clampToBounds(x, y, width, height, left, top, sw, sh)
 	h.moveTo(x, y)
 }
 
@@ -640,10 +713,9 @@ func (h *overlayHost) walkToForeground(durationMs int) {
 		x = int(target.Left) + margin
 		y = int(target.Bottom) - winH - margin
 	} else {
-		sw, _, _ := procGetSystemMetric.Call(smCXScreen)
-		sh, _, _ := procGetSystemMetric.Call(smCYScreen)
-		x = int(sw)/2 - winW/2
-		y = int(sh) - winH - int(64*h.scale)
+		left, top, sw, sh := virtualScreenBounds()
+		x = left + sw/2 - winW/2
+		y = top + sh - winH - int(64*h.scale)
 	}
 	h.walkToClamped(x, y, durationMs)
 }
@@ -662,10 +734,9 @@ func (h *overlayHost) walkToTaskbar(durationMs int) {
 		x = int(taskbar.Left) + int(float64(taskbarW)*0.38) - winW/2
 		y = int(taskbar.Top) - winH + int(10*h.scale)
 	} else {
-		sw, _, _ := procGetSystemMetric.Call(smCXScreen)
-		sh, _, _ := procGetSystemMetric.Call(smCYScreen)
-		x = int(sw)*38/100 - winW/2
-		y = int(sh) - int(64*h.scale) - winH
+		left, top, sw, sh := virtualScreenBounds()
+		x = left + sw*38/100 - winW/2
+		y = top + sh - int(64*h.scale) - winH
 	}
 	h.walkToClamped(x, y, durationMs)
 }
@@ -674,22 +745,8 @@ func (h *overlayHost) walkToClamped(x, y, durationMs int) {
 	var r rect
 	procGetWindowRect.Call(h.hwnd, uintptr(unsafe.Pointer(&r)))
 	winW, winH := int(r.Right-r.Left), int(r.Bottom-r.Top)
-	sw, _, _ := procGetSystemMetric.Call(smCXScreen)
-	sh, _, _ := procGetSystemMetric.Call(smCYScreen)
-	maxX := int(sw) - winW
-	maxY := int(sh) - winH
-	if x < 0 {
-		x = 0
-	}
-	if y < 0 {
-		y = 0
-	}
-	if maxX > 0 && x > maxX {
-		x = maxX
-	}
-	if maxY > 0 && y > maxY {
-		y = maxY
-	}
+	left, top, sw, sh := virtualScreenBounds()
+	x, y = clampToBounds(x, y, winW, winH, left, top, sw, sh)
 	h.walkTo(x, y, durationMs)
 }
 

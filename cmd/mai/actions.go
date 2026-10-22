@@ -7,6 +7,7 @@ import (
 	"log"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // ActionType represents the type of automation action.
@@ -184,14 +185,17 @@ func NewActionParser() *ActionParser {
 
 // Parse analyzes user text and returns an Action if a known pattern matches.
 func (p *ActionParser) Parse(text string) Action {
-	text = strings.TrimSpace(text)
-	// Keep the original case: message bodies must not be lowercased. All
-	// patterns use (?i), and fuzzyMatchAppName lowercases only the app name.
-	text = strings.TrimSuffix(text, ".") // Remove trailing period from ASR
-	text = strings.TrimSuffix(text, "?")
+	original := strings.TrimSpace(text)
+
+	// Strip trailing sentence punctuation for command matching, but remember it
+	// so a message body that ends the utterance keeps its punctuation. Without
+	// this, "saying Hello." would lose the period, while "open chrome." would
+	// still parse as a command.
+	commandText := strings.TrimSpace(strings.TrimRight(original, ".!?;"))
+	suffix := strings.TrimSpace(strings.TrimPrefix(original, commandText))
 
 	for _, rule := range p.rules {
-		matches := rule.pattern.FindStringSubmatch(text)
+		matches := rule.pattern.FindStringSubmatch(commandText)
 		if matches == nil {
 			continue
 		}
@@ -206,6 +210,10 @@ func (p *ActionParser) Parse(text string) Action {
 			}
 		}
 
+		if rule.actionType == ActionSendMsg || rule.actionType == ActionTypeText {
+			restoreMessagePunctuation(params, original, suffix)
+		}
+
 		return Action{
 			Type:            rule.actionType,
 			Confidence:      rule.confidence,
@@ -217,6 +225,28 @@ func (p *ActionParser) Parse(text string) Action {
 	return Action{Type: ActionNone, Confidence: 0.0}
 }
 
+// restoreMessagePunctuation puts trailing sentence punctuation back on a
+// message body when the body ended the original utterance. Punctuation after a
+// command's app name ("... in whatsapp.") belongs to the command, not to the
+// body, so it is deliberately not appended.
+func restoreMessagePunctuation(params map[string]interface{}, original, suffix string) {
+	if suffix == "" {
+		return
+	}
+	body, ok := params["text"].(string)
+	if !ok {
+		return
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return
+	}
+	withoutSuffix := strings.TrimSuffix(original, suffix)
+	if strings.HasSuffix(strings.TrimSpace(withoutSuffix), body) {
+		params["text"] = body + suffix
+	}
+}
+
 // ParseFromAnywhere searches for action patterns anywhere in the text.
 // It tries each sentence/phrase independently, since ASR may concatenate
 // TTS output with the user's actual command.
@@ -224,6 +254,21 @@ func (p *ActionParser) ParseFromAnywhere(text string) Action {
 	// 1. Try the normal anchored parse first (fast path)
 	action := p.Parse(text)
 	if action.Type != ActionNone {
+		// An open-app rule can swallow "open notepad then open chrome" as a
+		// single app name. When a command conjunction is present, prefer the
+		// final clause if it parses on its own. Body-carrying actions are
+		// exempt: "type hello and goodbye" and "send hello and goodbye" are
+		// single pieces of text, not two commands.
+		if action.Type == ActionSendMsg || action.Type == ActionTypeText ||
+			!commandConjunctionRE.MatchString(text) {
+			return action
+		}
+		sentences := splitSentences(text)
+		if len(sentences) > 0 {
+			if clause := p.Parse(sentences[len(sentences)-1]); clause.Type != ActionNone {
+				return clause
+			}
+		}
 		return action
 	}
 
@@ -242,31 +287,26 @@ func (p *ActionParser) ParseFromAnywhere(text string) Action {
 	return Action{Type: ActionNone, Confidence: 0.0}
 }
 
-// splitSentences splits text into sentence-like chunks.
+// commandConjunctionRE matches the conjunctions that commonly separate two
+// commands in a single ASR stream. It is case-insensitive and accepts the
+// conjunction at the start of a sentence as well as between words.
+var commandConjunctionRE = regexp.MustCompile(`(?i)(?:^|\s+)(?:and|then)\s+`)
+
+// splitSentences splits text into sentence-like chunks and keeps trailing
+// sentence punctuation on each chunk so a message body can retain it.
 func splitSentences(text string) []string {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return nil
 	}
 
-	// Split on sentence terminators and common command conjunctions
 	var sentences []string
-
-	// First split by punctuation
-	parts := strings.FieldsFunc(text, func(r rune) bool {
-		return r == '.' || r == '?' || r == '!' || r == ';'
-	})
-
-	for _, part := range parts {
+	appendPart := func(part string) {
 		part = strings.TrimSpace(part)
 		if part == "" {
-			continue
+			return
 		}
-
-		// Sub-split by common conjunctions like " and " or " then "
-		// which often separate multiple commands in a single ASR stream.
-		subParts := strings.Split(part, " and ")
-		for _, sp := range subParts {
+		for _, sp := range commandConjunctionRE.Split(part, -1) {
 			sp = strings.TrimSpace(sp)
 			if sp != "" {
 				sentences = append(sentences, sp)
@@ -274,6 +314,17 @@ func splitSentences(text string) []string {
 		}
 	}
 
+	start := 0
+	for i, r := range text {
+		switch r {
+		case '.', '?', '!', ';':
+			if part := strings.TrimSpace(text[start:i]); part != "" {
+				appendPart(part + string(r))
+			}
+			start = i + 1
+		}
+	}
+	appendPart(text[start:])
 	return sentences
 }
 
@@ -462,7 +513,12 @@ type ActionExecutor struct {
 	auto          *Automation
 	parser        *ActionParser
 	minConfidence float64
-	pending       *pendingMessageIntent
+
+	// mu serializes pending state and the prepare/confirm workflow. Voice and
+	// typed-chat turns can reach the executor concurrently, and two turns must
+	// not interleave WhatsApp's prepare/confirm state.
+	mu      sync.Mutex
+	pending *pendingMessageIntent
 }
 
 // NewActionExecutor creates an executor with the given automation instance.
@@ -476,6 +532,8 @@ func NewActionExecutor(auto *Automation) *ActionExecutor {
 
 // SetMinConfidence changes the threshold for automatic execution.
 func (e *ActionExecutor) SetMinConfidence(c float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.minConfidence = c
 }
 
@@ -489,6 +547,9 @@ func (e *ActionExecutor) SetMinConfidence(c float64) {
 // nor proactive tasks can open WhatsApp. The recipient and body are always
 // derived from text; no contact is defaulted or hardcoded.
 func (e *ActionExecutor) ParseAndExecute(text string) (bool, string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	// A prepared message or a missing contact/body takes priority over parsing
 	// the next utterance as a fresh command. This is what makes the
 	// prepare → confirm workflow conversational.
@@ -583,11 +644,36 @@ func (e *ActionExecutor) preparePendingMessage(intent *pendingMessageIntent) (bo
 	), nil
 }
 
+// confirmationDecision is the result of interpreting a reply to a pending
+// send. Negation is checked first: "yes, don't send" must cancel, not send.
+type confirmationDecision int
+
+const (
+	confirmationUnknown confirmationDecision = iota
+	confirmationSend
+	confirmationCancel
+)
+
+func parseConfirmation(text string) confirmationDecision {
+	if isNegative(text) {
+		return confirmationCancel
+	}
+	if isAffirmative(text) {
+		return confirmationSend
+	}
+	return confirmationUnknown
+}
+
 func (e *ActionExecutor) handleSendConfirmation(text string) (bool, string, error) {
-	input := strings.ToLower(strings.TrimSpace(text))
-	if isAffirmative(input) {
+	switch parseConfirmation(text) {
+	case confirmationCancel:
+		e.auto.CancelSend()
+		return true, "Okay, I didn't send it. The draft is still in the chat if you want to edit it.", nil
+	case confirmationSend:
 		if err := e.auto.ConfirmSend(); err != nil {
 			switch {
+			case errors.Is(err, ErrMessageNotPending):
+				return true, "There is no message waiting to send.", nil
 			case errors.Is(err, ErrContactNotFound):
 				return true, "The chat is no longer open, so I didn't send the message.", nil
 			case errors.Is(err, ErrAppNotFound):
@@ -597,22 +683,24 @@ func (e *ActionExecutor) handleSendConfirmation(text string) (bool, string, erro
 			}
 		}
 		return true, "Sent.", nil
+	default:
+		return true, "Say \"send\" to send it, or \"cancel\" to discard it.", nil
 	}
-	if isNegative(input) {
-		e.auto.CancelSend()
-		return true, "Okay, I didn't send it. The draft is still in the chat if you want to edit it.", nil
-	}
-	return true, "Say \"send\" to send it, or \"cancel\" to discard it.", nil
 }
 
 func normalizePhrase(text string) string {
 	text = strings.ToLower(strings.TrimSpace(text))
+	text = strings.ReplaceAll(text, "’", "'")
 	text = strings.ReplaceAll(text, ",", " ")
 	text = strings.Trim(text, " .,!?")
 	return strings.Join(strings.Fields(text), " ")
 }
 
 func isAffirmative(text string) bool {
+	// Negation wins even when the reply starts with "yes" or "ok".
+	if isNegative(text) {
+		return false
+	}
 	text = normalizePhrase(text)
 	switch text {
 	case "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "send", "send it",
@@ -626,21 +714,33 @@ func isAffirmative(text string) bool {
 func isNegative(text string) bool {
 	text = normalizePhrase(text)
 	switch text {
-	case "no", "nope", "cancel", "stop", "discard", "don't send", "do not send",
-		"never mind", "nevermind", "forget it":
+	case "no", "nope", "cancel", "stop", "discard", "don't send", "dont send",
+		"do not send", "never mind", "nevermind", "forget it":
 		return true
 	}
-	return strings.HasPrefix(text, "no ") || strings.HasPrefix(text, "don't ")
+	for _, phrase := range []string{
+		"don't send", "dont send", "do not send", "never mind", "forget it",
+	} {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	for _, word := range strings.Fields(text) {
+		switch word {
+		case "no", "nope", "cancel", "stop", "discard", "don't", "dont":
+			return true
+		}
+	}
+	for _, prefix := range []string{"no ", "nope ", "don't ", "dont ", "do not "} {
+		if strings.HasPrefix(text, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func isCancelPhrase(text string) bool {
-	text = normalizePhrase(text)
-	switch text {
-	case "cancel", "stop", "never mind", "nevermind", "forget it", "no":
-		return true
-	default:
-		return false
-	}
+	return isNegative(text)
 }
 
 // Execute runs a specific action and returns human-readable feedback.

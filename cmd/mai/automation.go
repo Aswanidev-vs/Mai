@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,9 +26,12 @@ type Automation struct {
 	// no event bus is available; the workflow still works without the overlay.
 	emit func(eventType string, payload map[string]interface{})
 
-	// pending is the prepared-but-unsent message. The user must confirm before
-	// ConfirmSend presses Enter.
-	pending *pendingMessage
+	// pending is the prepared-but-unsent message. pendingMu guards every read
+	// and write, and opMu serializes prepare/confirm/cancel so two turns cannot
+	// type into or send from WhatsApp at the same time.
+	pendingMu sync.Mutex
+	opMu      sync.Mutex
+	pending   *pendingMessage
 
 	// userTurns counts HandleInput calls currently in flight. Message drafting
 	// is allowed only while this is positive, so startup, timers, and proactive

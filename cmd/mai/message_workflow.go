@@ -60,6 +60,8 @@ func (a *Automation) emitPhase(phase, target, reason string, durationMS int) {
 
 // HasPendingSend reports whether a prepared draft is waiting for confirmation.
 func (a *Automation) HasPendingSend() bool {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
 	return a.pending != nil
 }
 
@@ -77,7 +79,13 @@ func (a *Automation) PrepareMessage(app, contact, text string) error {
 	if err := validateMessageRequest(app, contact, text); err != nil {
 		return err
 	}
-	if a.pending != nil {
+
+	// Serialize the whole UI workflow. A second prepare must not type into the
+	// composer while this one is still searching for a contact.
+	a.opMu.Lock()
+	defer a.opMu.Unlock()
+
+	if a.HasPendingSend() {
 		return fmt.Errorf("a message is already waiting for confirmation")
 	}
 
@@ -102,7 +110,7 @@ func (a *Automation) PrepareMessage(app, contact, text string) error {
 		return err
 	}
 
-	if err := a.openWhatsAppChat(hwnd, contact); err != nil {
+	if err := a.openWhatsAppChat(hwnd, contact, true); err != nil {
 		return err
 	}
 
@@ -110,15 +118,26 @@ func (a *Automation) PrepareMessage(app, contact, text string) error {
 	robotgo.TypeStr(text)
 	time.Sleep(250 * time.Millisecond)
 
+	a.pendingMu.Lock()
 	a.pending = &pendingMessage{App: app, Contact: contact, Text: text}
+	a.pendingMu.Unlock()
 	a.emitPhase("await_confirm", "message", "", 0)
 	log.Printf("[AUTO] Prepared WhatsApp draft for %q (length=%d); waiting for confirmation", contact, len([]rune(text)))
 	return nil
 }
 
-// ConfirmSend re-checks the app and composer, then presses Enter.
+// ConfirmSend re-opens the requested chat, re-checks the app and composer, then
+// presses Enter. Re-opening matters because a visible composer only proves that
+// some chat is open, not which one; the user may have switched chats while the
+// confirmation was pending.
 func (a *Automation) ConfirmSend() error {
-	if a.pending == nil {
+	a.opMu.Lock()
+	defer a.opMu.Unlock()
+
+	a.pendingMu.Lock()
+	pending := a.pending
+	a.pendingMu.Unlock()
+	if pending == nil {
 		return ErrMessageNotPending
 	}
 	if !a.InUserTurn() {
@@ -135,36 +154,43 @@ func (a *Automation) ConfirmSend() error {
 		return err
 	}
 
-	open, err := a.whatsAppChatOpen(hwnd)
-	if err != nil {
-		a.emitPhase("not_found", "contact", "I could not verify the chat", 0)
+	// Re-open the exact chat immediately before pressing Enter. Passing
+	// clearComposer=false keeps the draft already typed there. If the contact
+	// is gone, openWhatsAppChat returns before any Enter is sent.
+	if err := a.openWhatsAppChat(hwnd, pending.Contact, false); err != nil {
 		return err
 	}
-	if !open {
-		a.emitPhase("not_found", "contact", "The chat is no longer open", 0)
-		return ErrContactNotFound
-	}
 
-	// Put the caret back in the composer. If the user switched chats while the
-	// confirmation was pending, the draft stays in the original chat and an
-	// empty composer cannot send an empty message.
+	// Put the caret back in the composer. If focus moved while the search was
+	// running, the click restores it before the send key.
 	a.clickWhatsAppComposer(hwnd)
 	time.Sleep(150 * time.Millisecond)
+	if win.GetForegroundWindow() != hwnd {
+		a.emitPhase("not_found", "app", "WhatsApp lost focus before sending", 0)
+		return fmt.Errorf("WhatsApp lost focus before sending")
+	}
 
 	a.emitPhase("send", "message", "", 0)
 	robotgo.KeyTap("enter")
 	time.Sleep(300 * time.Millisecond)
 	a.emitPhase("done", "message", "", 0)
 
-	log.Printf("[AUTO] WhatsApp message sent to %q", a.pending.Contact)
+	a.pendingMu.Lock()
 	a.pending = nil
+	a.pendingMu.Unlock()
+	log.Printf("[AUTO] WhatsApp message sent to %q", pending.Contact)
 	return nil
 }
 
 // CancelSend discards the pending state. The typed draft is intentionally left
 // in the composer so the user can edit or send it manually.
 func (a *Automation) CancelSend() {
+	a.opMu.Lock()
+	defer a.opMu.Unlock()
+
+	a.pendingMu.Lock()
 	a.pending = nil
+	a.pendingMu.Unlock()
 	a.emitPhase("cancelled", "message", "", 0)
 	log.Printf("[AUTO] Cancelled prepared WhatsApp message")
 }
@@ -330,7 +356,7 @@ func (a *Automation) focusWhatsApp(hwnd win.HWND) error {
 	return fmt.Errorf("could not focus WhatsApp Desktop (foreground is %q)", title)
 }
 
-func (a *Automation) openWhatsAppChat(hwnd win.HWND, contact string) error {
+func (a *Automation) openWhatsAppChat(hwnd win.HWND, contact string, clearComposer bool) error {
 	a.emitPhase("click", "search", "", 0)
 	robotgo.KeyTap("f", "ctrl")
 	time.Sleep(350 * time.Millisecond)
@@ -375,10 +401,13 @@ func (a *Automation) openWhatsAppChat(hwnd win.HWND, contact string) error {
 	time.Sleep(250 * time.Millisecond)
 
 	// Replace any existing draft so the confirmation contains exactly the
-	// requested message rather than an accidental concatenation.
-	robotgo.KeyTap("a", "ctrl")
-	robotgo.KeyTap("backspace")
-	time.Sleep(150 * time.Millisecond)
+	// requested message rather than an accidental concatenation. The confirm
+	// path passes false: it must preserve the draft it is about to send.
+	if clearComposer {
+		robotgo.KeyTap("a", "ctrl")
+		robotgo.KeyTap("backspace")
+		time.Sleep(150 * time.Millisecond)
+	}
 	return nil
 }
 

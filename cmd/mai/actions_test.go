@@ -208,3 +208,137 @@ func TestConfirmationPhrases(t *testing.T) {
 		t.Fatal("a new command must not confirm a pending send")
 	}
 }
+
+func TestConfirmationNegationWins(t *testing.T) {
+	for _, text := range []string{
+		"yes, don't send",
+		"ok don't send",
+		"yes cancel",
+		"no thanks",
+		"nope",
+		"don't send",
+		"do not send",
+		"discard it",
+		"never mind",
+	} {
+		if got := parseConfirmation(text); got != confirmationCancel {
+			t.Fatalf("parseConfirmation(%q) = %v, want cancel", text, got)
+		}
+	}
+
+	for _, text := range []string{"yes", "Yes, please", "ok", "okay", "send", "send it", "go ahead", "confirm"} {
+		if got := parseConfirmation(text); got != confirmationSend {
+			t.Fatalf("parseConfirmation(%q) = %v, want send", text, got)
+		}
+	}
+
+	if got := parseConfirmation("maybe later"); got != confirmationUnknown {
+		t.Fatalf("parseConfirmation(%q) = %v, want unknown", "maybe later", got)
+	}
+	if isAffirmative("yes, don't send") {
+		t.Fatal("negation must override an affirmative prefix")
+	}
+}
+
+func TestCancelPhrasesDuringMessageCollection(t *testing.T) {
+	for _, text := range []string{"nope", "don't send", "do not send", "discard", "no thanks", "never mind"} {
+		if !isCancelPhrase(text) {
+			t.Fatalf("expected %q to cancel message collection", text)
+		}
+	}
+	if isCancelPhrase("Noah") {
+		t.Fatal("a contact name must not be treated as a cancellation")
+	}
+}
+
+func TestSplitSentencesSplitsThen(t *testing.T) {
+	got := splitSentences("open chrome then play music")
+	want := []string{"open chrome", "play music"}
+	if len(got) != len(want) {
+		t.Fatalf("splitSentences() = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("splitSentences() = %#v, want %#v", got, want)
+		}
+	}
+
+	got = splitSentences("Open chrome. Then play music.")
+	want = []string{"Open chrome.", "play music."}
+	if len(got) != len(want) {
+		t.Fatalf("splitSentences() = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("splitSentences() = %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestParseFromAnywhereSplitsThenCommands(t *testing.T) {
+	parser := NewActionParser()
+	action := parser.ParseFromAnywhere("open notepad then open chrome")
+	if action.Type != ActionOpenApp {
+		t.Fatalf("expected ActionOpenApp, got %s", action.Type)
+	}
+	if got := action.Params["name"]; got != "chrome" {
+		t.Fatalf("name = %v, want chrome", got)
+	}
+
+	action = parser.ParseFromAnywhere("open chrome then play music on youtube")
+	if action.Type != ActionPlayMedia {
+		t.Fatalf("expected ActionPlayMedia, got %s", action.Type)
+	}
+	if got := action.Params["query"]; got != "music" {
+		t.Fatalf("query = %v, want music", got)
+	}
+}
+
+func TestTypeTextKeepsConjunctions(t *testing.T) {
+	parser := NewActionParser()
+	for _, text := range []string{"hello and goodbye", "hello then goodbye"} {
+		action := parser.ParseFromAnywhere("type " + text)
+		if action.Type != ActionTypeText {
+			t.Fatalf("%q: expected ActionTypeText, got %s", text, action.Type)
+		}
+		if got := action.Params["text"]; got != text {
+			t.Fatalf("%q: text = %q, want %q", text, got, text)
+		}
+	}
+
+	action := parser.Parse("type hello.")
+	if action.Type != ActionTypeText {
+		t.Fatalf("expected ActionTypeText, got %s", action.Type)
+	}
+	if got := action.Params["text"]; got != "hello." {
+		t.Fatalf("text = %q, want %q", got, "hello.")
+	}
+}
+
+func TestMessageBodyKeepsTrailingPunctuation(t *testing.T) {
+	parser := NewActionParser()
+
+	tests := []struct {
+		input string
+		text  string
+	}{
+		{"send a message to John on whatsapp saying Hello.", "Hello."},
+		{"tell Ravi on whatsapp See you tomorrow?", "See you tomorrow?"},
+		{"message Priya in whatsapp Hello!", "Hello!"},
+		{"tell Ravi on whatsapp Hello...", "Hello..."},
+		{"send hello to mom in whatsapp.", "hello"},
+		{"send hello to mom in whatsapp!", "hello"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			action := parser.Parse(tc.input)
+			if action.Type != ActionSendMsg {
+				t.Fatalf("expected ActionSendMsg, got %s", action.Type)
+			}
+			if got := action.Params["text"]; got != tc.text {
+				t.Fatalf("text = %q, want %q", got, tc.text)
+			}
+		})
+	}
+}

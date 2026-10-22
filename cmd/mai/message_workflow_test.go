@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -45,5 +47,63 @@ func TestConfirmSendRequiresUserTurn(t *testing.T) {
 
 	if err := auto.ConfirmSend(); !errors.Is(err, ErrMessageRequiresUserTurn) {
 		t.Fatalf("expected ErrMessageRequiresUserTurn outside a user turn, got %v", err)
+	}
+}
+
+func TestCancelSendClearsPending(t *testing.T) {
+	auto := &Automation{
+		pending: &pendingMessage{App: "whatsapp", Contact: "Priya", Text: "hello"},
+	}
+	if !auto.HasPendingSend() {
+		t.Fatal("expected a pending message before cancellation")
+	}
+	auto.CancelSend()
+	if auto.HasPendingSend() {
+		t.Fatal("expected cancellation to clear the pending message")
+	}
+}
+
+func TestPrepareMessageRejectsSecondPending(t *testing.T) {
+	auto := &Automation{
+		pending: &pendingMessage{App: "whatsapp", Contact: "Priya", Text: "hello"},
+	}
+	auto.BeginUserTurn()
+	defer auto.EndUserTurn()
+
+	err := auto.PrepareMessage("whatsapp", "John", "hello")
+	if err == nil || !strings.Contains(err.Error(), "already waiting") {
+		t.Fatalf("expected the second prepare to be rejected, got %v", err)
+	}
+}
+
+func TestAutomationPendingStateConcurrent(t *testing.T) {
+	auto := &Automation{
+		pending: &pendingMessage{App: "whatsapp", Contact: "Priya", Text: "hello"},
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 50; j++ {
+				auto.HasPendingSend()
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		auto.CancelSend()
+	}()
+
+	close(start)
+	wg.Wait()
+
+	if auto.HasPendingSend() {
+		t.Fatal("expected cancellation to clear the pending message")
 	}
 }
