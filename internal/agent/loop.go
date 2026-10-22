@@ -437,8 +437,11 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		}
 	}
 
+	// Ten utterances (up from five): a TTS→STT echo can resurface a few turns
+	// later, and the longer window keeps catching it.
+	const recentInputLimit = 10
 	o.recentUserInputs = append(o.recentUserInputs, inputLower)
-	if len(o.recentUserInputs) > 5 {
+	if len(o.recentUserInputs) > recentInputLimit {
 		o.recentUserInputs = o.recentUserInputs[1:]
 	}
 

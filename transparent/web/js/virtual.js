@@ -273,6 +273,19 @@ class AnimationLayer {
         return this.entries.get(name)?.animatedNodes || new Set();
     }
 
+    // Nodes the running actions are writing right now. A faded-out action
+    // stops counting once its weight reaches zero, which is how the overlay
+    // knows a bone has fallen back to the rest pose.
+    drivenNodes() {
+        const set = new Set();
+        for (const entry of this.entries.values()) {
+            const action = entry.action;
+            if (!action.isRunning() || action.getEffectiveWeight() <= 0) continue;
+            for (const name of entry.animatedNodes) set.add(name);
+        }
+        return set;
+    }
+
     has(name) {
         return this.entries.has(name);
     }
@@ -552,6 +565,15 @@ class VirtualOverlay {
         this.gestureTimer = null;
         this.blinkState = null;
 
+        // Head/neck overlay state. Status and gesture offsets are composed on
+        // top of the pose the mixer (or rest) owns this frame, never added to
+        // the bone's current rotation, so they cannot accumulate.
+        this._headBase = new THREE.Quaternion();
+        this._neckBase = new THREE.Quaternion();
+        this._statusDelta = new THREE.Quaternion();
+        this._neckDelta = new THREE.Quaternion();
+        this._statusEuler = new THREE.Euler();
+
         // Lip sync state
         this.speaking = false;
         this.analyser = null;
@@ -704,6 +726,8 @@ class VirtualOverlay {
                 // restores this pose after the mixer runs.
                 this.neckRest = vrm.humanoid?.getNormalizedBoneNode('neck')?.quaternion.clone() || null;
                 this.headRest = vrm.humanoid?.getNormalizedBoneNode('head')?.quaternion.clone() || null;
+                if (this.neckRest) this._neckBase.copy(this.neckRest);
+                if (this.headRest) this._headBase.copy(this.headRest);
 
                 this.mixer = new THREE.AnimationMixer(vrm.scene);
                 this.layer = new AnimationLayer(vrm, this.mixer);
@@ -1582,15 +1606,22 @@ class VirtualOverlay {
         this.clock.last = now;
 
         if (this.vrm) {
+            // The head/neck status offset is render-only. Put the un-offset
+            // base back before the mixer blends, otherwise a clip that is
+            // fading in/out would blend from the overlaid pose and the offset
+            // would briefly stack.
+            this._restoreHeadBases();
             if (this.mixer) this.mixer.update(delta);
+
+            // Walk clips write head/neck in the retargeted skeleton; put the
+            // head back upright before the status overlay is composed on top.
+            const stabilized = this.vrmaLocomotion && !!this._stabilizeWalkHead();
 
             if (this.rig) {
                 this.rig.syncFromMixer();
                 if (this.vrmaLocomotion) {
-                    // The walk VRMA owns the body, but its retargeted neck/head
-                    // channels can pitch the head down into the chest. Keep the
-                    // head upright and let the status/gesture layer add motion.
-                    this._stabilizeWalkHead();
+                    // The walk VRMA owns the body; _stabilizeWalkHead already
+                    // replaced the head/neck pose above.
                 } else if (this.locomotion !== 'idle') {
                     this.rig.update(delta);
                 } else {
@@ -1600,6 +1631,7 @@ class VirtualOverlay {
                 }
             }
 
+            this._captureHeadBases(stabilized);
             this._updateStatusPose(delta);
             this._applyStatusPose();
             this._applyArmGesture();
@@ -1634,7 +1666,7 @@ class VirtualOverlay {
     }
 
     _stabilizeWalkHead() {
-        if (!this.vrm?.humanoid) return;
+        if (!this.vrm?.humanoid) return false;
         const h = this.vrm.humanoid;
         const neck = h.getNormalizedBoneNode('neck');
         const head = h.getNormalizedBoneNode('head');
@@ -1648,9 +1680,42 @@ class VirtualOverlay {
             head.rotation.x += Math.sin(t * 5.6) * 0.012;
             head.rotation.z += Math.sin(t * 2.8) * 0.008;
         }
+        return true;
     }
 
-    // The status pose is a small head/spine offset on top of everything else.
+    // Undo the previous frame's status offset on the bones the overlay wrote.
+    _restoreHeadBases() {
+        if (!this.vrm?.humanoid) return;
+        const h = this.vrm.humanoid;
+        const head = h.getNormalizedBoneNode('head');
+        const neck = h.getNormalizedBoneNode('neck');
+        if (head) head.quaternion.copy(this._headBase);
+        if (neck) neck.quaternion.copy(this._neckBase);
+    }
+
+    // Snapshot the pose the mixer/rest owns before the status overlay runs.
+    // The idle clip animates the neck but not the head (and the procedural
+    // layer animates neither), so a bone that is not driven has to fall back
+    // to rest; otherwise each frame would add the offset to the last one.
+    _captureHeadBases(stabilized) {
+        if (!this.vrm?.humanoid) return;
+        const h = this.vrm.humanoid;
+        const driven = this.layer?.drivenNodes?.() || null;
+        const capture = (node, rest, base) => {
+            if (!node) return;
+            if (stabilized || (driven && driven.has(node.name))) {
+                base.copy(node.quaternion);
+            } else {
+                base.copy(rest || node.quaternion);
+            }
+        };
+        capture(h.getNormalizedBoneNode('head'), this.headRest, this._headBase);
+        capture(h.getNormalizedBoneNode('neck'), this.neckRest, this._neckBase);
+    }
+
+    // The status pose is a small head/neck offset on top of the base captured
+    // above. Quaternion composition (base * delta) replaces the old Euler
+    // `+=`, which grew without bound whenever no clip rewrote the bone.
     _applyStatusPose() {
         if (!this.vrm?.humanoid) return;
         const h = this.vrm.humanoid;
@@ -1659,15 +1724,14 @@ class VirtualOverlay {
         const pitch = this.statusPose.pitch + this.gesturePose.pitch;
         const yaw = this.statusPose.yaw + this.gesturePose.yaw;
         const roll = this.statusPose.roll + this.gesturePose.roll;
-        if (head) {
-            head.rotation.x += pitch;
-            head.rotation.y += yaw;
-            head.rotation.z += roll;
-        }
-        if (neck) {
-            neck.rotation.x += pitch * 0.4;
-            neck.rotation.y += yaw * 0.4;
-        }
+
+        this._statusEuler.set(pitch, yaw, roll, 'XYZ');
+        this._statusDelta.setFromEuler(this._statusEuler);
+        this._statusEuler.set(pitch * 0.4, yaw * 0.4, 0, 'XYZ');
+        this._neckDelta.setFromEuler(this._statusEuler);
+
+        if (head) head.quaternion.copy(this._headBase).multiply(this._statusDelta);
+        if (neck) neck.quaternion.copy(this._neckBase).multiply(this._neckDelta);
     }
 
     // Click/typing arm overlay. Only run while the mixer owns the arms (idle or
