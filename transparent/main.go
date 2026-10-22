@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	neturl "net/url"
 	"os"
@@ -84,6 +85,7 @@ var (
 	procGetWindowRect   = user32.NewProc("GetWindowRect")
 	procGetForeground   = user32.NewProc("GetForegroundWindow")
 	procSetForeground   = user32.NewProc("SetForegroundWindow")
+	procFindWindow      = user32.NewProc("FindWindowW")
 	procGetSystemMetric = user32.NewProc("GetSystemMetrics")
 	procSetWindowLong   = user32.NewProc("SetWindowLongW")
 	procGetWindowLong   = user32.NewProc("GetWindowLongW")
@@ -118,6 +120,11 @@ const (
 
 	smCXScreen = 0
 	smCYScreen = 1
+
+	smXVirtualScreen  = 76
+	smYVirtualScreen  = 77
+	smCXVirtualScreen = 78
+	smCYVirtualScreen = 79
 
 	wmDestroy        = 0x0002
 	wmMove           = 0x0003
@@ -181,6 +188,11 @@ type overlayHost struct {
 	quit         chan struct{}
 	once         sync.Once
 
+	// Scripted walk state. All fields are touched on the UI thread except the
+	// stop channel, which the walk goroutine closes via cancelWalk.
+	walkStop   chan struct{}
+	walkActive bool
+
 	mu      sync.Mutex
 	pending []func()
 	scale   float64
@@ -196,6 +208,30 @@ var current *overlayHost
 // ─────────────────────────────────────────────────────────────────────────────
 // Starting up
 // ─────────────────────────────────────────────────────────────────────────────
+
+// overlayProfilePath returns an absolute path for the disposable WebView2
+// profile. os.UserConfigDir is %AppData% on Windows, but it can fail or return
+// a relative value when the environment is malformed. os.RemoveAll must never
+// receive a relative path, because that would delete a directory under the
+// process's current working directory.
+func overlayProfilePath() string {
+	base, err := os.UserConfigDir()
+	if err != nil || !filepath.IsAbs(base) {
+		base = ""
+		if home, homeErr := os.UserHomeDir(); homeErr == nil && filepath.IsAbs(home) {
+			base = filepath.Join(home, "AppData", "Roaming")
+		}
+	}
+	if !filepath.IsAbs(base) {
+		base = os.TempDir()
+	}
+	if !filepath.IsAbs(base) {
+		if wd, wdErr := os.Getwd(); wdErr == nil && filepath.IsAbs(wd) {
+			base = filepath.Join(wd, ".mai")
+		}
+	}
+	return filepath.Join(base, "Mai", "overlay")
+}
 
 // start creates the window, embeds the WebView2 in it and navigates to the
 // page.
@@ -278,8 +314,28 @@ func (h *overlayHost) start(url, title string, width, height int, debug, perch b
 	// The overlay must not take focus away from the app the user is working in.
 	h.restoreFocus()
 
+	// The WebView2 profile is disposable, and a stale one is what makes a
+	// start fail after the previous run was killed. Its cache can hold a
+	// virtual.js from an older build that imports a file which no longer
+	// exists, and a killed run can leave the profile in a state where
+	// CreateCoreWebView2Controller fails (go-webview2 then dereferences the
+	// nil controller and panics before the page is navigated to). The
+	// profile holds no user data — only the cache for a page served from
+	// localhost — so starting clean costs nothing.
+	dataPath := overlayProfilePath()
+	if !filepath.IsAbs(dataPath) {
+		return fmt.Errorf("could not determine an absolute overlay profile path (got %q)", dataPath)
+	}
+	if err := os.RemoveAll(dataPath); err != nil {
+		// The old browser process may still be shutting down. A separate
+		// profile keeps this start from inheriting its broken state.
+		fallback := filepath.Join(dataPath, fmt.Sprintf("run-%d", os.Getpid()))
+		log.Printf("[OVERLAY] could not clear %s, using %s: %v", dataPath, fallback, err)
+		dataPath = fallback
+	}
+
 	chromium := edge.NewChromium()
-	chromium.DataPath = filepath.Join(os.Getenv("AppData"), "Mai", "overlay")
+	chromium.DataPath = dataPath
 	chromium.MessageCallback = h.onMessage
 	if !chromium.Embed(hwnd) {
 		return fmt.Errorf("could not embed the WebView2")
@@ -477,14 +533,55 @@ func (h *overlayHost) setClickThrough(on bool) {
 	h.emitToPage(map[string]any{"event": "clickThrough", "on": on})
 }
 
-// positionInitial puts the window near the bottom-right of the screen, the way
-// a desktop pet usually starts.
+// virtualScreenBounds returns the full multi-monitor desktop in physical
+// pixels. SM_CXSCREEN/SM_CYSCREEN only cover the primary monitor, so using
+// them to clamp a walk would drag the overlay back from a secondary display.
+func virtualScreenBounds() (left, top, width, height int) {
+	l, _, _ := procGetSystemMetric.Call(smXVirtualScreen)
+	t, _, _ := procGetSystemMetric.Call(smYVirtualScreen)
+	w, _, _ := procGetSystemMetric.Call(smCXVirtualScreen)
+	h, _, _ := procGetSystemMetric.Call(smCYVirtualScreen)
+	if int32(w) <= 0 || int32(h) <= 0 {
+		l, t = 0, 0
+		w, _, _ = procGetSystemMetric.Call(smCXScreen)
+		h, _, _ = procGetSystemMetric.Call(smCYScreen)
+	}
+	return int(int32(l)), int(int32(t)), int(int32(w)), int(int32(h))
+}
+
+// clampToBounds keeps a w×h window inside a rectangular desktop area. If the
+// window is larger than the area, it is pinned to the area's top-left corner
+// rather than being pushed off-screen.
+func clampToBounds(x, y, w, h, left, top, width, height int) (int, int) {
+	maxX := left + width - w
+	maxY := top + height - h
+	if x < left {
+		x = left
+	}
+	if y < top {
+		y = top
+	}
+	if maxX < left {
+		x = left
+	} else if x > maxX {
+		x = maxX
+	}
+	if maxY < top {
+		y = top
+	} else if y > maxY {
+		y = maxY
+	}
+	return x, y
+}
+
+// positionInitial puts the window near the bottom-right of the virtual desktop,
+// the way a desktop pet usually starts.
 func (h *overlayHost) positionInitial(width, height int) {
-	w, _, _ := procGetSystemMetric.Call(smCXScreen)
-	sw, _, _ := procGetSystemMetric.Call(smCYScreen)
+	left, top, sw, sh := virtualScreenBounds()
 	margin := int(48 * h.scale)
-	x := int(w) - width - margin
-	y := int(sw) - height - margin
+	x := left + sw - width - margin
+	y := top + sh - height - margin
+	x, y = clampToBounds(x, y, width, height, left, top, sw, sh)
 	h.moveTo(x, y)
 }
 
@@ -496,6 +593,7 @@ func (h *overlayHost) moveTo(x, y int) {
 
 // moveBy moves the window by a pixel delta.
 func (h *overlayHost) moveBy(dx, dy int) {
+	h.cancelWalk("drag")
 	var r rect
 	procGetWindowRect.Call(h.hwnd, uintptr(unsafe.Pointer(&r)))
 	procSetWindowPos.Call(h.hwnd, hwndTopmost,
@@ -504,10 +602,176 @@ func (h *overlayHost) moveBy(dx, dy int) {
 	h.emitToPage(map[string]any{"event": "moved"})
 }
 
+// walkTo animates the overlay window from its current position to x,y. The
+// host owns the motion so the page only has to select the matching directional
+// walk clip when it receives walkStart.
+func (h *overlayHost) walkTo(x, y, durationMs int) {
+	h.cancelWalk("replaced")
+
+	var r rect
+	procGetWindowRect.Call(h.hwnd, uintptr(unsafe.Pointer(&r)))
+	sx, sy := int(r.Left), int(r.Top)
+	dx, dy := x-sx, y-sy
+	dist := math.Hypot(float64(dx), float64(dy))
+	if dist < 2 {
+		h.emitToPage(map[string]any{"event": "walkEnd", "reason": "done"})
+		return
+	}
+	if durationMs <= 0 {
+		speed := 220 * h.scale
+		if speed < 1 {
+			speed = 220
+		}
+		durationMs = int(dist / speed * 1000)
+	}
+	if durationMs < 250 {
+		durationMs = 250
+	}
+	if durationMs > 15000 {
+		durationMs = 15000
+	}
+
+	stop := make(chan struct{})
+	h.walkStop = stop
+	h.walkActive = true
+	h.emitToPage(map[string]any{
+		"event":      "walkStart",
+		"dx":         dx,
+		"dy":         dy,
+		"durationMs": durationMs,
+		"targetX":    x,
+		"targetY":    y,
+	})
+
+	go func() {
+		ticker := time.NewTicker(33 * time.Millisecond)
+		defer ticker.Stop()
+		start := time.Now()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-h.quit:
+				return
+			case <-ticker.C:
+				t := float64(time.Since(start)) / float64(time.Duration(durationMs)*time.Millisecond)
+				if t > 1 {
+					t = 1
+				}
+				eased := t * t * (3 - 2*t)
+				nx := sx + int(float64(dx)*eased)
+				ny := sy + int(float64(dy)*eased)
+				done := t >= 1
+				h.dispatch(func() {
+					if h.walkStop != stop {
+						return
+					}
+					h.moveTo(nx, ny)
+					if done {
+						h.walkStop = nil
+						h.walkActive = false
+						h.emitToPage(map[string]any{"event": "walkEnd", "reason": "done"})
+					}
+				})
+				if done {
+					return
+				}
+			}
+		}
+	}()
+}
+
+func (h *overlayHost) cancelWalk(reason string) {
+	if h.walkStop != nil {
+		close(h.walkStop)
+		h.walkStop = nil
+	}
+	if h.walkActive {
+		h.walkActive = false
+		h.emitToPage(map[string]any{"event": "walkEnd", "reason": reason})
+	}
+}
+
+// walkToForeground parks the overlay at the left edge of the focused app. The
+// left edge keeps the avatar clear of WhatsApp's composer, which the screenshot
+// verification samples on the right-hand side.
+func (h *overlayHost) walkToForeground(durationMs int) {
+	fg, _, _ := procGetForeground.Call()
+	var target rect
+	ok := false
+	if fg != 0 && fg != h.hwnd {
+		procGetWindowRect.Call(fg, uintptr(unsafe.Pointer(&target)))
+		ok = target.Right > target.Left && target.Bottom > target.Top
+	}
+
+	var r rect
+	procGetWindowRect.Call(h.hwnd, uintptr(unsafe.Pointer(&r)))
+	winW, winH := int(r.Right-r.Left), int(r.Bottom-r.Top)
+	margin := int(18 * h.scale)
+	x, y := 0, 0
+	if ok {
+		x = int(target.Left) + margin
+		y = int(target.Bottom) - winH - margin
+	} else {
+		left, top, sw, sh := virtualScreenBounds()
+		x = left + sw/2 - winW/2
+		y = top + sh - winH - int(64*h.scale)
+	}
+	h.walkToClamped(x, y, durationMs)
+}
+
+// walkToTaskbar walks to the search area of the primary taskbar. The actual
+// search is opened with Win+S; the walk is the visual choreography.
+func (h *overlayHost) walkToTaskbar(durationMs int) {
+	var r rect
+	procGetWindowRect.Call(h.hwnd, uintptr(unsafe.Pointer(&r)))
+	winW, winH := int(r.Right-r.Left), int(r.Bottom-r.Top)
+
+	taskbar, ok := taskbarRect()
+	x, y := 0, 0
+	if ok {
+		taskbarW := int(taskbar.Right - taskbar.Left)
+		x = int(taskbar.Left) + int(float64(taskbarW)*0.38) - winW/2
+		y = int(taskbar.Top) - winH + int(10*h.scale)
+	} else {
+		left, top, sw, sh := virtualScreenBounds()
+		x = left + sw*38/100 - winW/2
+		y = top + sh - int(64*h.scale) - winH
+	}
+	h.walkToClamped(x, y, durationMs)
+}
+
+func (h *overlayHost) walkToClamped(x, y, durationMs int) {
+	var r rect
+	procGetWindowRect.Call(h.hwnd, uintptr(unsafe.Pointer(&r)))
+	winW, winH := int(r.Right-r.Left), int(r.Bottom-r.Top)
+	left, top, sw, sh := virtualScreenBounds()
+	x, y = clampToBounds(x, y, winW, winH, left, top, sw, sh)
+	h.walkTo(x, y, durationMs)
+}
+
+func taskbarRect() (rect, bool) {
+	className, err := utf16("Shell_TrayWnd")
+	if err != nil {
+		return rect{}, false
+	}
+	hwnd, _, _ := procFindWindow.Call(0, uintptr(unsafe.Pointer(className)))
+	if hwnd == 0 {
+		return rect{}, false
+	}
+	var r rect
+	procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&r)))
+	if r.Right <= r.Left || r.Bottom <= r.Top {
+		return rect{}, false
+	}
+	return r, true
+}
+
 // beginDrag takes the mouse capture so the host can move the window directly
 // from WM_MOUSEMOVE. Round-tripping every move through the page adds a
 // frame of latency and makes the drag feel like it is fighting the cursor.
 func (h *overlayHost) beginDrag() {
+	h.cancelWalk("drag")
 	if h.dragging {
 		return
 	}
@@ -564,6 +828,7 @@ func foregroundRect() (rect, bool) {
 // perchOnForeground places the window on the bottom edge of the focused
 // application window, so the avatar appears to stand on it.
 func (h *overlayHost) perchOnForeground() bool {
+	h.cancelWalk("perch")
 	target, ok := foregroundRect()
 	if !ok {
 		return false
@@ -763,8 +1028,34 @@ func (h *overlayHost) onHostCall(method, params string) {
 		}
 		json.Unmarshal([]byte(params), &p)
 		h.dispatch(func() { h.setClickThrough(p.On) })
+	case "walkTo":
+		var p struct {
+			X          int `json:"x"`
+			Y          int `json:"y"`
+			DurationMS int `json:"duration_ms"`
+		}
+		json.Unmarshal([]byte(params), &p)
+		h.dispatch(func() { h.walkTo(p.X, p.Y, p.DurationMS) })
+	case "walkToForeground":
+		var p struct {
+			DurationMS int `json:"duration_ms"`
+		}
+		json.Unmarshal([]byte(params), &p)
+		h.dispatch(func() { h.walkToForeground(p.DurationMS) })
+	case "walkToTaskbar":
+		var p struct {
+			DurationMS int `json:"duration_ms"`
+		}
+		json.Unmarshal([]byte(params), &p)
+		h.dispatch(func() { h.walkToTaskbar(p.DurationMS) })
+	case "cancelWalk":
+		h.dispatch(func() { h.cancelWalk("page") })
 	case "quit":
-		h.shutdown()
+		h.dispatch(func() {
+			h.cancelWalk("quit")
+			h.shutdown()
+			procPostMessage.Call(h.hwnd, wmClose, 0, 0)
+		})
 	}
 }
 

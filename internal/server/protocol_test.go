@@ -95,3 +95,29 @@ func TestBridgePublishPartialTranscriptSelectsMethod(t *testing.T) {
 		})
 	}
 }
+
+func TestAutomationPhaseParamsJSONShape(t *testing.T) {
+	params := AutomationPhaseParams{
+		Phase:      "walk",
+		Target:     "app",
+		App:        "whatsapp",
+		Contact:    "Priya",
+		Reason:     "opening chat",
+		DurationMS: 1800,
+	}
+	data, err := json.Marshal(params)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"phase": "walk",
+		"target": "app",
+		"app": "whatsapp",
+		"contact": "Priya",
+		"reason": "opening chat",
+		"duration_ms": 1800
+	}`, string(data))
+
+	var decoded AutomationPhaseParams
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	assert.Equal(t, params, decoded)
+	assert.Equal(t, "companion.automation", NotifAutomation)
+}

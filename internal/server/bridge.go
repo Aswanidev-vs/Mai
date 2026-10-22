@@ -143,6 +143,31 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		})
 	})
 
+	// Desktop automation phases → overlay. The overlay walks to the taskbar or
+	// the foreground app and plays the click/typing/not-found gestures. The
+	// actual keyboard and mouse work stays in cmd/mai.
+	bus.Subscribe(NotifAutomation, func(event interfaces.Event) {
+		var phase AutomationPhaseParams
+		if event.Payload != nil {
+			phase.Phase, _ = event.Payload["phase"].(string)
+			phase.Target, _ = event.Payload["target"].(string)
+			phase.App, _ = event.Payload["app"].(string)
+			phase.Contact, _ = event.Payload["contact"].(string)
+			phase.Reason, _ = event.Payload["reason"].(string)
+			switch v := event.Payload["duration_ms"].(type) {
+			case int:
+				phase.DurationMS = v
+			case float64:
+				phase.DurationMS = int(v)
+			}
+		}
+		if phase.Phase == "" {
+			return
+		}
+		log.Printf("[BRIDGE] Automation phase → overlay: %s/%s", phase.Phase, phase.Target)
+		b.hub.BroadcastNotification(NotifAutomation, phase)
+	})
+
 	log.Println("[BRIDGE] Event bus bridge active")
 }
 

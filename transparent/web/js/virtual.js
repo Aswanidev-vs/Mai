@@ -14,6 +14,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { VRMAnimationLoaderPlugin, createVRMAnimationClip, VRMLookAtQuaternionProxy } from '@pixiv/three-vrm-animation';
+import { selectWalkClipKey } from './walk-direction.js';
 
 // ── Colour key ───────────────────────────────────────────────────────────────
 
@@ -33,6 +34,16 @@ const ACTION_CLIP_URLS = [
     '/vrpack/VRMA_06.vrma',
     '/vrpack/VRMA_07.vrma',
 ];
+
+// Imported directional walk clips. They are served from /assets alongside the
+// idle loop and are registered as looping clips, never as one-shot actions.
+const WALK_CLIP_URLS = {
+    'walk-front': '/assets/walk-front.vrma',
+    'walk-left-profile': '/assets/walk-left-profile.vrma',
+    'walk-right-profile': '/assets/walk-right-profile.vrma',
+    'walk-three-quarter-left': '/assets/walk-three-quarter-left.vrma',
+    'walk-three-quarter-right': '/assets/walk-three-quarter-right.vrma',
+};
 
 // ── Timing ───────────────────────────────────────────────────────────────────
 const FADE_MS = 400;
@@ -92,13 +103,35 @@ const STATUS_MAP = {
     error:     { expression: [{ name: 'sad', value: 0.45 }], pose: { pitch: 0.1, yaw: 0, roll: 0 } },
 };
 
+// Short desktop-automation gestures. They are head/arm overlays rather than
+// full-body VRMA clips so they can run during a walk without interrupting the
+// locomotion state machine.
+const GESTURE_MAP = {
+    click: {
+        emotion: 'surprised', intensity: 0.45, durationMs: 650,
+        pose: { pitch: -0.05, yaw: 0.08, roll: 0.03 }, restoreEmotion: true,
+    },
+    typing: {
+        emotion: 'think', intensity: 0.55, durationMs: 1600,
+        pose: { pitch: -0.08, yaw: -0.08, roll: 0.02 }, restoreEmotion: true,
+    },
+    not_found: {
+        emotion: 'sad', intensity: 0.65, durationMs: 2200,
+        pose: { pitch: 0.12, yaw: 0.0, roll: -0.05 }, restoreEmotion: false,
+    },
+    success: {
+        emotion: 'happy', intensity: 0.6, durationMs: 1400,
+        pose: { pitch: -0.04, yaw: 0.0, roll: 0.02 }, restoreEmotion: true,
+    },
+};
+
 const VOWEL_MAP = { A: 'aa', E: 'ee', I: 'ih', O: 'oh', U: 'ou' };
 const VOWEL_KEYS = ['A', 'E', 'I', 'O', 'U'];
 
 // ── Locomotion presets ───────────────────────────────────────────────────────
-// There is no walk/run asset in the repo, so the walk cycle is generated from
-// the humanoid bones. Amplitudes are in radians; the frequencies are cycles
-// per second.
+// Five directional walk VRMA clips are loaded when available; the procedural
+// cycle below is the fallback (and drives run/carry). Amplitudes are radians;
+// frequencies are cycles per second.
 //
 // armLower: mai.vrm rests in a T-pose (the arms stick straight out), so the
 // procedural layer has to bring the arms down before they can swing like a
@@ -208,6 +241,7 @@ class AnimationLayer {
         this.currentName = null;
         this.currentAction = null;
         this.oneShotNames = new Set();
+        this.mixerFadedOut = false;
 
         mixer.addEventListener('finished', (e) => {
             const name = this._nameOf(e.action);
@@ -239,32 +273,55 @@ class AnimationLayer {
         return this.entries.get(name)?.animatedNodes || new Set();
     }
 
+    // Nodes the running actions are writing right now. A faded-out action
+    // stops counting once its weight reaches zero, which is how the overlay
+    // knows a bone has fallen back to the rest pose.
+    drivenNodes() {
+        const set = new Set();
+        for (const entry of this.entries.values()) {
+            const action = entry.action;
+            if (!action.isRunning() || action.getEffectiveWeight() <= 0) continue;
+            for (const name of entry.animatedNodes) set.add(name);
+        }
+        return set;
+    }
+
     has(name) {
         return this.entries.has(name);
     }
 
-    playClip(name, { fadeMs } = {}) {
+    playClip(name, { fadeMs, warp = true, resetPose = true, startTime = null } = {}) {
         const entry = this.entries.get(name);
         if (!entry) return false;
         const action = entry.action;
-        const dur = fadeMs ?? entry.fadeMs;
+        // Callers pass milliseconds, matching FADE_MS and resumeMixer.
+        const dur = (fadeMs ?? entry.fadeMs) / 1000;
         const previous = this.currentAction;
 
         if (previous && previous !== action) {
-            // Warping keeps the two clips in phase across the crossfade.
-            previous.crossFadeTo(action, dur, true);
+            // Warping keeps clips in phase, but it distorts playback when the
+            // clips have very different durations (idle 10s vs walk 4.2s).
+            previous.crossFadeTo(action, dur, warp);
         }
         // three.js disables an action whose fade-out completed; play() alone
         // would not bring it back.
         action.enabled = true;
-        action.reset().setEffectiveWeight(1).fadeIn(dur).play();
+        action.reset();
+        if (startTime != null && Number.isFinite(startTime)) {
+            action.time = startTime;
+        }
+        action.setEffectiveWeight(1).fadeIn(dur).play();
 
         this.currentAction = action;
         this.currentName = name;
+        this.mixerFadedOut = false;
 
-        // A new clip must not inherit the previous clip's pose or gaze.
-        this.vrm.humanoid?.resetNormalizedPose();
-        this.vrm.lookAt?.reset();
+        // A new clip must not inherit the previous clip's pose or gaze. A
+        // walk→walk direction switch skips the reset so the gait does not pop.
+        if (resetPose) {
+            this.vrm.humanoid?.resetNormalizedPose();
+            this.vrm.lookAt?.reset();
+        }
         if (this.vrm.lookAt) {
             this.vrm.lookAt.autoUpdate = (entry.clip.lookAtTrack != null);
         }
@@ -275,6 +332,7 @@ class AnimationLayer {
     fadeMixerOut(durationMs = FADE_MS) {
         if (!this.currentAction) return;
         this.currentAction.fadeOut(durationMs / 1000);
+        this.mixerFadedOut = true;
     }
 
     // Bring the mixer layer back in (idle clip) after a procedural state.
@@ -290,6 +348,10 @@ class AnimationLayer {
         action.setEffectiveWeight(1).fadeIn(dur).play();
         this.currentAction = action;
         this.currentName = name;
+        this.mixerFadedOut = false;
+        if (this.vrm.lookAt) {
+            this.vrm.lookAt.autoUpdate = (entry.clip.lookAtTrack != null);
+        }
         return true;
     }
 }
@@ -480,6 +542,10 @@ class VirtualOverlay {
         this.locomotionAuto = true;
         this.actionClips = new Map();
         this.pendingClip = null;
+        this.walkClipKey = 'walk-front';
+        this.vrmaLocomotion = false;
+        this.hostWalking = false;
+        this.walkDir = null;
 
         // Expression state
         this.currentExpressionValues = new Map();
@@ -491,7 +557,22 @@ class VirtualOverlay {
         this.agentStatus = 'idle';
         this.statusPose = { pitch: 0, yaw: 0, roll: 0 };
         this.statusPoseTarget = { pitch: 0, yaw: 0, roll: 0 };
+        this.gesturePose = { pitch: 0, yaw: 0, roll: 0 };
+        this.gesturePoseTarget = { pitch: 0, yaw: 0, roll: 0 };
+        this.gestureName = null;
+        this.gestureStart = 0;
+        this.gestureDuration = 0;
+        this.gestureTimer = null;
         this.blinkState = null;
+
+        // Head/neck overlay state. Status and gesture offsets are composed on
+        // top of the pose the mixer (or rest) owns this frame, never added to
+        // the bone's current rotation, so they cannot accumulate.
+        this._headBase = new THREE.Quaternion();
+        this._neckBase = new THREE.Quaternion();
+        this._statusDelta = new THREE.Quaternion();
+        this._neckDelta = new THREE.Quaternion();
+        this._statusEuler = new THREE.Euler();
 
         // Lip sync state
         this.speaking = false;
@@ -639,6 +720,15 @@ class VirtualOverlay {
                     vrm.scene.add(proxy);
                 }
 
+                // Remember the neutral neck/head pose. The imported walk
+                // clips come from a different skeleton, and their neck/head
+                // channels can fold the head onto the chest. The walk branch
+                // restores this pose after the mixer runs.
+                this.neckRest = vrm.humanoid?.getNormalizedBoneNode('neck')?.quaternion.clone() || null;
+                this.headRest = vrm.humanoid?.getNormalizedBoneNode('head')?.quaternion.clone() || null;
+                if (this.neckRest) this._neckBase.copy(this.neckRest);
+                if (this.headRest) this._headBase.copy(this.headRest);
+
                 this.mixer = new THREE.AnimationMixer(vrm.scene);
                 this.layer = new AnimationLayer(vrm, this.mixer);
                 this.rig = new ProceduralRig(vrm);
@@ -662,12 +752,37 @@ class VirtualOverlay {
                     console.error('[VIRTUAL] idle VRMA error:', e);
                 }
 
+                // Directional walk clips are optional: a failed file simply
+                // falls back to the procedural walk cycle.
+                await this._loadWalkClips(loader, vrm, load);
+
                 this._frameModel();
                 this.loaded = true;
                 console.log('[VIRTUAL] ready');
                 this._logState();
             })
             .catch((err) => console.error('[VIRTUAL] load error:', err));
+    }
+
+    async _loadWalkClips(loader, vrm, load) {
+        let loaded = 0;
+        await Promise.all(Object.entries(WALK_CLIP_URLS).map(async ([name, url]) => {
+            try {
+                const gltf = await load(url);
+                const anim = gltf?.userData?.vrmAnimations?.[0];
+                if (!anim) throw new Error('no vrmAnimations');
+                const clip = createVRMAnimationClip(anim, vrm);
+                clip.lookAtTrack = anim.lookAtTrack;
+                this.layer.register(name, clip, { loop: true, fadeMs: FADE_MS_QUICK });
+                loaded++;
+            } catch (e) {
+                console.warn('[VIRTUAL] walk clip failed', name, e);
+            }
+        }));
+        if (!this.layer.has(this.walkClipKey)) {
+            this.walkClipKey = this.layer.has('walk-front') ? 'walk-front' : null;
+        }
+        console.log(`[VIRTUAL] walk clips ready: ${loaded}/${Object.keys(WALK_CLIP_URLS).length}`);
     }
 
     // _logState reports the sizes that decide whether anything is on screen. The
@@ -761,16 +876,57 @@ class VirtualOverlay {
     }
 
     // ── Animation state machine ─────────────────────────────────────────────
-    setLocomotion(mode, { auto = false } = {}) {
+    setLocomotion(mode, { auto = false, dx = null, dy = null } = {}) {
         if (!LOCOMOTION_PRESETS[mode]) return false;
         if (!auto) this.locomotionAuto = false;
-        if (this.locomotion === mode) return true;
+
+        if (mode === 'walk') {
+            if (dx !== null || dy !== null) this._selectWalkClip(dx || 0, dy || 0);
+            if (this.walkClipKey && this.layer?.has(this.walkClipKey)) {
+                const already = this.locomotion === 'walk' && this.vrmaLocomotion &&
+                    this.layer.currentName === this.walkClipKey;
+                if (already) return true;
+
+                // If the procedural layer faded the mixer out, bring idle back
+                // first. Crossfading from a zero-weight action can expose a
+                // one-frame T-pose.
+                if (this.layer.mixerFadedOut) {
+                    this.layer.resumeMixer('idle', FADE_MS_QUICK);
+                }
+                this.rig.useRestBase();
+
+                const previous = this.layer.currentAction;
+                const previousTime = previous ? previous.time : 0;
+                const clipDuration = this.layer.entries.get(this.walkClipKey)?.clip.duration || 0;
+                const switchingWalk = this.vrmaLocomotion &&
+                    String(this.layer.currentName || '').startsWith('walk-');
+                this.layer.playClip(this.walkClipKey, {
+                    fadeMs: FADE_MS_QUICK,
+                    warp: false,
+                    resetPose: !this.vrmaLocomotion,
+                    startTime: switchingWalk && clipDuration > 0
+                        ? previousTime % clipDuration
+                        : null,
+                });
+                this.rig.setMixerNodes(this.layer.animatedNodes(this.walkClipKey));
+                this.rig.setMode('idle');
+                this.vrmaLocomotion = true;
+                this.locomotion = mode;
+                console.log('[VIRTUAL] locomotion: walk', this.walkClipKey);
+                return true;
+            }
+            // No walk clips loaded (or all failed): use the procedural cycle.
+        }
+
+        if (this.locomotion === mode && !this.vrmaLocomotion) return true;
         this.locomotion = mode;
+        this.vrmaLocomotion = false;
 
         if (mode === 'idle') {
             // Hand the bones back to the mixer (the idle clip).
             this.rig.useRestBase();
             this.layer.resumeMixer('idle', FADE_MS_QUICK);
+            this.rig.setMixerNodes(this.layer.animatedNodes('idle'));
         } else {
             // Procedural locomotion owns the bones: fade the mixer out and let
             // the rig blend the offsets in.
@@ -786,6 +942,9 @@ class VirtualOverlay {
     playAction(name) {
         const key = String(name || '').toLowerCase().trim();
         if (!key) return false;
+
+        // Automation gestures are overlays, not full-body clips.
+        if (GESTURE_MAP[key]) return this.playGesture(key);
 
         if (this.layer.has(key)) {
             this._startOneShot(key);
@@ -830,6 +989,30 @@ class VirtualOverlay {
             this.setLocomotion('idle', { auto: true });
         }
         this.layer.playClip(name, { fadeMs: FADE_MS });
+    }
+
+    // A small, non-destructive gesture layer. The mixer keeps owning the walk
+    // or idle pose; these offsets are added after it each frame.
+    playGesture(name) {
+        const key = String(name || '').toLowerCase().trim();
+        const cfg = GESTURE_MAP[key];
+        if (!cfg) return false;
+
+        clearTimeout(this.gestureTimer);
+        this.gestureName = key;
+        this.gestureStart = performance.now();
+        this.gestureDuration = cfg.durationMs;
+        this.gesturePoseTarget = { ...cfg.pose };
+        this.setEmotion(cfg.emotion, cfg.intensity);
+
+        this.gestureTimer = setTimeout(() => {
+            this.gestureName = null;
+            this.gesturePoseTarget = { pitch: 0, yaw: 0, roll: 0 };
+            if (cfg.restoreEmotion && !this.speaking) {
+                this.setEmotion('neutral', 0.8);
+            }
+        }, cfg.durationMs);
+        return true;
     }
 
     // ── Expressions ─────────────────────────────────────────────────────────
@@ -902,6 +1085,11 @@ class VirtualOverlay {
         this.statusPose.pitch = lerp(this.statusPose.pitch, this.statusPoseTarget.pitch, rate);
         this.statusPose.yaw = lerp(this.statusPose.yaw, this.statusPoseTarget.yaw, rate);
         this.statusPose.roll = lerp(this.statusPose.roll, this.statusPoseTarget.roll, rate);
+
+        const gestureRate = 1 - Math.exp(-12 * delta);
+        this.gesturePose.pitch = lerp(this.gesturePose.pitch, this.gesturePoseTarget.pitch, gestureRate);
+        this.gesturePose.yaw = lerp(this.gesturePose.yaw, this.gesturePoseTarget.yaw, gestureRate);
+        this.gesturePose.roll = lerp(this.gesturePose.roll, this.gesturePoseTarget.roll, gestureRate);
     }
 
     // ── Blink ───────────────────────────────────────────────────────────────
@@ -1162,6 +1350,7 @@ class VirtualOverlay {
         this.ws.on('companion.action', (params) => {
             if (params?.action) this.playAction(params.action);
         });
+        this.ws.on('companion.automation', (params) => this.handleAutomationPhase(params));
 
         this.ws.connect();
     }
@@ -1222,6 +1411,8 @@ class VirtualOverlay {
                 try { canvas.releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
             }
             // Being picked up: the carried pose replaces the walk cycle.
+            this.hostWalking = false;
+            this.walkDir = null;
             this.setLocomotion('carried');
             e.preventDefault();
         });
@@ -1240,6 +1431,8 @@ class VirtualOverlay {
             const wasHost = this.hostDragging;
             this.dragging = false;
             this.hostDragging = false;
+            this.hostWalking = false;
+            this.walkDir = null;
             document.body.classList.remove('dragging');
             if (e && e.pointerId !== undefined) {
                 try { canvas.releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
@@ -1269,6 +1462,44 @@ class VirtualOverlay {
     }
 
     // ── Host events ─────────────────────────────────────────────────────────
+    handleAutomationPhase(params) {
+        const phase = String(params?.phase || '');
+        const duration = Number(params?.duration_ms) || 0;
+        switch (phase) {
+            case 'walk':
+                if (params?.target === 'taskbar') {
+                    hostSend('walkToTaskbar', { duration_ms: duration || 1600 });
+                } else {
+                    hostSend('walkToForeground', { duration_ms: duration || 1800 });
+                }
+                break;
+            case 'click':
+                this.playGesture('click');
+                break;
+            case 'type':
+            case 'typing':
+                this.playGesture('typing');
+                break;
+            case 'not_found':
+                this.playGesture('not_found');
+                break;
+            case 'done':
+                this.playGesture('success');
+                break;
+            case 'send':
+                this.setEmotion('happy', 0.45);
+                break;
+            case 'await_confirm':
+                this.setEmotion('think', 0.5);
+                break;
+            case 'cancelled':
+                this.setEmotion('relaxed', 0.5);
+                break;
+            default:
+                console.log('[VIRTUAL] automation phase:', phase, params);
+        }
+    }
+
     handleHostEvent(evt) {
         if (!evt) return;
         switch (evt.event) {
@@ -1281,8 +1512,16 @@ class VirtualOverlay {
             case 'dragEnd':
                 this.dragging = false;
                 this.hostDragging = false;
+                this.hostWalking = false;
+                this.walkDir = null;
                 document.body.classList.remove('dragging');
                 this.setLocomotion('idle', { auto: true });
+                break;
+            case 'walkStart':
+                this._onWalkStart(evt);
+                break;
+            case 'walkEnd':
+                this._onWalkEnd(evt);
                 break;
             case 'clickThrough':
                 this.clickThrough = !!evt.on;
@@ -1291,6 +1530,40 @@ class VirtualOverlay {
             default:
                 console.log('[VIRTUAL] host event:', evt);
         }
+    }
+
+    _onWalkStart(evt) {
+        if (this.dragging) {
+            hostSend('cancelWalk');
+            return;
+        }
+        const dx = Number(evt?.dx) || 0;
+        const dy = Number(evt?.dy) || 0;
+        this.hostWalking = true;
+        this.walkDir = { dx, dy };
+        this._selectWalkClip(dx, dy);
+        clearTimeout(this.moveIdleTimer);
+        this.setLocomotion('walk', { auto: true });
+    }
+
+    _onWalkEnd(evt) {
+        if (!this.hostWalking) return;
+        this.hostWalking = false;
+        this.walkDir = null;
+        if (this.dragging) return;
+        this.setLocomotion('idle', { auto: true });
+    }
+
+    _selectWalkClip(dx, dy) {
+        const key = selectWalkClipKey(dx, dy);
+        if (this.layer?.has(key)) {
+            this.walkClipKey = key;
+        } else if (this.layer?.has('walk-front')) {
+            this.walkClipKey = 'walk-front';
+        } else {
+            this.walkClipKey = null;
+        }
+        return this.walkClipKey;
     }
 
     // The host reports every window move; fast moves mean she is being
@@ -1309,6 +1582,9 @@ class VirtualOverlay {
         }
 
         if (this.locomotion === 'carried') return;
+        // Scripted host walks already selected a directional clip in
+        // _onWalkStart. Do not let the generic drag-speed heuristic replace it.
+        if (this.hostWalking) return;
         if (speed > 900) this.setLocomotion('run', { auto: true });
         else if (speed > 120) this.setLocomotion('walk', { auto: true });
         else this.setLocomotion('walk', { auto: true });
@@ -1330,11 +1606,23 @@ class VirtualOverlay {
         this.clock.last = now;
 
         if (this.vrm) {
+            // The head/neck status offset is render-only. Put the un-offset
+            // base back before the mixer blends, otherwise a clip that is
+            // fading in/out would blend from the overlaid pose and the offset
+            // would briefly stack.
+            this._restoreHeadBases();
             if (this.mixer) this.mixer.update(delta);
+
+            // Walk clips write head/neck in the retargeted skeleton; put the
+            // head back upright before the status overlay is composed on top.
+            const stabilized = this.vrmaLocomotion && !!this._stabilizeWalkHead();
 
             if (this.rig) {
                 this.rig.syncFromMixer();
-                if (this.locomotion !== 'idle') {
+                if (this.vrmaLocomotion) {
+                    // The walk VRMA owns the body; _stabilizeWalkHead already
+                    // replaced the head/neck pose above.
+                } else if (this.locomotion !== 'idle') {
                     this.rig.update(delta);
                 } else {
                     // Idle: the mixer owns the bones again. Bones the clip
@@ -1343,8 +1631,10 @@ class VirtualOverlay {
                 }
             }
 
+            this._captureHeadBases(stabilized);
             this._updateStatusPose(delta);
             this._applyStatusPose();
+            this._applyArmGesture();
 
             this._updateBlink(delta);
             this._updateExpressions(delta);
@@ -1375,20 +1665,113 @@ class VirtualOverlay {
         }
     }
 
-    // The status pose is a small head/spine offset on top of everything else.
+    _stabilizeWalkHead() {
+        if (!this.vrm?.humanoid) return false;
+        const h = this.vrm.humanoid;
+        const neck = h.getNormalizedBoneNode('neck');
+        const head = h.getNormalizedBoneNode('head');
+        if (neck && this.neckRest) neck.quaternion.copy(this.neckRest);
+        if (head && this.headRest) head.quaternion.copy(this.headRest);
+
+        // A tiny walk bob keeps the head from looking frozen while the body
+        // moves. It is deliberately small; the old failure was a large fold.
+        const t = performance.now() / 1000;
+        if (head) {
+            head.rotation.x += Math.sin(t * 5.6) * 0.012;
+            head.rotation.z += Math.sin(t * 2.8) * 0.008;
+        }
+        return true;
+    }
+
+    // Undo the previous frame's status offset on the bones the overlay wrote.
+    _restoreHeadBases() {
+        if (!this.vrm?.humanoid) return;
+        const h = this.vrm.humanoid;
+        const head = h.getNormalizedBoneNode('head');
+        const neck = h.getNormalizedBoneNode('neck');
+        if (head) head.quaternion.copy(this._headBase);
+        if (neck) neck.quaternion.copy(this._neckBase);
+    }
+
+    // Snapshot the pose the mixer/rest owns before the status overlay runs.
+    // The idle clip animates the neck but not the head (and the procedural
+    // layer animates neither), so a bone that is not driven has to fall back
+    // to rest; otherwise each frame would add the offset to the last one.
+    _captureHeadBases(stabilized) {
+        if (!this.vrm?.humanoid) return;
+        const h = this.vrm.humanoid;
+        const driven = this.layer?.drivenNodes?.() || null;
+        const capture = (node, rest, base) => {
+            if (!node) return;
+            if (stabilized || (driven && driven.has(node.name))) {
+                base.copy(node.quaternion);
+            } else {
+                base.copy(rest || node.quaternion);
+            }
+        };
+        capture(h.getNormalizedBoneNode('head'), this.headRest, this._headBase);
+        capture(h.getNormalizedBoneNode('neck'), this.neckRest, this._neckBase);
+    }
+
+    // The status pose is a small head/neck offset on top of the base captured
+    // above. Quaternion composition (base * delta) replaces the old Euler
+    // `+=`, which grew without bound whenever no clip rewrote the bone.
     _applyStatusPose() {
         if (!this.vrm?.humanoid) return;
         const h = this.vrm.humanoid;
         const head = h.getNormalizedBoneNode('head');
         const neck = h.getNormalizedBoneNode('neck');
-        if (head) {
-            head.rotation.x += this.statusPose.pitch;
-            head.rotation.y += this.statusPose.yaw;
-            head.rotation.z += this.statusPose.roll;
-        }
-        if (neck) {
-            neck.rotation.x += this.statusPose.pitch * 0.4;
-            neck.rotation.y += this.statusPose.yaw * 0.4;
+        const pitch = this.statusPose.pitch + this.gesturePose.pitch;
+        const yaw = this.statusPose.yaw + this.gesturePose.yaw;
+        const roll = this.statusPose.roll + this.gesturePose.roll;
+
+        this._statusEuler.set(pitch, yaw, roll, 'XYZ');
+        this._statusDelta.setFromEuler(this._statusEuler);
+        this._statusEuler.set(pitch * 0.4, yaw * 0.4, 0, 'XYZ');
+        this._neckDelta.setFromEuler(this._statusEuler);
+
+        if (head) head.quaternion.copy(this._headBase).multiply(this._statusDelta);
+        if (neck) neck.quaternion.copy(this._neckBase).multiply(this._neckDelta);
+    }
+
+    // Click/typing arm overlay. Only run while the mixer owns the arms (idle or
+    // VRMA walk); procedural locomotion already writes the upper arms and would
+    // otherwise accumulate the offsets.
+    _applyArmGesture() {
+        if (!this.gestureName || !this.vrm?.humanoid) return;
+        if (this.locomotion !== 'idle' && !this.vrmaLocomotion) return;
+
+        const elapsed = (performance.now() - this.gestureStart) / 1000;
+        const duration = this.gestureDuration / 1000;
+        if (duration <= 0 || elapsed >= duration) return;
+        const progress = Math.max(0, Math.min(1, elapsed / duration));
+        const h = this.vrm.humanoid;
+
+        if (this.gestureName === 'click') {
+            const pulse = Math.sin(Math.PI * progress);
+            const upper = h.getNormalizedBoneNode('rightUpperArm');
+            const lower = h.getNormalizedBoneNode('rightLowerArm');
+            const hand = h.getNormalizedBoneNode('rightHand');
+            if (upper) {
+                upper.rotation.x -= 0.55 * pulse;
+                upper.rotation.z += 0.12 * pulse;
+            }
+            if (lower) lower.rotation.x -= 0.45 * pulse;
+            if (hand) hand.rotation.x -= 0.18 * pulse;
+        } else if (this.gestureName === 'typing') {
+            const wiggle = Math.sin(elapsed * 18) * 0.08;
+            for (const side of ['left', 'right']) {
+                const sign = side === 'left' ? 1 : -1;
+                const upper = h.getNormalizedBoneNode(`${side}UpperArm`);
+                const lower = h.getNormalizedBoneNode(`${side}LowerArm`);
+                const hand = h.getNormalizedBoneNode(`${side}Hand`);
+                if (upper) {
+                    upper.rotation.x -= 0.32;
+                    upper.rotation.z += 0.10 * sign;
+                }
+                if (lower) lower.rotation.x -= 0.5 + wiggle * sign;
+                if (hand) hand.rotation.x -= 0.15;
+            }
         }
     }
 }

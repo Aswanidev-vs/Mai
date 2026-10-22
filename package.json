@@ -1,7 +1,7 @@
 {
   "type": "module",
   "scripts": {
-    "test": "node --test internal/server/static/js/*.test.js"
+    "test": "node --test internal/server/static/js/*.test.js transparent/web/js/*.test.js"
   },
   "dependencies": {
     "@pixiv/three-vrm": "^3.5.5",
