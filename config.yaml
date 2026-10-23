@@ -94,9 +94,9 @@ asr:
     # Hard cap on one spoken turn. The decoder's rule3 is 20s; a command that
     # has already repeated itself should not hold the turn that long.
     max_turn_seconds: 12
-    # Echo cancellation stays armed this long after TTS ends. 2.5s covered
-    # room reverb but also discarded the first words of a quick follow-up.
-    post_tts_aec_ms: 800
+    # Echo cancellation stays armed this long after TTS ends. Do not shorten
+    # this: the reduced window let the last TTS tail reach ASR as user speech.
+    post_tts_aec_ms: 2500
     # Decoupled ASR worker queue, in 25ms capture frames. Bounds the decoder
     # backlog without ever blocking the capture callback.
     asr_queue_depth: 128

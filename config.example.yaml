@@ -65,7 +65,7 @@ asr:
   pipeline:
     vad_endpoint_silence_ms: 1600  # VAD-backed endpoint backstop
     max_turn_seconds: 12           # hard cap for one spoken turn
-    post_tts_aec_ms: 800           # shorter than the old 2.5s follow-up guard
+    post_tts_aec_ms: 2500          # echo guard after playback; do not shorten
     asr_queue_depth: 128           # decoupled decoder queue, 25ms frames
 
   # Dual-model: use a secondary offline model for unsupported languages

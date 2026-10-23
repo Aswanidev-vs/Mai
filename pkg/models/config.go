@@ -67,7 +67,8 @@ type Config struct {
 			// the recognizer's 20s rule3.
 			MaxTurnSeconds float64 `yaml:"max_turn_seconds"`
 			// PostTTSAECMs is how long echo cancellation stays armed after
-			// playback ends. Long windows eat the first words of a follow-up.
+			// playback. Defaults to 2500ms; shorter windows let the TTS tail
+			// reach the decoder and be mistaken for user speech.
 			PostTTSAECMs int `yaml:"post_tts_aec_ms"`
 			// ASRQueueDepth bounds the decoupled ASR worker queue in capture
 			// frames. The audio callback never waits for the decoder.
