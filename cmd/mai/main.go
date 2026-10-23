@@ -2066,10 +2066,37 @@ func main() {
 	// promptly; it just no longer starts the transcript at the confirmation
 	// instant.
 	var overlapSamples []float32
+	// overlapPreRoll holds recent VAD-positive, non-echo residual during
+	// playback. It supplies the onset of a real interruption without keeping
+	// the whole TTS residual: only frames around verified user speech are
+	// eventually submitted to ASR.
+	var overlapPreRoll []float32
+	// overlapSpeech means "there is something safe to flush" (the pre-TTS
+	// greeting lookback or verified user speech). overlapVoiceSeen means the
+	// safe content includes actual user speech, not just the lookback seed.
 	var overlapSpeech bool
+	var overlapVoiceSeen bool
+	var overlapTailRemaining int
 	var wasTTSPlaying bool
 	var bargeInFlushed bool
-	const overlapMaxSamples = 3 * 16000 // 3s: 1.5s lookback + short greeting overlap
+	// greetingPending is set only around the wake greeting. Using
+	// state==Listening alone also matched proactive/response playback and let
+	// that audio seed a phantom ASR turn.
+	var greetingPending bool
+	var greetingRequestedAt time.Time
+	const (
+		overlapMaxSamples        = 3 * 16000          // 3s cap, including the greeting seed
+		overlapPreRollMaxSamples = 16000 * 300 / 1000 // ~300ms onset recovery
+		overlapVoiceTailFrames   = 8                  // ~200ms after the last voiced frame
+	)
+
+	clearOverlap := func() {
+		overlapSamples = overlapSamples[:0]
+		overlapPreRoll = overlapPreRoll[:0]
+		overlapSpeech = false
+		overlapVoiceSeen = false
+		overlapTailRemaining = 0
+	}
 
 	appendOverlap := func(clean []float32) {
 		overlapSamples = append(overlapSamples, clean...)
@@ -2078,10 +2105,16 @@ func main() {
 		}
 	}
 
+	appendOverlapPreRoll := func(clean []float32) {
+		overlapPreRoll = append(overlapPreRoll, clean...)
+		if len(overlapPreRoll) > overlapPreRollMaxSamples {
+			overlapPreRoll = overlapPreRoll[len(overlapPreRoll)-overlapPreRollMaxSamples:]
+		}
+	}
+
 	flushOverlap := func(reason string) {
 		if !overlapSpeech || len(overlapSamples) == 0 {
-			overlapSamples = overlapSamples[:0]
-			overlapSpeech = false
+			clearOverlap()
 			return
 		}
 		// A new turn starts here. Reset the decoder generation so old
@@ -2095,8 +2128,7 @@ func main() {
 		turnStartedAt = time.Time{}
 		submitASRFrame(overlapSamples, true)
 		log.Printf("[TTS] Captured %s speech (%d samples) for ASR.", reason, len(overlapSamples))
-		overlapSamples = overlapSamples[:0]
-		overlapSpeech = false
+		clearOverlap()
 	}
 
 	// handleAudioFrame processes one audio frame.
@@ -2152,13 +2184,18 @@ func main() {
 			bargeInFlushed = false
 			resetASR()
 			resetVAD()
-			overlapSamples = overlapSamples[:0]
-			overlapSpeech = false
+			clearOverlap()
 			// If this is the wake greeting, the 1.5s lookback already holds
 			// the words spoken around the wake word. Seed the overlap with it
 			// before the decoder generation is reset, so a late ASR result
-			// cannot make the greeting discard the command prefix.
-			if state == StateListening {
+			// cannot make the greeting discard the command prefix. Only the
+			// greeting is seeded: response/proactive TTS must never inject its
+			// own audio into ASR.
+			seedGreeting := greetingPending &&
+				state == StateListening &&
+				time.Since(greetingRequestedAt) < 10*time.Second
+			greetingPending = false
+			if seedGreeting {
 				pre := make([]float32, 0, lookbackSize+len(samples))
 				for i := 0; i < lookbackSize; i++ {
 					pre = append(pre, lookbackBuffer[(lookbackIdx+i)%lookbackSize])
@@ -2177,8 +2214,7 @@ func main() {
 				// The barge-in path already reset the decoder and submitted
 				// the overlap. Do not flush the same words a second time.
 				bargeInFlushed = false
-				overlapSamples = overlapSamples[:0]
-				overlapSpeech = false
+				clearOverlap()
 			} else {
 				flushOverlap("playback ended")
 			}
@@ -2229,7 +2265,6 @@ func main() {
 					vadDetector.AcceptWaveform(chunk)
 				}
 				vadSpeech := !vadDetector.IsEmpty()
-				appendOverlap(clean)
 
 				warm := time.Since(time.Unix(0, ttsStartedNano.Load())) > bargeInWarmup
 				loud := crms > cfg.Audio.BargeInThreshold*bargeInMargin
@@ -2253,12 +2288,32 @@ func main() {
 				notEcho := coherence < bargeInEchoMax
 				voiced := (denoiser.HaveVerdict() && denoiser.Speech()) || vadSpeech
 				if warm && notEcho && voiced {
-					// Record that the residual contained verified speech even
-					// if the sustain gate has not confirmed barge-in yet. This
-					// is what gets flushed if playback ends first. The ring
-					// already holds the pre-warm frames, so marking only after
-					// the AEC has converged does not lose the onset.
+					// Only verified user speech is appended. On the first
+					// voiced frame, include the VAD-positive, non-echo pre-roll
+					// so the syllable that opened the interruption is not
+					// clipped. TTS-only frames are never appended wholesale:
+					// that was what put Mai's own greeting/response into STT.
+					if !overlapVoiceSeen {
+						appendOverlap(overlapPreRoll)
+						overlapVoiceSeen = true
+					}
+					appendOverlap(clean)
 					overlapSpeech = true
+					overlapTailRemaining = overlapVoiceTailFrames
+				} else {
+					if !overlapVoiceSeen && warm && notEcho && vadSpeech {
+						// Retain at most ~300ms for the onset. The VAD and
+						// echo checks have to agree before residual is kept,
+						// so a pure TTS tail does not become ASR input.
+						appendOverlapPreRoll(clean)
+					}
+					if overlapVoiceSeen && overlapTailRemaining > 0 {
+						// A short tail keeps a final consonant that the
+						// VAD/echo check did not catch, then stops capturing
+						// residual.
+						appendOverlap(clean)
+						overlapTailRemaining--
+					}
 				}
 				// Capture is independent of barge-in. If the user disabled
 				// interruption, speech over TTS is still preserved and flushed
@@ -2360,8 +2415,12 @@ func main() {
 				}
 				// Residual above threshold — genuine speech, fall through.
 				// Downstream VAD/ASR should see the echo-cancelled frame, not
-				// the raw one that still contains Mai's reverb tail.
+				// the raw one that still contains Mai's reverb tail. Keep the
+				// energy value in sync too: the wake/follow-up gates below use
+				// it, and raw speaker audio must not open the ASR gate after
+				// the residual has been judged safe.
 				samples = clean
+				rms = crms
 			} else {
 				return
 			}
@@ -2479,16 +2538,18 @@ func main() {
 					// greeting; the lookback seed covers the case where ASR is
 					// simply a few hundred milliseconds late.
 					speechInProgress := liveText != ""
+					// Route greeting through the orchestrator so it shares the
+					// turn-sequence space and can be truncated by an
+					// interruption. If speech was already present, skip the
+					// greeting entirely: it would talk over the command.
+					wantGreeting := !speechInProgress && orch != nil
 					if speechInProgress {
 						log.Printf("[WAKE] Speech already in progress; preserving ASR prefix (%q).", snap.Text)
-					} else if orch != nil {
-						// Route greeting through the orchestrator so it shares
-						// the turn-sequence space and can be truncated by an
-						// interruption. If speech was already present, skip the
-						// greeting entirely: it would talk over the command.
-						go orch.Speak(pickGreeting())
 					}
 
+					// Publish the listening state before the greeting
+					// goroutine can start playback. Otherwise TTS can observe
+					// the old wake state and skip the greeting-overlap seed.
 					state = StateListening
 					streaming.SetEndpointEnabled(true)
 					turnStartedAt = time.Time{}
@@ -2497,6 +2558,13 @@ func main() {
 					// the turn finalizer clean it.
 					if liveText != "" {
 						lastVoiceAt = time.Now()
+					}
+					if wantGreeting {
+						greetingPending = true
+						greetingRequestedAt = time.Now()
+						go orch.Speak(pickGreeting())
+					} else {
+						greetingPending = false
 					}
 					return
 				}
