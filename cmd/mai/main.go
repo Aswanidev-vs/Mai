@@ -134,6 +134,11 @@ func main() {
 	// playing. It is separate from ttsPlaying because the startup goroutine
 	// must never clear a flag owned by an agent/legacy reply.
 	var startupTTSActive atomic.Bool
+	// ttsDrainTail is held after the last rendered sample is written to the
+	// device, while ttsPlaying is still set. It lets the hardware buffer
+	// finish carrying the tail, so releasing the playback gate cannot expose
+	// Mai's own voice to ASR.
+	const ttsDrainTail = 300 * time.Millisecond
 
 	// Post-TTS AEC window: continue echo cancellation for this long after
 	// TTS finishes, so room reverberation doesn't pass through to ASR. This
@@ -1198,6 +1203,11 @@ func main() {
 				return
 			}
 			turnOpen = false
+			// Keep ttsPlaying set while the device output buffer drains. A
+			// classifier cannot be trusted to tell the last TTS samples from
+			// the user, so the only safe handoff is to hold the gate until the
+			// tail is physically gone.
+			time.Sleep(ttsDrainTail)
 			// Arm the post-TTS window before releasing the playback gate.
 			// Otherwise a capture frame scheduled in the gap between the two
 			// stores sees ttsPlaying=0 with no postTTS window and can submit
@@ -1299,7 +1309,9 @@ func main() {
 				return
 			}
 			// Capture can finish starting while this short startup phrase is
-			// still playing. Arm the post-TTS echo window for the tail.
+			// still playing. Keep the gate closed through the device tail,
+			// then arm the post-TTS echo window.
+			time.Sleep(ttsDrainTail)
 			lastTTSEndNano.Store(time.Now().UnixNano())
 			startupTTSActive.Store(false)
 		}()
@@ -1647,6 +1659,10 @@ func main() {
 			if playErr != nil {
 				log.Printf("[TTS] Play error: %v", playErr)
 			}
+			// Hold the playback gate through the device buffer tail. This
+			// path has no player turn to do it, so do it here before releasing
+			// ttsPlaying.
+			time.Sleep(ttsDrainTail)
 			atomic.StoreInt32(&ttsPlaying, 0)
 			// Nothing is playing now, so the consumer gets the idle burst
 			// budget. The ASR decoder is on its own worker, so this is no
@@ -2079,24 +2095,24 @@ func main() {
 	// then a full vowel, then noise floor again.
 	var levelPeak float64
 
-	// TTS is a hard ASR gate. Frames captured while ttsPlaying is set are
-	// never queued for ASR unless the barge-in gate confirms real speech; a
-	// playback-end flush would make Mai's own echo a phantom user turn again.
+	// TTS is a hard ASR gate. No frame captured while ttsPlaying is set is
+	// queued for ASR, including a frame that triggers barge-in. The trigger is
+	// an energy/echo/denoiser decision and can be wrong; the only way to keep
+	// Mai's own voice out of STT with certainty is to require playback to stop
+	// and the device tail to drain before opening the decoder again.
 	var wasTTSPlaying bool
 	var bargeInFlushed bool
 
-	// beginBargeInASR starts a fresh turn from the one frame that the barge-in
-	// gate verified. It deliberately does not replay a residual ring: the old
-	// "flush everything captured during playback" path was what fed TTS back
-	// into STT.
-	beginBargeInASR := func(clean []float32) {
+	// beginBargeInTurn clears the abandoned ASR generation and arms the next
+	// listening turn. It deliberately submits no audio: the first words of an
+	// interruption are lost, but no unverified TTS frame can enter ASR.
+	beginBargeInTurn := func() {
 		resetASR()
 		state = StateListening
 		streaming.SetEndpointEnabled(true)
 		sessionText = ""
 		lastVoiceAt = time.Now()
 		turnStartedAt = time.Time{}
-		submitASRFrame(clean, true)
 	}
 
 	// handleAudioFrame processes one audio frame.
@@ -2283,10 +2299,10 @@ func main() {
 						}
 						echoCanceller.Reset()
 						sessionSamples = nil
-						// Hand over only the frame the echo/energy/sustain
-						// gate just verified. Replaying a residual ring here
-						// would put unverified TTS back into the decoder.
-						beginBargeInASR(clean)
+						// Stop the reply, but do not hand this frame to ASR.
+						// The barge gate can false-positive on Mai's echo;
+						// capture resumes only after playback has drained.
+						beginBargeInTurn()
 						bargeInFlushed = true
 						return
 					}
