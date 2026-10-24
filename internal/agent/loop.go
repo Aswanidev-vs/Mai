@@ -56,9 +56,10 @@ type Orchestrator struct {
 	lastSpoken   string
 	lastSpokenAt time.Time
 
-	// recentUserInputs guards against the TTS→STT loop: if the mic picks up
-	// Mai's own voice (or the user's own words echoed back) and it reaches ASR
-	// a second time, we drop it instead of speaking it back.
+	// recentUserInputs is the history for the repeat-input guard. A user may
+	// legitimately repeat a command (prepare then confirm a message, retry a
+	// failed action), so only an input seen repeatInputIgnoreAfter times in
+	// this window is treated as a stuck loop.
 	recentUserInputs []string
 
 	// chatHistory is a verbatim ring buffer of recent user/assistant pairs,
@@ -430,17 +431,17 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 			return &interfaces.AgentResponse{Text: "", Success: true}, nil
 		}
 	}
-	for _, prev := range o.recentUserInputs {
-		if isEcho(inputLower, prev) {
-			log.Printf("[Agent] Repeat input — ignoring: %q", text)
-			return &interfaces.AgentResponse{Text: "", Success: true}, nil
-		}
+	// Repeated commands are legitimate: a WhatsApp send is prepare/confirm,
+	// and a retry can say the same sentence again. Ignore only after the same
+	// normalized input has appeared repeatInputIgnoreAfter times in the recent
+	// window, not on the first repeat.
+	if shouldIgnoreRepeatedInput(inputLower, o.recentUserInputs) {
+		log.Printf("[Agent] Repeat input (%d times) — ignoring: %q", repeatInputIgnoreAfter, text)
+		return &interfaces.AgentResponse{Text: "", Success: true}, nil
 	}
 
-	// Ten utterances (up from five): a TTS→STT echo can resurface a few turns
-	// later, and the longer window keeps catching it.
 	const recentInputLimit = 10
-	o.recentUserInputs = append(o.recentUserInputs, inputLower)
+	o.recentUserInputs = append(o.recentUserInputs, normalizeRepeatInput(inputLower))
 	if len(o.recentUserInputs) > recentInputLimit {
 		o.recentUserInputs = o.recentUserInputs[1:]
 	}
@@ -1823,6 +1824,35 @@ func (s *echoWordSet) has(word string) bool {
 		}
 	}
 	return false
+}
+
+// repeatInputIgnoreAfter is intentionally high: repeated commands are normal
+// (prepare/confirm, retries), while a decoder or TTS→STT loop will repeat far
+// more often than this.
+const repeatInputIgnoreAfter = 10
+
+// normalizeRepeatInput makes punctuation, case and spacing differences
+// irrelevant when deciding whether the user said the same thing again.
+func normalizeRepeatInput(text string) string {
+	fields := strings.Fields(strings.ToLower(text))
+	for i, w := range fields {
+		fields[i] = strings.Trim(w, ".,!?;:\"'()[]{}")
+	}
+	return strings.Join(fields, " ")
+}
+
+func shouldIgnoreRepeatedInput(input string, recent []string) bool {
+	normalized := normalizeRepeatInput(input)
+	if normalized == "" {
+		return false
+	}
+	count := 0
+	for _, prev := range recent {
+		if normalizeRepeatInput(prev) == normalized {
+			count++
+		}
+	}
+	return count >= repeatInputIgnoreAfter
 }
 
 func isEcho(input, spoken string) bool {

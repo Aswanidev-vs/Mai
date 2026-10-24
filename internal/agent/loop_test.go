@@ -10,6 +10,38 @@ import (
 	"github.com/user/mai/internal/personality"
 )
 
+func TestShouldIgnoreRepeatedInputAfterTenOccurrences(t *testing.T) {
+	const command = "Send hallo to Mano on WhatsApp"
+	var recent []string
+
+	for i := 0; i < repeatInputIgnoreAfter-1; i++ {
+		assert.False(t, shouldIgnoreRepeatedInput(command, recent),
+			"repeat %d must still reach the agent", i+1)
+		recent = append(recent, normalizeRepeatInput(command))
+	}
+	assert.False(t, shouldIgnoreRepeatedInput(command, recent),
+		"the %dth occurrence must still reach the agent", repeatInputIgnoreAfter)
+
+	recent = append(recent, normalizeRepeatInput(command))
+	assert.True(t, shouldIgnoreRepeatedInput(command, recent),
+		"the repeat guard must fire after %d previous occurrences", repeatInputIgnoreAfter)
+
+	// ASR punctuation/case drift must not reset the count.
+	recent = recent[:repeatInputIgnoreAfter-1]
+	recent = append(recent, normalizeRepeatInput(command))
+	assert.True(t, shouldIgnoreRepeatedInput("  send HALLO to Mano on WhatsApp! ", recent),
+		"normalized comparison should catch punctuation and casing differences")
+}
+
+func TestShouldIgnoreRepeatedInputLeavesNewCommandsAlone(t *testing.T) {
+	recent := make([]string, repeatInputIgnoreAfter)
+	for i := range recent {
+		recent[i] = normalizeRepeatInput("Send hallo to Mano on WhatsApp")
+	}
+	assert.False(t, shouldIgnoreRepeatedInput("Open Chrome", recent),
+		"a different command must not be suppressed by the repeat guard")
+}
+
 func TestTakeSentenceKeepsEllipsisTogether(t *testing.T) {
 	var buf strings.Builder
 	buf.WriteString("Hmm... That makes sense.")
@@ -43,10 +75,10 @@ func TestMain(m *testing.M) {
 
 func TestIsEcho(t *testing.T) {
 	tests := []struct {
-		name    string
-		input   string
-		spoken  string
-		isEcho  bool
+		name   string
+		input  string
+		spoken string
+		isEcho bool
 	}{
 		// True echoes
 		{
@@ -153,10 +185,10 @@ func TestIsEcho(t *testing.T) {
 
 func TestIsEchoStrict(t *testing.T) {
 	tests := []struct {
-		name    string
-		input   string
-		spoken  string
-		isEcho  bool
+		name   string
+		input  string
+		spoken string
+		isEcho bool
 	}{
 		// Strict mode catches partial echoes (40% threshold)
 		{
@@ -173,9 +205,9 @@ func TestIsEchoStrict(t *testing.T) {
 		},
 		{
 			name:   "partial echo 40 percent",
-			input:   "open notepad",
-			spoken:  "please open notepad for me right now",
-			isEcho:  true,
+			input:  "open notepad",
+			spoken: "please open notepad for me right now",
+			isEcho: true,
 		},
 		{
 			name:   "low overlap not echo",
@@ -605,4 +637,3 @@ func TestTTSTurnLifecycle(t *testing.T) {
 	assert.Equal(t, got[6].seq, got[7].seq)
 	assert.True(t, got[7].final)
 }
-
