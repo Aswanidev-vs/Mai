@@ -396,10 +396,10 @@ class CharacterRenderer {
         wallCanvas.height = 512;
         const wallCtx = wallCanvas.getContext('2d');
         const wallGrad = wallCtx.createLinearGradient(0, 0, 0, 512);
-        wallGrad.addColorStop(0, '#f7ede1');
-        wallGrad.addColorStop(0.4, '#f1e0c9');
-        wallGrad.addColorStop(0.72, '#e7d0af');
-        wallGrad.addColorStop(1, '#d8bf99');
+        wallGrad.addColorStop(0, '#f5e6d8');
+        wallGrad.addColorStop(0.35, '#ecd5c0');
+        wallGrad.addColorStop(0.7, '#e0c4a8');
+        wallGrad.addColorStop(1, '#d4b494');
         wallCtx.fillStyle = wallGrad;
         wallCtx.fillRect(0, 0, 1, 512);
         const wall = new PIXI.Sprite(tex(wallCanvas));
@@ -420,8 +420,8 @@ class CharacterRenderer {
         floorCanvas.height = 64;
         const floorCtx = floorCanvas.getContext('2d');
         const floorGrad = floorCtx.createLinearGradient(0, 0, 0, 64);
-        floorGrad.addColorStop(0, 'rgba(214,186,150,0)');
-        floorGrad.addColorStop(1, 'rgba(188,155,115,0.6)');
+        floorGrad.addColorStop(0, 'rgba(196,158,118,0)');
+        floorGrad.addColorStop(1, 'rgba(168,128,90,0.65)');
         floorCtx.fillStyle = floorGrad;
         floorCtx.fillRect(0, 0, 1, 64);
         const floor = new PIXI.Sprite(tex(floorCanvas));
@@ -451,7 +451,7 @@ class CharacterRenderer {
 
         // Glow sits under the pane so it blooms onto the wall without
         // washing out the sky itself
-        this._bgGlow = new PIXI.Sprite(radialTex(128, 'rgba(255,230,180,0.35)', 'rgba(255,230,180,0)'));
+        this._bgGlow = new PIXI.Sprite(radialTex(128, 'rgba(255,180,120,0.4)', 'rgba(255,180,120,0)'));
         this._bgGlow.anchor.set(0.5);
         this._bgGlow.position.set(winX + winW / 2, winY + winH / 2);
         this._bgGlow.width = winW * 1.9;
@@ -463,9 +463,10 @@ class CharacterRenderer {
         skyCanvas.height = 192;
         const skyCtx = skyCanvas.getContext('2d');
         const skyGrad = skyCtx.createLinearGradient(0, 0, 0, 192);
-        skyGrad.addColorStop(0, '#a7c7e4');
-        skyGrad.addColorStop(0.55, '#cfe3ef');
-        skyGrad.addColorStop(1, '#f4ecd9');
+        skyGrad.addColorStop(0, '#5c4a72');
+        skyGrad.addColorStop(0.45, '#d4845a');
+        skyGrad.addColorStop(0.75, '#e8a87c');
+        skyGrad.addColorStop(1, '#f4d4a8');
         skyCtx.fillStyle = skyGrad;
         skyCtx.fillRect(0, 0, 128, 192);
         const sky = new PIXI.Sprite(tex(skyCanvas));
@@ -603,6 +604,66 @@ class CharacterRenderer {
         this._bgPlant.addChild(leaf);
         mid.addChild(this._bgPlant);
 
+        // ── Cozy bedroom: a soft bed on the left, the intimate half of the room ──
+        const bedX = w * 0.02;
+        const bedY = h * 0.78;
+        const bedW = w * 0.22;
+        const bedH = h * 0.12;
+        const bed = new PIXI.Graphics();
+        // bed frame / base
+        bed.beginFill(0x7a5a3a);
+        bed.drawRoundedRect(bedX, bedY, bedW, bedH, 6);
+        bed.endFill();
+        // mattress
+        bed.beginFill(0xe8d8c4);
+        bed.drawRoundedRect(bedX + 3, bedY + 2, bedW - 6, bedH * 0.7, 4);
+        bed.endFill();
+        // pillow
+        bed.beginFill(0xf5ebe0);
+        bed.drawRoundedRect(bedX + 6, bedY + 2, bedW * 0.32, bedH * 0.35, 6);
+        bed.endFill();
+        // blanket fold
+        bed.beginFill(0xc9a882, 0.7);
+        bed.drawRoundedRect(bedX + bedW * 0.35, bedY + 2, bedW * 0.6, bedH * 0.3, 4);
+        bed.endFill();
+        mid.addChild(bed);
+
+        // ── Desk lamp: warm point light from the side ──
+        const lampGlow = new PIXI.Sprite(radialTex(256, 'rgba(255,200,120,0.55)', 'rgba(255,200,120,0)'));
+        lampGlow.anchor.set(0.5);
+        lampGlow.position.set(w * 0.14, h * 0.55);
+        lampGlow.width = w * 0.5;
+        lampGlow.height = h * 0.7;
+        back.addChild(lampGlow);
+
+        // ── Fairy lights strung across the top ──
+        this._bgFairy = [];
+        const fairy = new PIXI.Graphics();
+        for (let i = 0; i < 12; i++) {
+            const fx = w * 0.05 + i * (w * 0.08);
+            const fy = h * 0.12 + Math.sin(i * 0.7) * h * 0.03;
+            fairy.beginFill(0xffe8b0, 0.9);
+            fairy.drawCircle(fx, fy, 2.5);
+            fairy.endFill();
+            const dot = new PIXI.Graphics();
+            dot.beginFill(0xffe8b0, 0.9);
+            dot.drawCircle(0, 0, 2.5);
+            dot.endFill();
+            dot.position.set(fx, fy);
+            dot._phase = Math.random() * Math.PI * 2;
+            this._bgFairy.push(dot);
+            back.addChild(dot);
+        }
+        // string
+        const string = new PIXI.Graphics();
+        string.lineStyle(1, 0xc9a882, 0.5);
+        for (let i = 0; i < 12; i++) {
+            const fx = w * 0.05 + i * (w * 0.08);
+            const fy = h * 0.12 + Math.sin(i * 0.7) * h * 0.03;
+            if (i === 0) string.moveTo(fx, fy); else string.lineTo(fx, fy);
+        }
+        back.addChild(string);
+
         // ── Front: dust motes drifting through the light ──
         this._bgDust = {
             topY: winY * 0.6,
@@ -653,7 +714,13 @@ class CharacterRenderer {
 
         this._bgPlant.rotation = Math.sin(t * 1.1) * 0.05;
         this._bgGlow.alpha = 0.85 + Math.sin(t * 0.6) * 0.15;
-        this._bgShaft.alpha = 0.5 + Math.sin(t * 0.45) * 0.12;
+        if (this._bgShaft) this._bgShaft.alpha = 0.5 + Math.sin(t * 0.45) * 0.12;
+
+        if (this._bgFairy) {
+            for (const d of this._bgFairy) {
+                d.alpha = 0.5 + 0.5 * (0.5 + 0.5 * Math.sin(t * 2 + d._phase));
+            }
+        }
 
         for (const c of this._bgClouds) {
             c.x += c._vx;
