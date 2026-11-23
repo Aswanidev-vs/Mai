@@ -102,6 +102,11 @@ class CharacterRenderer {
         this.clock = new THREE.Clock();
         this.loaded = false;
         this.mixer = null;
+        this._wasHidden = false;
+
+        // Motion3 clips are fetched on first use, not before the first render.
+        this.motionClips = new Array(MOTION_FILES.length).fill(null);
+        this._motionLoading = new Map();
 
         // Base positions and rotations for drift-free offsets
         this.hipsBaseX = null;
@@ -895,16 +900,12 @@ class CharacterRenderer {
         loader.register((parser) => new VRMLoaderPlugin(parser));
         loader.register((parser) => new VRMAnimationLoaderPlugin(parser));
 
-        // Load VRM + VRMA + motion3 files in parallel
-        const motionPromises = MOTION_FILES.map(url =>
-            loadMotion3(url).catch(e => { console.warn(`[VRM] Failed to load motion: ${url}`, e); return null; })
-        );
-
+        // Only the model and idle animation block first render; motion3 clips
+        // are fetched when a motion is actually requested.
         Promise.all([
             new Promise((resolve) => loader.load('/assets/mai.vrm', resolve)),
             new Promise((resolve) => loader.load('/assets/idle_loop.vrma', resolve)),
-            Promise.all(motionPromises),
-        ]).then(([vrmGltf, vrmaGltf, motionClips]) => {
+        ]).then(([vrmGltf, vrmaGltf]) => {
             const vrm = vrmGltf.userData.vrm;
             if (!vrm) { console.error('[VRM] No VRM data'); return; }
 
@@ -942,12 +943,9 @@ class CharacterRenderer {
             }
             this.scene.add(this.vrm.lookAt.target);
 
-            // Store motion3 clips for playback
-            this.motionClips = motionClips.filter(Boolean);
             this.currentMotion = null;
             this.motionTime = 0;
             this.motionPlaying = false;
-            console.log(`[VRM] Loaded ${this.motionClips.length} motion clips`);
 
             try {
                 const vrmaAnims = vrmaGltf?.userData?.vrmAnimations;
@@ -995,27 +993,54 @@ class CharacterRenderer {
     }
 
     // ── Motion3 Playback ──
-    playMotion(index) {
-        if (!this.motionClips || index >= this.motionClips.length) return;
-        this.currentMotion = this.motionClips[index];
-        this.motionTime = 0;
-        this.motionPlaying = true;
-        console.log(`[VRM] Playing motion: ${this.currentMotion.name}`);
+    // Reuse one in-flight promise per file so duplicate requests never fetch twice.
+    _loadMotion(index) {
+        if (this.motionClips[index]) return Promise.resolve(this.motionClips[index]);
+        if (this._motionLoading.has(index)) return this._motionLoading.get(index);
+        const url = MOTION_FILES[index];
+        const promise = loadMotion3(url)
+            .then(clip => { this.motionClips[index] = clip; this._motionLoading.delete(index); return clip; })
+            .catch(e => { console.warn(`[VRM] Failed to load motion: ${url}`, e); this._motionLoading.delete(index); return null; });
+        this._motionLoading.set(index, promise);
+        return promise;
     }
 
-    playMotionByName(name, loop = false) {
-        if (!this.motionClips || !name) return false;
-        const target = name.toLowerCase().trim();
-        const clip = this.motionClips.find(c => c && c.name && c.name.toLowerCase() === target);
-        if (!clip) {
-            console.warn(`[VRM] Motion not found: ${name}`);
-            return false;
-        }
+    _startMotion(clip, loop) {
         this.currentMotion = clip;
         this.currentMotionLoop = loop;
         this.motionTime = 0;
         this.motionPlaying = true;
-        console.log(`[VRM] Playing motion by name: ${clip.name} (dur: ${clip.duration}s, loop: ${loop})`);
+        console.log(`[VRM] Playing motion: ${clip.name} (dur: ${clip.duration}s, loop: ${loop})`);
+    }
+
+    playMotion(index) {
+        if (index < 0 || index >= MOTION_FILES.length) return false;
+        const clip = this.motionClips[index];
+        if (clip) {
+            this._startMotion(clip, false);
+            return true;
+        }
+        this._loadMotion(index).then(loaded => { if (loaded) this._startMotion(loaded, false); });
+        return true;
+    }
+
+    playMotionByName(name, loop = false) {
+        if (!name) return false;
+        const target = name.toLowerCase().trim();
+        let index = this.motionClips.findIndex(c => c && c.name && c.name.toLowerCase() === target);
+        if (index < 0) {
+            index = MOTION_FILES.findIndex(url => url.split('/').pop().replace('.motion3.json', '').toLowerCase() === target);
+        }
+        if (index < 0) {
+            console.warn(`[VRM] Motion not found: ${name}`);
+            return false;
+        }
+        const clip = this.motionClips[index];
+        if (clip) {
+            this._startMotion(clip, loop);
+            return true;
+        }
+        this._loadMotion(index).then(loaded => { if (loaded) this._startMotion(loaded, loop); });
         return true;
     }
 
@@ -2313,6 +2338,18 @@ class CharacterRenderer {
     _animate() {
         requestAnimationFrame(() => this._animate());
         if (!this.renderer) return; // Wait for async _init to complete
+        // A hidden tab still gets occasional rAF ticks. Skip physics/animation
+        // and drop the accumulated clock time so the first visible frame does
+        // not integrate seconds of hidden time in one step.
+        if (document.hidden) {
+            this._wasHidden = true;
+            this.clock.getDelta();
+            return;
+        }
+        if (this._wasHidden) {
+            this._wasHidden = false;
+            this.clock.getDelta();
+        }
         const delta = Math.min(this.clock.getDelta(), 0.1);
         const elapsed = this.clock.getElapsedTime();
 

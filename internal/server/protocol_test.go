@@ -73,7 +73,8 @@ func TestBridgePublishPartialTranscriptSelectsMethod(t *testing.T) {
 
 			var raw []byte
 			select {
-			case raw = <-hub.broadcast:
+			case out := <-hub.broadcast:
+				raw = out.data
 			case <-time.After(200 * time.Millisecond):
 				raw = nil
 			}

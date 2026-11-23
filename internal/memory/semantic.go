@@ -19,12 +19,13 @@ type vectorEntry struct {
 }
 
 type SemanticStore struct {
-	mu       sync.RWMutex
-	entries  []vectorEntry
-	llm      interfaces.LLMProvider
-	filePath string
+	mu        sync.RWMutex
+	loadOnce  sync.Once
+	entries   []vectorEntry
+	llm       interfaces.LLMProvider
+	filePath  string
 	jsonlPath string
-	loaded   bool
+	loaded    bool
 }
 
 func NewSemanticStore(llm interfaces.LLMProvider, dataDir string) *SemanticStore {
@@ -43,11 +44,14 @@ func NewSemanticStore(llm interfaces.LLMProvider, dataDir string) *SemanticStore
 }
 
 func (s *SemanticStore) ensureLoaded() {
-	if s.loaded {
-		return
-	}
-	s.load()
-	s.loaded = true
+	// Loading writes entries; hold the same lock Compact uses so the first
+	// query cannot race with another turn's write.
+	s.loadOnce.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.load()
+		s.loaded = true
+	})
 }
 
 func (s *SemanticStore) AddFact(entry interfaces.MemoryEntry) error {

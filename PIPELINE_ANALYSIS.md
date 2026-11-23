@@ -304,3 +304,32 @@ Ranked by impact:
 - `go vet ./cmd/mai ./internal/...` — clean.
 - High-impact claims spot-checked directly in source (unused cognition components, hybrid privacy bypass, session APIs, hard TTS gate call sites, config knobs, ASR notification handlers, faceai imports, `getStatusFunc`, `ws.config.update`, token handling).
 - Static analysis only — no runtime/audio-hardware testing was performed.
+
+---
+
+## 10. Post-analysis optimization pass (this session)
+
+Applied with four parallel specialists + central integration. Verified: `go build ./cmd/mai`, `go vet`, `go test -p 1 ./cmd/mai/... ./internal/... ./pkg/...` (all ok), `npm test` (12/12), `go test -race` on changed core packages (clean).
+
+- **Tier 1 #1** background LLM work (summarize/pattern/self-improve/proactive) is now gated by `Orchestrator.isIdle()` (`loop.go`), using existing status + interrupt state.
+- **Tier 1 #2** browser mic uses an AudioWorklet (256-frame ≈16 ms) and binary WS frames; `tts.chunk` is binary too, with a single ordered outbound queue to protect lip-sync ordering. Overlay compatibility preserved via the shared client.
+- **Tier 1 #3** `asr_queue_depth` 128 → 48 (~1.2 s) in both `config.yaml` and `config.example.yaml`, with matching Go fallback.
+- **Tier 1 #4** fixed-utterance PCM cache (`cmd/mai/tts_cache.go`) for startup/greeting/error prompts only; dynamic replies never cached.
+- **Tier 2 #8** exciter/limiter passes fused and WSOLA Hann window computed once (bit-equivalent DSP).
+- **Tier 3** observability now has a default collector + `RecordStage`/`Snapshot`, wired into ASR/LLM/ReAct/TTS/AEC; episodic memory writes are async with `Flush`/`Close` (closed on shutdown).
+- **Extra fix** pre-existing data race in `SemanticStore.ensureLoaded` (now `sync.Once` + mutex).
+- **Deliberately skipped** (with reasons): prefix caching (premise was false — persona is already a stable system prefix), ONNX runtime consolidation (second runtime is dormant), parallel model boot (sherpa thread-safety + `log.Fatal`/defers), and AEC coherence scan (would change the measured barge-in decision boundary).
+- **Audible change to note:** `config.yaml` `tts.exciter_amount` 0.0 → 0.25 (restores the repo's documented/test-asserted default; brighter voice). Revert that one line if the disabled setting was intentional.
+
+---
+
+## 11. Wake-word / level-meter fixes
+
+Restored four regressions documented in `log.md` (lost in a prior reset):
+
+1. **Per-keyword thresholds + names** in `config.yaml`: `▁MA I @mai #0.25, ▁MY @my #0.45, ▁HE Y ▁MA I @heymai #0.20`. Previously all three shared `0.25`. Wake log now prints `result.Keyword`. Verified sherpa parses `#`/`@` in both keyword paths (`utils.cc:49-66`, `keyword-spotter-transducer-impl.h:112-118`).
+2. **Follow-up gate data race**: `lastResponseTime` is now read under `lastResponseMu` (`main.go`), matching its two writes.
+3. **Follow-up speech level** now measures the VAD segment via `vadDetector.Front()` and always `Pop()`s it, so a rejected segment cannot block newer ones.
+4. **Level meter** moved to the top of `handleAudioFrame`, so it updates in every state (it previously only updated in `StateWakeWord`, freezing during commands/replies and reading as audio stutter).
+
+Verified: build, vet, focused wake/audio tests, and `go test -race` on `cmd/mai` all pass. The known flaky `TestEchoCanceller_ResetRacesProcessCleanlyAndStillConverges` (scheduling-count assertion) still flakes under full-suite load; it passes in isolation.

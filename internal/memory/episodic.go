@@ -3,15 +3,38 @@ package memory
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/user/mai/pkg/interfaces"
 )
 
-// EpisodicStore implements interfaces.EpisodicStore using SQLite
+const episodicQueueSize = 64
+
+var errEpisodicClosed = errors.New("episodic store closed")
+
+type writeJob struct {
+	entry *interfaces.MemoryEntry // nil marks a flush barrier
+	done  chan struct{}
+}
+
+// EpisodicStore implements interfaces.EpisodicStore using SQLite.
+// Writes go to one background writer; a full queue falls back to a synchronous
+// write so events are never dropped.
 type EpisodicStore struct {
 	db *sql.DB
+
+	mu       sync.Mutex // serializes queue sends with Close and guards closed
+	jobs     chan writeJob
+	done     chan struct{}
+	closed   bool
+	errMu    sync.Mutex
+	writeErr error
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func NewEpisodicStore(dbPath string) (*EpisodicStore, error) {
@@ -36,10 +59,71 @@ func NewEpisodicStore(dbPath string) (*EpisodicStore, error) {
 		return nil, err
 	}
 
-	return &EpisodicStore{db: db}, nil
+	s := &EpisodicStore{
+		db:   db,
+		jobs: make(chan writeJob, episodicQueueSize),
+		done: make(chan struct{}),
+	}
+	go s.writeLoop()
+
+	return s, nil
 }
 
 func (s *EpisodicStore) StoreEvent(entry interfaces.MemoryEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errEpisodicClosed
+	}
+	select {
+	case s.jobs <- writeJob{entry: &entry}:
+		return s.lastWriteErr()
+	default:
+		// Bounded queue is full: write inline while holding mu so Close
+		// cannot tear down the DB underneath the write.
+		return s.storeEventSync(entry)
+	}
+}
+
+func (s *EpisodicStore) writeLoop() {
+	defer close(s.done)
+	for job := range s.jobs {
+		if job.entry == nil {
+			close(job.done)
+			continue
+		}
+		if err := s.storeEventSync(*job.entry); err != nil {
+			s.errMu.Lock()
+			if s.writeErr == nil {
+				s.writeErr = err
+			}
+			s.errMu.Unlock()
+		}
+	}
+}
+
+func (s *EpisodicStore) lastWriteErr() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.writeErr
+}
+
+// Flush waits for all writes queued before the call to reach SQLite.
+func (s *EpisodicStore) Flush() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return s.lastWriteErr()
+	}
+	done := make(chan struct{})
+	// Hold mu across the send so Close cannot close jobs underneath it.
+	s.jobs <- writeJob{done: done}
+	s.mu.Unlock()
+	<-done
+	return s.lastWriteErr()
+}
+
+func (s *EpisodicStore) storeEventSync(entry interfaces.MemoryEntry) error {
 	metadataJSON, err := json.Marshal(entry.Metadata)
 	if err != nil {
 		return err
@@ -55,6 +139,11 @@ func (s *EpisodicStore) StoreEvent(entry interfaces.MemoryEntry) error {
 }
 
 func (s *EpisodicStore) QueryEvents(queryStr string, limit int) ([]interfaces.MemoryEntry, error) {
+	// Queries must see writes the caller has already made (read-your-writes).
+	if err := s.Flush(); err != nil {
+		return nil, err
+	}
+
 	var rows *sql.Rows
 	var err error
 
@@ -93,5 +182,14 @@ func (s *EpisodicStore) QueryEvents(queryStr string, limit int) ([]interfaces.Me
 }
 
 func (s *EpisodicStore) Close() error {
-	return s.db.Close()
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		close(s.jobs)
+		s.mu.Unlock()
+
+		<-s.done
+		s.closeErr = errors.Join(s.lastWriteErr(), s.db.Close())
+	})
+	return s.closeErr
 }

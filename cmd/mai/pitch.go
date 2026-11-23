@@ -1,6 +1,9 @@
 package main
 
-import "math"
+import (
+	"math"
+	"sync"
+)
 
 // Pitch shifting is applied to the decoded audio, so unlike `speed` it works on
 // every TTS engine — including Pocket, whose ONNX graph ignores speed entirely.
@@ -13,7 +16,26 @@ const (
 	// pitchShiftDeadZone skips the DSP for negligible changes, so an unshifted
 	// sentence is never touched.
 	pitchShiftDeadZone = 0.02
+	wsolaWin           = 1024
 )
+
+var (
+	wsolaHannOnce sync.Once
+	wsolaHann     []float32
+)
+
+// wsolaWindow is built once, not per sentence: the window depends only on the
+// fixed frame size, so recomputing a thousand cosines on the synthesis path is
+// pure cost. Readers only ever index it.
+func wsolaWindow() []float32 {
+	wsolaHannOnce.Do(func() {
+		wsolaHann = make([]float32, wsolaWin)
+		for i := range wsolaHann {
+			wsolaHann[i] = float32(0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(wsolaWin-1)))
+		}
+	})
+	return wsolaHann
+}
 
 // pitchShift re-voices samples by pitchRatio (1.0 = unchanged) without changing
 // the duration, using WSOLA:
@@ -50,10 +72,10 @@ func pitchShift(samples []float32, pitchRatio float64) []float32 {
 // through periodic content, which is what makes naive OLA sound rough.
 func wsolaStretch(in []float32, stretch float64) []float32 {
 	const (
-		win     = 1024 // ~43 ms at 24 kHz
-		hopS    = 256  // synthesis hop; win/4 gives 4x overlap
-		corrLen = 256  // similarity-search window
-		search  = 96   // max alignment offset, ~4 ms at 24 kHz
+		win     = wsolaWin // ~43 ms at 24 kHz
+		hopS    = 256      // synthesis hop; win/4 gives 4x overlap
+		corrLen = 256      // similarity-search window
+		search  = 96       // max alignment offset, ~4 ms at 24 kHz
 	)
 	if len(in) < win+corrLen {
 		return in
@@ -61,10 +83,7 @@ func wsolaStretch(in []float32, stretch float64) []float32 {
 
 	hopA := float64(hopS) / stretch
 
-	hann := make([]float32, win)
-	for i := range hann {
-		hann[i] = float32(0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(win-1)))
-	}
+	hann := wsolaWindow()
 
 	est := int(float64(len(in))*stretch) + win
 	out := make([]float32, est)

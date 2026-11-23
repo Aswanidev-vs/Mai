@@ -234,17 +234,19 @@ ws.on('status.changed', (params) => {
     }
 });
 
-// TTS audio chunks — queue for sequential playback with lip sync
+// TTS audio chunks — queue for sequential playback with lip sync.
+// Binary frames expose `pcm` (an Int16Array) and avoid base64 entirely; the
+// legacy `audio` field remains for clients that still receive JSON.
 ws.on('tts.chunk', (params) => {
-    // Always queue: even done-only chunks (empty audio, done=true) must be
-    // enqueued so the drain loop knows when synthesis has ended.
-    if (!params.audio && !params.done) return; // skip truly empty chunks
+    const pcm = params.pcm;
+    // Check pcm first so the legacy base64 getter is not evaluated for binary frames.
+    if (!(pcm && pcm.length) && !params.audio && !params.done) return;
     // Ensure analyser is connected before first chunk
     if (audio.analyser && !character.analyser) {
         character.setAnalyser(audio.analyser);
     }
     audio.queueChunk(
-        params.audio || '',
+        pcm && pcm.length ? pcm : (params.audio || ''),
         params.sample_rate,
         !!params.done,
         !!params.muted,
@@ -336,8 +338,21 @@ const micBtn = document.getElementById('micToggle');
 const micController = {
     stream: null,
     ctx: null,
-    proc: null,
+    node: null,
     active: false,
+
+    // Binary mic frame: 1-byte tag + uint32 LE sample rate + int16 LE PCM.
+    _sendPCM(float32) {
+        const buf = new ArrayBuffer(5 + float32.length * 2);
+        const view = new DataView(buf);
+        view.setUint8(0, 0x41);
+        view.setUint32(1, 16000, true);
+        for (let i = 0; i < float32.length; i++) {
+            const s = Math.max(-1, Math.min(1, float32[i]));
+            view.setInt16(5 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        }
+        ws.sendBinary(buf);
+    },
 
     async start() {
         if (this.active) return;
@@ -353,25 +368,28 @@ const micController = {
         this.ctx = new Ctx({ sampleRate: 16000 });
         if (this.ctx.state === 'suspended') await this.ctx.resume();
 
-        const source = this.ctx.createMediaStreamSource(this.stream);
-        // ScriptProcessor gives us raw PCM frames to stream to the backend ASR.
-        this.proc = this.ctx.createScriptProcessor(2048, 1, 1);
-        this.proc.onaudioprocess = (ev) => {
-            const input = ev.inputBuffer.getChannelData(0);
-            const len = input.length;
-            const buf = new ArrayBuffer(len * 2);
-            const view = new DataView(buf);
-            for (let i = 0; i < len; i++) {
-                let s = Math.max(-1, Math.min(1, input[i]));
-                view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        // AudioWorklet keeps capture off the main thread and cuts latency from
+        // ScriptProcessor's 2048 frames (~128 ms) to 256 (~16 ms).
+        if (this.ctx.audioWorklet) {
+            try {
+                await this.ctx.audioWorklet.addModule('/js/pcm-capture-processor.js');
+                this.node = new AudioWorkletNode(this.ctx, 'pcm-capture');
+                this.node.port.onmessage = (ev) => this._sendPCM(ev.data);
+            } catch (e) {
+                console.warn('[MIC] AudioWorklet unavailable, falling back:', e);
             }
-            const b64 = (() => { const u8 = new Uint8Array(buf); let s = ''; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return btoa(s); })();
-            ws.send('audio.input', { audio: b64, sample_rate: 16000 });
-        };
+        }
+        if (!this.node) {
+            this.node = this.ctx.createScriptProcessor(256, 1, 1);
+            this.node.onaudioprocess = (ev) => this._sendPCM(new Float32Array(ev.inputBuffer.getChannelData(0)));
+        }
+
+        const source = this.ctx.createMediaStreamSource(this.stream);
         const silent = this.ctx.createGain();
         silent.gain.value = 0;
-        source.connect(this.proc);
-        this.proc.connect(silent);
+        source.connect(this.node);
+        // Worklet nodes are pull-driven: keep a (silent) path to the destination.
+        this.node.connect(silent);
         silent.connect(this.ctx.destination);
 
         this.active = true;
@@ -388,7 +406,7 @@ const micController = {
         if (!this.active) return;
         this.active = false;
         if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
-        if (this.proc) { try { this.proc.disconnect(); } catch (e) {} this.proc = null; }
+        if (this.node) { try { this.node.disconnect(); } catch (e) {} this.node = null; }
         if (this.ctx) { this.ctx.close(); this.ctx = null; }
         if (micBtn) {
             micBtn.classList.remove('active');

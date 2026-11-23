@@ -1,11 +1,26 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/user/mai/pkg/models"
+	"gopkg.in/yaml.v3"
 )
+
+// The Go fallback and config.yaml must agree: a missing key would otherwise
+// silently change the shipped decoder backlog, and therefore utterance latency.
+func TestDefaultASRQueueDepthMatchesConfig(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(pipelineProbeRoot(t), "config.yaml"))
+	require.NoError(t, err)
+	var cfg models.Config
+	require.NoError(t, yaml.Unmarshal(data, &cfg))
+	assert.Equal(t, defaultASRQueueDepth, cfg.ASR.Pipeline.ASRQueueDepth)
+	assert.Equal(t, 48, defaultASRQueueDepth, "48 frames = 1.2s of slack at 25ms/frame")
+}
 
 // These tests exercise the queue/reset contract without a model. The actual
 // sherpa stream is owned by the worker; what matters to the audio path is that

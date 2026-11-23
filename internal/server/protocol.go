@@ -1,6 +1,35 @@
 package server
 
-import "encoding/json"
+import (
+	"encoding/binary"
+	"encoding/json"
+	"math"
+)
+
+// WebSocket text frames are JSON-RPC messages (WSMessage). Binary frames carry
+// raw PCM instead of base64; their first byte is a tag:
+//
+//	audio input (browser → server), tag 0x41:
+//	  byte 0:    tag
+//	  bytes 1-4: sample rate, uint32 little-endian
+//	  bytes 5+:  int16 little-endian mono PCM
+//
+//	TTS chunk (server → browser), tag 0x54:
+//	  byte 0:     tag
+//	  bytes 1-4:  sample rate, uint32 little-endian
+//	  byte 5:     flags: bit0 = done, bit1 = muted
+//	  bytes 6-13: duration seconds, float64 little-endian (lip-sync timeline)
+//	  bytes 14+:  int16 little-endian PCM
+const (
+	frameTagAudioInput = 0x41
+	frameTagTTSChunk   = 0x54
+
+	audioInputHeaderSize = 5
+	ttsChunkHeaderSize   = 14
+
+	ttsFlagDone  = 0x01
+	ttsFlagMuted = 0x02
+)
 
 // WSMessage represents a JSON-RPC style message over WebSocket.
 type WSMessage struct {
@@ -79,9 +108,10 @@ type StatusChangedParams struct {
 	Status string `json:"status"`
 }
 
-// TTSChunkParams carries base64-encoded audio.
+// TTSChunkParams is encoded as a binary frame, not a JSON notification.
 type TTSChunkParams struct {
-	Audio      string `json:"audio"`
+	// PCM is int16 little-endian audio; it has no JSON representation.
+	PCM        []byte `json:"-"`
 	SampleRate int    `json:"sample_rate"`
 	Done       bool   `json:"done"`
 	// Muted marks audio the companion must play silently: the speaker output
@@ -131,4 +161,35 @@ type PartialTranscriptParams struct {
 	// lands; until then clients must treat a missing turn_id as "current
 	// utterance" rather than assuming the ID never changes.
 	TurnID string `json:"turn_id,omitempty"`
+}
+
+// encodeTTSChunkFrame packs a TTS chunk into the binary frame documented above.
+func encodeTTSChunkFrame(p TTSChunkParams) []byte {
+	frame := make([]byte, ttsChunkHeaderSize+len(p.PCM))
+	frame[0] = frameTagTTSChunk
+	binary.LittleEndian.PutUint32(frame[1:5], uint32(p.SampleRate))
+	if p.Done {
+		frame[5] |= ttsFlagDone
+	}
+	if p.Muted {
+		frame[5] |= ttsFlagMuted
+	}
+	binary.LittleEndian.PutUint64(frame[6:14], math.Float64bits(p.DurationSeconds))
+	copy(frame[ttsChunkHeaderSize:], p.PCM)
+	return frame
+}
+
+// parseAudioInputFrame validates a microphone frame and returns its payload.
+func parseAudioInputFrame(raw []byte) (sampleRate int, pcm []byte, ok bool) {
+	if len(raw) <= audioInputHeaderSize || (len(raw)-audioInputHeaderSize)%2 != 0 {
+		return 0, nil, false
+	}
+	if raw[0] != frameTagAudioInput {
+		return 0, nil, false
+	}
+	rate := binary.LittleEndian.Uint32(raw[1:5])
+	if rate == 0 || rate > 384000 {
+		return 0, nil, false
+	}
+	return int(rate), raw[audioInputHeaderSize:], true
 }

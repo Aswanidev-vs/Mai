@@ -49,7 +49,11 @@ kws:
   decoder: "decoder-epoch-12-avg-2-chunk-16-left-64.onnx"
   joiner: "joiner-epoch-12-avg-2-chunk-16-left-64.onnx"
   tokens: "tokens.txt"
-  keywords: "▁MA I @mai, ▁MY @mai, ▁HE Y ▁MA I @mai"  # Subword token version
+  # Distinct @names and per-keyword thresholds (sherpa parses "#0.45"):
+  # "MY" is a common English word and needs a higher bar than "MAI";
+  # "HEY MAI" is longer and can trigger lower. Distinct names let the wake
+  # log say which phrase fired. Subword token version.
+  keywords: "▁MA I @mai #0.25, ▁MY @my #0.45, ▁HE Y ▁MA I @heymai #0.20"
   confidence_threshold: 0.25
   cooldown_ms: 1500
 
@@ -98,8 +102,12 @@ asr:
     # this: the reduced window let the last TTS tail reach ASR as user speech.
     post_tts_aec_ms: 2500
     # Decoupled ASR worker queue, in 25ms capture frames. Bounds the decoder
-    # backlog without ever blocking the capture callback.
-    asr_queue_depth: 128
+    # backlog without ever blocking the capture callback. 48 frames = 1.2s of
+    # slack: 128 was 3.2s of buffered audio (pure latency on every utterance),
+    # while 48 still absorbs several 560ms chunk-decode bursts. Submit drops the
+    # oldest frame when full, so a smaller bound trades a little old-audio loss
+    # under sustained decoder load for much lower steady-state latency.
+    asr_queue_depth: 48
 
   # Dual-model: use a secondary offline model for unsupported languages
   dual_mode:
@@ -220,8 +228,7 @@ tts:
   # output and read as harsh/sharp, so this ships at 0.25 (the original
   # start-here value; measured air share 1.7%, peak unchanged). Raise for more
   # air, set 0 to disable.
-  # exciter_amount: 0.25
-  exciter_amount: 0.0
+  exciter_amount: 0.25
 
   # normalize_loudness: bring every utterance's active speech to
   # target_loudness_dbfs before the emotion volume is applied. This is the fix
