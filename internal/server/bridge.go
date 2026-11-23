@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"log"
 	"time"
 
@@ -83,7 +84,8 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 	})
 
 	// TTS audio chunks → WS clients (browser-side lip sync; muted chunks are
-	// mirrored at zero gain when the speakers are local).
+	// mirrored at zero gain when the speakers are local). Producers still hand
+	// us base64 PCM; only the wire changes to a binary frame.
 	bus.Subscribe("tts.audio.chunk", func(event interfaces.Event) {
 		audio, _ := event.Payload["audio"].(string)
 		sampleRate, _ := event.Payload["sample_rate"].(int)
@@ -94,16 +96,21 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		if audio == "" && !done {
 			return
 		}
+		pcm, err := base64.StdEncoding.DecodeString(audio)
+		if err != nil {
+			log.Printf("[BRIDGE] Bad TTS audio payload: %v", err)
+			return
+		}
 		if sampleRate == 0 {
 			sampleRate = 24000
 		}
-		b.hub.BroadcastNotification(NotifTTSChunk, TTSChunkParams{
-			Audio:           audio,
+		b.hub.BroadcastBinary(encodeTTSChunkFrame(TTSChunkParams{
+			PCM:             pcm,
 			SampleRate:      sampleRate,
 			Done:            done,
 			Muted:           muted,
 			DurationSeconds: durationSeconds,
-		})
+		}))
 	})
 
 	// Live ASR results → WS clients so the browser can render interim text

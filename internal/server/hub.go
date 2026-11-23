@@ -17,18 +17,25 @@ const (
 	maxMessageSize = 256 * 1024 // 256 KB — large enough for TTS audio chunks
 )
 
+// outboundMessage keeps text and binary frames on one ordered queue. Lip sync
+// depends on chat.response arriving before the PCM it describes.
+type outboundMessage struct {
+	data   []byte
+	binary bool
+}
+
 // Client represents a single WebSocket connection.
 type Client struct {
 	hub  *Hub
 	conn *websocket.Conn
-	send chan []byte
+	send chan outboundMessage
 	id   string
 }
 
 // Hub manages all connected WebSocket clients.
 type Hub struct {
 	clients       map[*Client]bool
-	broadcast     chan []byte
+	broadcast     chan outboundMessage
 	register      chan *Client
 	unregister    chan *Client
 	mu            sync.RWMutex
@@ -40,7 +47,7 @@ type Hub struct {
 func NewHub() *Hub {
 	return &Hub{
 		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte, 512),
+		broadcast:  make(chan outboundMessage, 512),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 	}
@@ -68,31 +75,36 @@ func (h *Hub) Run() {
 			}
 
 		case message := <-h.broadcast:
-			// Collect stale clients first, then remove them under write lock.
-			h.mu.RLock()
-			var stale []*Client
-			for client := range h.clients {
-				select {
-				case client.send <- message:
-				default:
-					stale = append(stale, client)
-				}
-			}
-			h.mu.RUnlock()
+			h.fanout(message)
+		}
+	}
+}
 
-			if len(stale) > 0 {
-				h.mu.Lock()
-				for _, client := range stale {
-					if _, ok := h.clients[client]; ok {
-						delete(h.clients, client)
-						close(client.send)
-					}
-				}
-				h.mu.Unlock()
-				if h.onClientGone != nil {
-					h.onClientGone()
-				}
+// fanout shares one message with every client without blocking the publisher.
+func (h *Hub) fanout(message outboundMessage) {
+	// Collect stale clients first, then remove them under write lock.
+	h.mu.RLock()
+	var stale []*Client
+	for client := range h.clients {
+		select {
+		case client.send <- message:
+		default:
+			stale = append(stale, client)
+		}
+	}
+	h.mu.RUnlock()
+
+	if len(stale) > 0 {
+		h.mu.Lock()
+		for _, client := range stale {
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				close(client.send)
 			}
+		}
+		h.mu.Unlock()
+		if h.onClientGone != nil {
+			h.onClientGone()
 		}
 	}
 }
@@ -132,7 +144,17 @@ func reportBroadcastDrops() {
 // it, and Run() above already evicts clients that cannot keep up.
 func (h *Hub) BroadcastToAll(data []byte) {
 	select {
-	case h.broadcast <- data:
+	case h.broadcast <- outboundMessage{data: data}:
+	default:
+		broadcastDrops.Add(1)
+		reportBroadcastDrops()
+	}
+}
+
+// BroadcastBinary fans a raw binary frame out to every connected client.
+func (h *Hub) BroadcastBinary(frame []byte) {
+	select {
+	case h.broadcast <- outboundMessage{data: frame, binary: true}:
 	default:
 		broadcastDrops.Add(1)
 		reportBroadcastDrops()
@@ -142,7 +164,7 @@ func (h *Hub) BroadcastToAll(data []byte) {
 // SendToClient sends a message to a specific client.
 func (h *Hub) SendToClient(client *Client, data []byte) {
 	select {
-	case client.send <- data:
+	case client.send <- outboundMessage{data: data}:
 	default:
 		log.Printf("[WS] Send buffer full for client %s, dropping message", client.id)
 	}
@@ -170,12 +192,17 @@ func (c *Client) readPump() {
 	})
 
 	for {
-		_, message, err := c.conn.ReadMessage()
+		messageType, message, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 				log.Printf("[WS] Read error from %s: %v", c.id, err)
 			}
 			break
+		}
+		// Text frames stay JSON-RPC; binary frames carry microphone PCM.
+		if messageType == websocket.BinaryMessage {
+			c.hub.HandleBinaryMessage(c, message)
+			continue
 		}
 		c.hub.HandleMessage(c, message)
 	}
@@ -197,7 +224,11 @@ func (c *Client) writePump() {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			messageType := websocket.TextMessage
+			if message.binary {
+				messageType = websocket.BinaryMessage
+			}
+			if err := c.conn.WriteMessage(messageType, message.data); err != nil {
 				return
 			}
 

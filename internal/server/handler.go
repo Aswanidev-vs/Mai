@@ -59,8 +59,8 @@ func (h *Hub) handleChatInput(client *Client, msg WSMessage) {
 		Type:   "ws.chat.input",
 		Source: "ws-server",
 		Payload: map[string]interface{}{
-			"text":    params.Text,
-			"client":  client.id,
+			"text":   params.Text,
+			"client": client.id,
 		},
 	}
 	if h.eventBus != nil {
@@ -115,6 +115,19 @@ func (h *Hub) sendResult(client *Client, id string, result json.RawMessage) {
 	h.SendToClient(client, data)
 }
 
+// HandleBinaryMessage handles binary frames. Microphone frames use the raw PCM
+// layout documented in protocol.go; every other binary frame is ignored.
+func (h *Hub) HandleBinaryMessage(client *Client, raw []byte) {
+	if h.eventBus == nil {
+		return
+	}
+	sampleRate, pcm, ok := parseAudioInputFrame(raw)
+	if !ok {
+		return
+	}
+	h.publishAudioFrame(client, sampleRate, pcm16LEToFloat32(pcm))
+}
+
 func (h *Hub) handleAudioInput(client *Client, msg WSMessage) {
 	var params AudioInputParams
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
@@ -124,23 +137,33 @@ func (h *Hub) handleAudioInput(client *Client, msg WSMessage) {
 		return
 	}
 
-	// base64 int16 → float32 PCM
 	raw, err := base64.StdEncoding.DecodeString(params.Audio)
 	if err != nil || len(raw) == 0 || len(raw)%2 != 0 {
 		return
 	}
+	h.publishAudioFrame(client, params.SampleRate, pcm16LEToFloat32(raw))
+}
+
+// pcm16LEToFloat32 keeps the normalization used by the local microphone path.
+func pcm16LEToFloat32(raw []byte) []float32 {
 	samples := make([]float32, len(raw)/2)
 	for i := 0; i < len(samples); i++ {
 		s16 := int16(binary.LittleEndian.Uint16(raw[i*2 : i*2+2]))
 		samples[i] = float32(s16) / 32768.0
 	}
+	return samples
+}
 
+func (h *Hub) publishAudioFrame(client *Client, sampleRate int, samples []float32) {
+	if len(samples) == 0 {
+		return
+	}
 	h.eventBus.Publish(interfaces.Event{
 		Type:   "perception.audio.frame",
 		Source: "ws-server",
 		Payload: map[string]interface{}{
 			"samples":     samples,
-			"sample_rate": params.SampleRate,
+			"sample_rate": sampleRate,
 			"client":      client.id,
 		},
 	})

@@ -36,8 +36,8 @@ func New(cfg ServerConfig, bus interfaces.EventBus, isSpeaking, ttsPlaying *int3
 	hub := NewHub()
 	hub.eventBus = bus
 	return &Server{
-		cfg:        cfg,
-		hub:        hub,
+		cfg: cfg,
+		hub: hub,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				origin := r.Header.Get("Origin")
@@ -137,7 +137,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	client := &Client{
 		hub:  s.hub,
 		conn: conn,
-		send: make(chan []byte, 512),
+		send: make(chan outboundMessage, 512),
 		id:   r.RemoteAddr,
 	}
 
@@ -151,7 +151,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		status = s.getStatus()
 	}
 	raw := fmt.Sprintf(`{"method":"status.changed","params":{"status":"%s"}}`, status)
-	client.send <- []byte(raw)
+	client.send <- outboundMessage{data: []byte(raw)}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

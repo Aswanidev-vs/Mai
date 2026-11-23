@@ -160,11 +160,22 @@ func applyExciter(samples []float32, sampleRate int, cfg exciterConfig) []float3
 	const targetPeak = 0.5
 	scale := targetPeak / peak
 
+	// Accumulate the air band's RMS and peak while generating it: two extra
+	// full passes over the sentence bought nothing the generator cannot report
+	// as it goes, and the accumulation order is unchanged.
 	air := make([]float32, len(samples))
+	airEnergy := 0.0
+	peakAir := 0.0
 	for i := range samples {
 		p := float64(presence[i]) * scale
 		h := p * math.Abs(p) // second-order: every partial gains a 2f component
-		air[i] = float32(airLP.process(airHP.process(h)))
+		v := float32(airLP.process(airHP.process(h)))
+		air[i] = v
+		d := float64(v)
+		airEnergy += d * d
+		if a := math.Abs(d); a > peakAir {
+			peakAir = a
+		}
 	}
 
 	// Calibrate so `amount` has a predictable meaning: the air band is scaled to
@@ -172,7 +183,7 @@ func applyExciter(samples []float32, sampleRate int, cfg exciterConfig) []float3
 	// relative to the voice", which is audible, and every step of the knob is
 	// proportionate. Without this the stage's output would depend on the square
 	// of the input level and the knob would mean nothing measurable.
-	airRMS := rmsLevel(air)
+	airRMS := math.Sqrt(airEnergy / float64(len(air)))
 	if airRMS < 1e-9 || dryRMS < 1e-9 {
 		return samples
 	}
@@ -180,12 +191,6 @@ func applyExciter(samples []float32, sampleRate int, cfg exciterConfig) []float3
 
 	// RMS calibration alone does not bound the peak: an impulsive air band can
 	// have a peak far above its RMS and would clip. Cap the added amplitude too.
-	peakAir := 0.0
-	for _, v := range air {
-		if a := math.Abs(float64(v)); a > peakAir {
-			peakAir = a
-		}
-	}
 	const maxPeakAdd = 0.30
 	if maxGain := maxPeakAdd / peakAir; gain > maxGain {
 		gain = maxGain
@@ -254,12 +259,20 @@ func colourVoice(samples []float32, cfg colourConfig) []float32 {
 	if cfg.targetRMS > 0 {
 		out = normalizeLoudness(out, cfg.sampleRate, cfg.targetRMS)
 	}
-	if trim := cfg.volume * cfg.outputGain; trim != 1 {
-		scaled := make([]float32, len(out))
+	// The master trim and the final limiter are one pass: the limiter's input is
+	// exactly the trimmed sample, so splitting them allocated and scanned the
+	// whole sentence twice. Multiply in float32 first so the limiter sees the
+	// same value the old two-pass chain handed it.
+	trim := cfg.volume * cfg.outputGain
+	limited := make([]float32, len(out))
+	if trim == 1 {
 		for i, s := range out {
-			scaled[i] = s * trim
+			limited[i] = float32(softLimit(float64(s)))
 		}
-		out = scaled
+	} else {
+		for i, s := range out {
+			limited[i] = float32(softLimit(float64(s * trim)))
+		}
 	}
-	return limitSamples(out)
+	return limited
 }

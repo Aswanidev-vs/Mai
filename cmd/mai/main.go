@@ -36,6 +36,7 @@ import (
 	"github.com/user/mai/internal/events"
 	"github.com/user/mai/internal/llm"
 	"github.com/user/mai/internal/memory"
+	"github.com/user/mai/internal/observability"
 	"github.com/user/mai/internal/perception"
 	"github.com/user/mai/internal/personality"
 	"github.com/user/mai/internal/server"
@@ -197,6 +198,8 @@ func main() {
 	var bus interfaces.EventBus
 	var companionServer *server.Server
 	var browserMicActive int32
+	// Held at main scope so graceful shutdown can flush the async writer.
+	var episodicMem *memory.EpisodicStore
 	companionHasClient := func() bool { return companionServer != nil && companionServer.ClientCount() > 0 }
 	var capture *audioCapture // forward-declared; assigned later
 
@@ -503,7 +506,7 @@ func main() {
 	if recognizer != nil && asrStream != nil {
 		depth := cfg.ASR.Pipeline.ASRQueueDepth
 		if depth <= 0 {
-			depth = 128
+			depth = defaultASRQueueDepth
 		}
 		streaming = newStreamingASR(recognizer, asrStream, depth)
 		defer streaming.Stop()
@@ -952,7 +955,7 @@ func main() {
 		// over the whole sentence: the pitch shifter needs the complete buffer,
 		// and the exciter's filters need contiguous state.
 		out := make([]float32, 0, 44100*4)
-		synthesize(text, speed, func(samples []float32) bool {
+		synthesizeFixed(text, speed, volume, pitch, ttsSampleRate, synthesize, func(samples []float32) bool {
 			// Abort mid-synthesis only when the turn itself was replaced
 			// (barge-in answered by a new reply). Deliberately NOT keyed on
 			// stopPlayback: the player clears that flag when the new turn's
@@ -1315,7 +1318,7 @@ func main() {
 			lastTTSEndNano.Store(time.Now().UnixNano())
 			startupTTSActive.Store(false)
 		}()
-		synthesize("System ready.", ttsDefaultSpeed, func(samples []float32) bool {
+		synthesizeFixed("System ready.", ttsDefaultSpeed, 1, 1, ttsSampleRate, synthesize, func(samples []float32) bool {
 			if !started {
 				started = true
 				startupTTSActive.Store(true)
@@ -1375,7 +1378,7 @@ func main() {
 
 		// Memory
 		workingMem := memory.NewWorkingMemory(10)
-		episodicMem, _ := memory.NewEpisodicStore("data/memory/episodic.db")
+		episodicMem, _ = memory.NewEpisodicStore("data/memory/episodic.db")
 		semanticMem := memory.NewSemanticStore(llmProvider, "data/vector")
 		proceduralMem, _ := memory.NewProceduralStore("data/memory")
 		memManager := memory.NewMemoryManager(workingMem, episodicMem, semanticMem, proceduralMem)
@@ -1677,6 +1680,9 @@ func main() {
 			// Arm the post-TTS window before releasing isSpeaking. A frame
 			// scheduled between the two stores must still see a guarded path.
 			lastTTSEndNano.Store(time.Now().UnixNano())
+			if start := ttsStartedNano.Load(); start != 0 {
+				observability.RecordStage("tts", time.Since(time.Unix(0, start)))
+			}
 			atomic.StoreInt32(&isSpeaking, 0) // Resume ASR
 			lastResponseMu.Lock()
 			lastResponseTime = time.Now()
@@ -1732,6 +1738,7 @@ func main() {
 	lastVoiceAt := time.Now()
 	lastASRTextAt := time.Now()
 	turnStartedAt := time.Time{}
+	var aecSamples atomic.Uint64
 	var lastASRDropLog time.Time
 
 	resetASR := func() {
@@ -1799,6 +1806,9 @@ func main() {
 	// Silero's 0.5s silence — duplicating the text and cutting the speaker off
 	// mid-sentence.
 	finalizeTurn := func() {
+		if !turnStartedAt.IsZero() {
+			observability.RecordStage("asr", time.Since(turnStartedAt))
+		}
 		// The display transcript and the routed transcript are the same text.
 		// Strip the wake word that the ASR stream may have retained while KWS
 		// was confirming it, then remove decoder-loop repetition before the
@@ -2152,6 +2162,18 @@ func main() {
 			sum += s * s
 		}
 		rms := math.Sqrt(float64(sum / float32(len(samples))))
+
+		// The meter must update on every frame in every state. It used to live
+		// in the wake-word branch, so the line froze for a whole turn and read
+		// as audio stutter.
+		if rms > levelPeak {
+			levelPeak = rms
+		}
+		if rateLimit(&levelPrintAt, levelPrintInterval) {
+			fmt.Printf("\r[AUDIO] Level: %.4f  dropped: %d ", levelPeak, micPipe.Load().Dropped())
+			levelPeak = 0
+		}
+
 		lastMicMu.Lock()
 		lastMicRMS = rms
 		lastMicMu.Unlock()
@@ -2200,7 +2222,11 @@ func main() {
 				// window the gate below stays closed, so feeding the filter
 				// early is pure training (echo only) and it converges before
 				// detection arms.
+				aecStart := time.Now()
 				clean := echoCanceller.Process(samples)
+				if aecSamples.Add(1)%64 == 0 {
+					observability.RecordStage("aec", time.Since(aecStart))
+				}
 				crms := rmsOf(clean)
 				lastMicMu.Lock()
 				lastMicRMS = crms
@@ -2322,7 +2348,11 @@ func main() {
 		// passes through.
 		if postTTS {
 			if echoCanceller != nil {
+				aecStart := time.Now()
 				clean := echoCanceller.Process(samples)
+				if aecSamples.Add(1)%64 == 0 {
+					observability.RecordStage("aec", time.Since(aecStart))
+				}
 				crms := rmsOf(clean)
 				if denoiser != nil {
 					denoiser.Feed(clean, true)
@@ -2370,7 +2400,12 @@ func main() {
 		switch state {
 		case StateWakeWord:
 			// Follow-up: if the user speaks within the 15s window, skip wake word.
-			if time.Since(lastResponseTime) < 15*time.Second {
+			// lastResponseTime is written by the TTS player goroutine, so read
+			// it under the same mutex to avoid a torn time.Time.
+			lastResponseMu.Lock()
+			inFollowUpWindow := time.Since(lastResponseTime) < 15*time.Second
+			lastResponseMu.Unlock()
+			if inFollowUpWindow {
 				vadBuffer.Push(samples)
 				var lastChunk []float32
 				for vadBuffer.Size() >= cfg.VAD.WindowSize {
@@ -2381,14 +2416,16 @@ func main() {
 				}
 
 				if !vadDetector.IsEmpty() {
-					var sum float32
-					for _, s := range samples {
-						sum += s * s
-					}
-					rms := math.Sqrt(float64(sum / float32(len(samples))))
+					// The VAD reports a segment only after speech ends, so the
+					// current 25ms frame is usually silence by then. Measure the
+					// segment itself, and always pop it: an unpopped segment
+					// blocks every newer one.
+					segment := vadDetector.Front()
+					segmentRMS := rmsOf(segment.Samples)
+					vadDetector.Pop()
 
-					if rms > 0.001 {
-						log.Printf("[FOLLOW-UP] Speech detected (Level %.4f)! Skipping wake word.", rms)
+					if segmentRMS > 0.001 {
+						log.Printf("[FOLLOW-UP] Speech detected (segment level %.4f)! Skipping wake word.", segmentRMS)
 						// Preserve whatever the streaming decoder already
 						// heard. Resetting here used to throw away the first
 						// word of a follow-up.
@@ -2435,14 +2472,6 @@ func main() {
 			// Rate-limited because this runs on the pipeline goroutine: an
 			// unbuffered write per frame competes with the serial drain and shows
 			// up as dropped frames.
-			if rms > levelPeak {
-				levelPeak = rms
-			}
-			if rateLimit(&levelPrintAt, levelPrintInterval) {
-				fmt.Printf("\r[AUDIO] Level: %.4f  dropped: %d ", levelPeak, micPipe.Load().Dropped())
-				levelPeak = 0
-			}
-
 			if time.Since(lastDetected) < time.Duration(cfg.KWS.CooldownMs)*time.Millisecond {
 				return
 			}
@@ -2453,7 +2482,7 @@ func main() {
 				if result.Keyword != "" {
 					spotter.Reset(kwsStream)
 					lastDetected = time.Now()
-					log.Println("\n[WAKE] Detected! Listening...")
+					log.Printf("\n[WAKE] Detected %q! Listening...", result.Keyword)
 
 					// Do not reset the ASR stream here. The keyword spotter
 					// reports 20-300ms after the phrase starts, so by now the
@@ -2551,6 +2580,11 @@ func main() {
 	}() // unblock any blocked senders
 	atomic.StoreInt32(&stopPlayback, 1)
 	ttsWG.Wait()
+	if episodicMem != nil {
+		if err := episodicMem.Close(); err != nil {
+			log.Printf("[Memory] Episodic close: %v", err)
+		}
+	}
 
 	// Wait briefly for cleanup, then force exit
 	done := make(chan struct{})
@@ -2565,42 +2599,6 @@ func main() {
 	case <-time.After(2 * time.Second):
 		log.Println("[SYSTEM] Shutdown timeout - forcing exit.")
 	}
-}
-
-// pickGreeting returns a persona-consistent, time-of-day aware opener instead
-// of the old JARVIS-style "Yes Sir / At your service" lines. Rotated per
-// hour so repeated wake-ups don't sound scripted ("greet by context" — the
-// single biggest companionship cue per companion-AI research).
-func pickGreeting() string {
-	hour := time.Now().Hour()
-	var pool []string
-	switch {
-	case hour >= 5 && hour < 12:
-		pool = []string{
-			"Good morning. What are we getting into today?",
-			"Morning. I'm awake. What do you need?",
-			"Good morning, Aswani-kun.",
-		}
-	case hour >= 12 && hour < 17:
-		pool = []string{
-			"Hey. What's on your mind?",
-			"I'm here. What do we have today?",
-			"Good afternoon. What do you need?",
-		}
-	case hour >= 17 && hour < 22:
-		pool = []string{
-			"Evening. I'm with you.",
-			"Hey, good evening. What are we doing?",
-			"Evening, Aswani-kun. I'm here.",
-		}
-	default:
-		pool = []string{
-			"Still up? I'm here. What do you need?",
-			"Night owl hours. What's on your mind?",
-			"Late one, hm? Say the word.",
-		}
-	}
-	return pool[time.Now().UnixNano()%int64(len(pool))]
 }
 
 // startOllama starts the ollama serve process and returns a function to kill it.

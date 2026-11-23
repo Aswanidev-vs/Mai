@@ -36,7 +36,8 @@ function loadAudioPlayer() {
         createAnalyser() { this.analyser = new FakeNode(); this.analyser.fftSize = 512; return this.analyser; }
         createGain() { return new FakeNode(); }
         createBuffer(channels, length, sampleRate) {
-            return { length, sampleRate, data: new Float32Array(length), getChannelData: () => new Float32Array(length) };
+            const data = new Float32Array(length);
+            return { length, sampleRate, data, getChannelData: () => data };
         }
         createBufferSource() { const source = new FakeSource(this); this.sources.push(source); return source; }
         resume() { this.state = 'running'; return Promise.resolve(); }
@@ -80,6 +81,37 @@ test('sentence duration is applied on its first scheduled chunk', async () => {
     assert.deepEqual(durations, [2.5]);
     assert.equal(player.getKnownDuration(), 2.5);
     assert.equal(player.getPlayhead(), 0);
+});
+
+test('binary Int16Array chunks play without base64 decoding', async () => {
+    const { player } = loadAudioPlayer();
+    player.beginVisemeUtterance();
+    const pcm = new Int16Array([0, 16384, -16384, 32767]);
+    await player._playSmooth(pcm, 16000, false, true, 0.25);
+    assert.equal(player.audioContext.sources.length, 1);
+    assert.equal(player.audioContext.sources[0].buffer.length, 4);
+    assert.equal(player.getKnownDuration(), 0.25);
+    assert.deepEqual([...player.audioContext.sources[0].buffer.data], [0, 0.5, -0.5, 32767 / 32768]);
+});
+
+test('queueChunk accepts binary frames end to end', async () => {
+    const { player } = loadAudioPlayer();
+    let started = 0;
+    let ended = 0;
+    player.onSpeakingStart = () => started++;
+    player.onSpeakingEnd = () => ended++;
+    player.queueChunk(new Int16Array([0, 1000, -1000]), 16000, true, false, 0.125);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(started, 1);
+    assert.equal(ended, 1);
+    assert.equal(player.audioContext.sources.length, 1);
+});
+
+test('legacy base64 chunks still decode to the same samples', async () => {
+    const { player } = loadAudioPlayer();
+    const pcm = new Int16Array([0, 16384, -16384, 32767]);
+    await player._playSmooth(Buffer.from(pcm.buffer).toString('base64'), 16000, false, false);
+    assert.deepEqual([...player.audioContext.sources[0].buffer.data], [0, 0.5, -0.5, 32767 / 32768]);
 });
 
 test('done marker ends speaking and does not require audio', async () => {

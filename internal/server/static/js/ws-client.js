@@ -1,5 +1,9 @@
 // WebSocket client with auto-reconnect and message routing
 
+// Binary frame layout (see internal/server/protocol.go).
+const BINARY_TAG_TTS = 0x54;
+const TTS_HEADER_BYTES = 14;
+
 class WSClient {
     constructor(url) {
         this.url = url;
@@ -18,6 +22,8 @@ class WSClient {
         }
 
         this.ws = new WebSocket(this.url);
+        // Keep binary frames as ArrayBuffers so the PCM view is zero-copy.
+        this.ws.binaryType = 'arraybuffer';
 
         this.ws.onopen = () => {
             this.connected = true;
@@ -27,11 +33,17 @@ class WSClient {
         };
 
         this.ws.onmessage = (event) => {
-            try {
-                const msg = JSON.parse(event.data);
-                this._dispatch(msg);
-            } catch (e) {
-                console.error('[WS] Parse error:', e);
+            // Text frames are JSON-RPC notifications; binary frames are raw PCM.
+            if (typeof event.data === 'string') {
+                try {
+                    this._dispatch(JSON.parse(event.data));
+                } catch (e) {
+                    console.error('[WS] Parse error:', e);
+                }
+                return;
+            }
+            if (event.data instanceof ArrayBuffer) {
+                this._dispatchBinary(event.data);
             }
         };
 
@@ -51,10 +63,21 @@ class WSClient {
     send(method, params) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
             console.warn('[WS] Not connected, cannot send');
-            return;
+            return false;
         }
         const msg = { method, params };
         this.ws.send(JSON.stringify(msg));
+        return true;
+    }
+
+    // Send a pre-built binary frame (microphone PCM).
+    sendBinary(data) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            console.warn('[WS] Not connected, cannot send binary frame');
+            return false;
+        }
+        this.ws.send(data);
+        return true;
     }
 
     sendWithId(method, params) {
@@ -91,6 +114,42 @@ class WSClient {
                 delete this.handlers['_response_' + msg.id];
             }
         }
+    }
+
+    _dispatchBinary(buffer) {
+        if (buffer.byteLength < TTS_HEADER_BYTES) return;
+        const view = new DataView(buffer);
+        if (view.getUint8(0) !== BINARY_TAG_TTS) return;
+        const sampleRate = view.getUint32(1, true);
+        const flags = view.getUint8(5);
+        const durationSeconds = view.getFloat64(6, true);
+        const pcm = new Int16Array(buffer, TTS_HEADER_BYTES);
+
+        // Same notification as before, with `audio` kept as a lazy base64 field
+        // so the desktop overlay (which only knows the JSON shape) still works.
+        const params = {
+            sample_rate: sampleRate,
+            done: !!(flags & 0x01),
+            muted: !!(flags & 0x02),
+            duration_seconds: durationSeconds,
+            pcm,
+        };
+        let cachedAudio;
+        Object.defineProperty(params, 'audio', {
+            enumerable: true,
+            get() {
+                if (cachedAudio === undefined) {
+                    const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+                    let binary = '';
+                    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+                    cachedAudio = btoa(binary);
+                }
+                return cachedAudio;
+            },
+        });
+
+        const callbacks = this.handlers['tts.chunk'];
+        if (callbacks) callbacks.forEach(cb => cb(params));
     }
 
     disconnect() {

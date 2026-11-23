@@ -19,6 +19,12 @@ type asrSnapshot struct {
 	Endpoint   bool
 }
 
+// defaultASRQueueDepth mirrors config.yaml's asr.pipeline.asr_queue_depth. The
+// queue is measured in 25ms frames, so this is ~1.2s of decoder backlog: enough
+// to absorb chunk-decode bursts without the 3.2s of pure latency the old 128
+// frames added to every utterance.
+const defaultASRQueueDepth = 48
+
 // asrFrame is one captured block on its way to the decoder worker. The samples
 // are copied by Submit: the audio pipeline owns its slice only for the duration
 // of the frame callback, while the worker may run a chunk decode behind it.
@@ -55,7 +61,7 @@ func newStreamingASR(rec *sherpa.OnlineRecognizer, stream *sherpa.OnlineStream, 
 		return nil
 	}
 	if queueDepth <= 0 {
-		queueDepth = 128
+		queueDepth = defaultASRQueueDepth
 	}
 	a := &streamingASR{
 		rec:    rec,

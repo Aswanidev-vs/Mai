@@ -58,15 +58,29 @@ class AudioPlayer {
         }
     }
 
+    // Accepts either base64 PCM (legacy JSON clients) or an Int16Array from a
+    // binary WS frame. Decoding happens once, when the chunk is actually played.
+    _decodePCM(source) {
+        if (!source) return null;
+        if (typeof source !== 'string') {
+            return source instanceof Int16Array ? source : new Int16Array(source);
+        }
+        const binary = atob(source);
+        if (!binary.length) return null;
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return new Int16Array(bytes.buffer);
+    }
+
     // Queue a chunk for smooth sequential playback. `muted` marks mirrored
     // audio from local-speaker mode: it is scheduled and analysed exactly like
     // audible audio, but output at zero gain so the tab never doubles the
     // sound while its lip-sync clock still follows the real voice.
     // Queue in arrival order before resuming. Resuming first yields to the
     // event loop, allowing bursty WebSocket chunks to enter the queue out of order.
-    queueChunk(base64Audio, sampleRate, done, muted, durationSeconds = 0) {
+    queueChunk(pcmSource, sampleRate, done, muted, durationSeconds = 0) {
         if (!this.audioContext) this.init();
-        this.queue.push({ base64Audio, sampleRate, done, muted: !!muted, durationSeconds: Number(durationSeconds) || 0 });
+        this.queue.push({ pcmSource, sampleRate, done, muted: !!muted, durationSeconds: Number(durationSeconds) || 0 });
         if (!this._draining) {
             this._drainQueue();
         }
@@ -109,7 +123,7 @@ class AudioPlayer {
             try {
                 // Sources are played sequentially, so the next chunk starts
                 // after this one ends. Gain automation still protects boundaries.
-                await this._playSmooth(chunk.base64Audio, chunk.sampleRate, chunkIndex > 0, chunk.muted, chunk.durationSeconds);
+                await this._playSmooth(chunk.pcmSource, chunk.sampleRate, chunkIndex > 0, chunk.muted, chunk.durationSeconds);
             } catch (e) {
                 console.error('[Audio] Chunk play error:', e);
             }
@@ -131,21 +145,15 @@ class AudioPlayer {
     // with crossfade gain to eliminate gaps between chunks. With `muted`, the
     // chunk is analysed but silent: local speakers own the sound, the tab only
     // mirrors the timeline for lip sync.
-    _playSmooth(base64Audio, sampleRate, applyCrossfade, muted, durationSeconds = 0) {
+    _playSmooth(pcmSource, sampleRate, applyCrossfade, muted, durationSeconds = 0) {
         return new Promise((resolve, reject) => {
             try {
-                const binaryString = atob(base64Audio);
+                const int16Array = this._decodePCM(pcmSource);
                 // Zero-length chunk = done marker; resolve immediately.
-                if (binaryString.length === 0) {
+                if (!int16Array || int16Array.length === 0) {
                     resolve();
                     return;
                 }
-                const bytes = new Uint8Array(binaryString.length);
-                for (let i = 0; i < binaryString.length; i++) {
-                    bytes[i] = binaryString.charCodeAt(i);
-                }
-
-                const int16Array = new Int16Array(bytes.buffer);
                 const float32Array = new Float32Array(int16Array.length);
                 for (let i = 0; i < int16Array.length; i++) {
                     float32Array[i] = int16Array[i] / 32768.0;
@@ -240,18 +248,13 @@ class AudioPlayer {
     }
 
     // Legacy: direct play without queue (for backwards compat)
-    async playChunk(base64Audio, sampleRate) {
+    async playChunk(pcmSource, sampleRate) {
         if (!this.audioContext) this.init();
         this.resume();
 
         try {
-            const binaryString = atob(base64Audio);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
-            }
-
-            const int16Array = new Int16Array(bytes.buffer);
+            const int16Array = this._decodePCM(pcmSource);
+            if (!int16Array) return;
             const float32Array = new Float32Array(int16Array.length);
             for (let i = 0; i < int16Array.length; i++) {
                 float32Array[i] = int16Array[i] / 32768.0;

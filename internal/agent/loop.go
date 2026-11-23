@@ -13,6 +13,7 @@ import (
 
 	"github.com/user/mai/internal/cognition"
 	"github.com/user/mai/internal/memory"
+	"github.com/user/mai/internal/observability"
 	"github.com/user/mai/internal/personality"
 	"github.com/user/mai/internal/skills"
 	"github.com/user/mai/pkg/interfaces"
@@ -210,6 +211,11 @@ func (o *Orchestrator) summarizeDropped(entries []interfaces.MemoryEntry) {
 	if o.llm == nil || len(entries) == 0 {
 		return
 	}
+	// Compaction can fire mid-turn; generating now would queue behind (or
+	// starve) the foreground reply on a single-request local LLM.
+	if !o.isIdle() {
+		return
+	}
 
 	var b strings.Builder
 	b.WriteString("Summarize the following conversation history into a compact memory note (2-4 short lines, first person, plain text). Keep the user's name, topics, preferences, emotions, and unfinished tasks. Drop filler.\n\n")
@@ -317,6 +323,10 @@ func (o *Orchestrator) Stop() error {
 }
 
 func (o *Orchestrator) analyzePatterns(ctx context.Context) {
+	if !o.isIdle() {
+		return
+	}
+
 	events := o.proactive.AnalyzePatterns()
 	for _, event := range events {
 		if event.Priority >= 2 {
@@ -326,7 +336,7 @@ func (o *Orchestrator) analyzePatterns(ctx context.Context) {
 }
 
 func (o *Orchestrator) proactiveMonitor(ctx context.Context) {
-	if o.statusValue() != interfaces.StatusIdle {
+	if !o.isIdle() {
 		return
 	}
 
@@ -364,6 +374,10 @@ func (o *Orchestrator) proactiveMonitor(ctx context.Context) {
 }
 
 func (o *Orchestrator) selfImprove(ctx context.Context) {
+	if !o.isIdle() {
+		return
+	}
+
 	analysis := o.meta.AnalyzeStrategy()
 	log.Printf("[SelfImprove] %s", analysis)
 
@@ -557,7 +571,9 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		return o.handleConversation(ctx, text, emotionState, taskType)
 	}
 
+	llmStart := time.Now()
 	response, err := o.react.Execute(ctx, text)
+	observability.RecordStage("llm_react", time.Since(llmStart))
 	if err != nil {
 		// Fallback: direct conversation if ReAct fails
 		log.Printf("[Agent] ReAct failed: %v, falling back to conversation", err)
@@ -663,22 +679,47 @@ func pickGreetingResponse(input string) string {
 	return pool[time.Now().UnixNano()%int64(len(pool))]
 }
 
+func isWordByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+}
+
+// containsWord matches phrase only at word boundaries: substring matching
+// made "display" look like "play" and "newspaper" look like "news".
+func containsWord(text, phrase string) bool {
+	if phrase == "" {
+		return false
+	}
+	for offset := 0; ; {
+		i := strings.Index(text[offset:], phrase)
+		if i < 0 {
+			return false
+		}
+		i += offset
+		end := i + len(phrase)
+		if (i == 0 || !isWordByte(text[i-1])) && (end == len(text) || !isWordByte(text[end])) {
+			return true
+		}
+		offset = i + 1
+	}
+}
+
 // hasCommandTriggers reports whether the utterance looks like a direct
 // command that needs tool execution (ReAct) rather than plain conversation.
+// Clock questions stay here so they reach the local get_system_time tool.
 func hasCommandTriggers(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	triggers := []string{
-		"open ", "launch ", "start ", "stop ", "close ", "quit ",
-		"send ", "type ", "press ", "click ",
-		"search ", "search for", "look up", "google", "weather", "news",
-		"play ", "pause ", "youtube", "download ",
-		"create ", "write a file", "save ", "delete ", "rename ", "move ",
-		"install ", "run ", "execute ", "compile ", "build ",
+		"open", "reopen", "launch", "start", "restart", "reboot", "stop", "close", "quit",
+		"send", "type", "press", "click",
+		"search", "look up", "google", "weather", "news",
+		"play", "pause", "youtube", "download",
+		"create", "write a file", "save", "delete", "remove", "rename", "move",
+		"install", "run", "execute", "compile", "build",
 		"set a timer", "remind me", "set an alarm", "volume", "brightness",
-		"screenshot", "what time", "what's the time",
+		"screenshot", "what time", "what's the time", "whats the time",
 	}
 	for _, t := range triggers {
-		if strings.Contains(lower, t) {
+		if containsWord(lower, t) {
 			return true
 		}
 	}
@@ -997,11 +1038,13 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	}
 
 	var streamErr error
+	llmStart := time.Now()
 	if useChat {
 		streamErr = o.llm.(interfaces.ChatStreamer).StreamChat(ctx, chatMessages, o.genOpts, onChunk)
 	} else {
 		streamErr = o.llm.Stream(ctx, fullPrompt, o.genOpts, onChunk)
 	}
+	observability.RecordStage("llm", time.Since(llmStart))
 	if streamErr != nil && ctx.Err() == nil {
 		// Finalize the browser transcript even on failure so the companion
 		// UI doesn't stay stuck in streaming state.
@@ -1154,14 +1197,13 @@ func needsWebLookup(lower string) bool {
 	lower = strings.ToLower(strings.TrimSpace(lower))
 	// Self-referential questions about Mai herself are answered by the system
 	// prompt ("You are Mai.") — never search the web for her own name, identity,
-	// or personality. Without this, "what is your name?" triggers a lookup on
-	// "what is" and steers her to answer from web results instead of herself.
+	// or personality, so she never answers from web results instead of herself.
 	for _, self := range []string{
 		"your name", "what is your", "what's your", "who are you",
 		"who're you", "who is mai", "who's mai", "tell me about yourself",
 		"about you", "yourself", "what are you", "what do you do",
 	} {
-		if strings.Contains(lower, self) {
+		if containsWord(lower, self) {
 			return false
 		}
 	}
@@ -1170,7 +1212,20 @@ func needsWebLookup(lower string) bool {
 		"you love", "you like", "are you", "do you like", "what about you",
 		"you feel", "you mad", "you sad", "you happy", "you doing",
 	} {
-		if strings.Contains(lower, social) {
+		if containsWord(lower, social) {
+			return false
+		}
+	}
+	// Clock/calendar questions are answered by the local get_system_time tool;
+	// web_research would add a network round-trip to an answer Mai already has.
+	for _, local := range []string{
+		"what time", "what's the time", "whats the time", "is the time",
+		"time is it", "tell me the time", "current time",
+		"what's the date", "whats the date", "is the date", "date is it",
+		"today's date", "todays date", "what day is it", "day is it",
+		"current date",
+	} {
+		if containsWord(lower, local) {
 			return false
 		}
 	}
@@ -1179,17 +1234,19 @@ func needsWebLookup(lower string) bool {
 		"news", "this week", "this month", "this year", "released",
 		"came out", "score", "weather", "top song", "popular in", "in vogue",
 	} {
-		if strings.Contains(lower, kw) {
+		if containsWord(lower, kw) {
 			return true
 		}
 	}
+	// Bare "what is"/"what's" matched ordinary conversation; require a
+	// research-shaped phrase so only entity and factual lookups go online.
 	for _, p := range []string{
 		"who is", "who's", "who was", "who played", "who plays",
-		"what is", "what's", "what are", "what does", "which ",
-		"where is", "when did", "when was", "tell me about",
-		"look up", "search for", "google ",
+		"what is the", "what's the", "what was the", "what are the",
+		"which is the", "which was the", "where is", "when did", "when was",
+		"tell me about", "look up", "search for", "google",
 	} {
-		if strings.Contains(lower, p) {
+		if containsWord(lower, p) {
 			return true
 		}
 	}
@@ -1748,6 +1805,21 @@ func (o *Orchestrator) statusValue() interfaces.AgentStatus {
 		return interfaces.StatusIdle
 	}
 	return s
+}
+
+// isIdle gates background work: a local LLM serves one request at a time, so
+// proactive analysis, memory summarization, or TTS during a turn stalls the
+// user's reply. The interrupt manager's flags cover the gap before HandleInput
+// flips status and after it resets it while audio is still playing.
+func (o *Orchestrator) isIdle() bool {
+	if o.statusValue() != interfaces.StatusIdle {
+		return false
+	}
+	if o.interrupts == nil {
+		return true
+	}
+	speaking, processing := o.interrupts.State()
+	return !speaking && !processing
 }
 
 func (o *Orchestrator) handleTranscription(event interfaces.Event) {
