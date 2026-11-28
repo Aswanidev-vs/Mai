@@ -11,6 +11,25 @@
     gap: 16px;
 }
 
+/* Live speech caption — one replaceable line, not a chat message. */
+.asr-caption {
+    min-height: 28px;
+    margin: 0 20px 8px;
+    padding: 6px 12px;
+    border-radius: 8px;
+    background: rgba(12, 12, 20, 0.72);
+    color: var(--text-secondary);
+    font-size: 13px;
+    text-align: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 160ms ease;
+}
+
+.asr-caption.visible {
+    opacity: 1;
+}
+
 /* Welcome */
 .welcome-message {
     display: flex;

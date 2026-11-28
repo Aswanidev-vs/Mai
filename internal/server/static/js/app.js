@@ -138,10 +138,27 @@ ws.on('companion.phase', (params) => {
     currentPhase = phase;
     character.setPhase(phase);
     character.setUserSpeaking(phase === 'listening' || phase === 'wake');
+    if (phase === 'wake') showCaption('I'm here', true);
 });
 
-ws.on('asr.partial', () => character.setUserSpeaking(true));
-ws.on('asr.final', () => character.setUserSpeaking(false));
+const asrCaption = document.getElementById('asrCaption');
+let asrCaptionTimer = null;
+function showCaption(text, final) {
+    if (!asrCaption) return;
+    asrCaption.textContent = text || '';
+    asrCaption.classList.add('visible');
+    clearTimeout(asrCaptionTimer);
+    if (final) asrCaptionTimer = setTimeout(() => asrCaption.classList.remove('visible'), 2200);
+}
+
+ws.on('asr.partial', (params) => {
+    character.setUserSpeaking(true);
+    showCaption(params.text, false);
+});
+ws.on('asr.final', (params) => {
+    character.setUserSpeaking(false);
+    showCaption(params.text, true);
+});
 
 // A reconnecting client resumes the same moment rather than snapping to neutral.
 ws.on('companion.presence', (params) => {
