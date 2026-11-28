@@ -27,6 +27,17 @@ func TestHandleMetricsExposesStagePercentiles(t *testing.T) {
 	assert.Contains(t, body, "latency_ms{operation=asr}_p50")
 }
 
+func TestHubKeepsPresenceSnapshot(t *testing.T) {
+	hub := NewHub()
+	assert.Empty(t, hub.Presence().Phase)
+	hub.SetPresence(PresenceParams{Phase: "speaking", Emotion: "happy", Intensity: 0.7, TurnID: "t9"})
+
+	got := hub.Presence()
+	assert.Equal(t, "speaking", got.Phase)
+	assert.Equal(t, "happy", got.Emotion)
+	assert.Equal(t, "t9", got.TurnID)
+}
+
 func TestBroadcastNotificationCarriesTurnID(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()

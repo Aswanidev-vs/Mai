@@ -42,6 +42,23 @@ type Hub struct {
 	eventBus      interfaces.EventBus
 	getStatusFunc func() string
 	onClientGone  func() // called after a client fully disconnects
+
+	presenceMu sync.RWMutex
+	presence   PresenceParams
+}
+
+// SetPresence records the shared avatar state so a browser or overlay that
+// reconnects resumes the same moment instead of snapping back to neutral.
+func (h *Hub) SetPresence(p PresenceParams) {
+	h.presenceMu.Lock()
+	h.presence = p
+	h.presenceMu.Unlock()
+}
+
+func (h *Hub) Presence() PresenceParams {
+	h.presenceMu.RLock()
+	defer h.presenceMu.RUnlock()
+	return h.presence
 }
 
 func NewHub() *Hub {

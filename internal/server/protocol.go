@@ -71,6 +71,7 @@ const (
 	NotifAutomation    = "companion.automation"
 	NotifPhase         = "companion.phase"
 	NotifProsody       = "companion.prosody"
+	NotifPresence      = "companion.presence"
 	// NotifPartialTranscript carries an in-progress ASR result (final=false) and
 	// NotifFinalTranscript the authoritative one for the utterance (final=true).
 	NotifPartialTranscript = "asr.partial"
@@ -105,6 +106,16 @@ type AutomationPhaseParams struct {
 type PhaseParams struct {
 	Phase  string `json:"phase"`
 	TurnID string `json:"turn_id,omitempty"`
+}
+
+// PresenceParams is the small snapshot a reconnecting client needs to resume
+// the same moment: where Mai is in the turn and how she is feeling.
+type PresenceParams struct {
+	Phase     string  `json:"phase"`
+	Emotion   string  `json:"emotion,omitempty"`
+	Intensity float64 `json:"intensity,omitempty"`
+	Target    string  `json:"target,omitempty"`
+	TurnID    string  `json:"turn_id,omitempty"`
 }
 
 // ProsodyParams carries measured speech features for one sentence so the

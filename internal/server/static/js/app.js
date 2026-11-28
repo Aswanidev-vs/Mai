@@ -143,6 +143,15 @@ ws.on('companion.phase', (params) => {
 ws.on('asr.partial', () => character.setUserSpeaking(true));
 ws.on('asr.final', () => character.setUserSpeaking(false));
 
+// A reconnecting client resumes the same moment rather than snapping to neutral.
+ws.on('companion.presence', (params) => {
+    if (params.emotion) character.setEmotion(params.emotion, params.intensity || 0.5);
+    if (params.phase && params.phase !== currentPhase) {
+        currentPhase = params.phase;
+        character.setPhase(params.phase);
+    }
+});
+
 // Measured prosody reshapes the viseme timeline for the next sentence.
 ws.on('companion.prosody', (params) => character.setProsody(params));
 

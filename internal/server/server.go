@@ -155,6 +155,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	raw := fmt.Sprintf(`{"method":"status.changed","params":{"status":"%s"}}`, status)
 	s.hub.SendToClient(client, []byte(raw))
+
+	// Catch a reconnecting browser or overlay up on the current moment.
+	if presence, err := json.Marshal(s.hub.Presence()); err == nil {
+		msg := WSMessage{Method: NotifPresence, Params: presence}
+		if data, err := json.Marshal(msg); err == nil {
+			s.hub.SendToClient(client, data)
+		}
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

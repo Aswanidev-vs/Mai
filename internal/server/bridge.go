@@ -81,6 +81,9 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 			Emotion:   emotion,
 			Intensity: intensity,
 		}, event.TurnID)
+		p := b.hub.Presence()
+		p.Emotion, p.Intensity = emotion, intensity
+		b.hub.SetPresence(p)
 	})
 
 	// TTS audio chunks → WS clients (browser-side lip sync; muted chunks are
@@ -139,6 +142,9 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		}
 		turnID, _ := event.Payload["turn_id"].(string)
 		b.hub.BroadcastNotification(NotifPhase, PhaseParams{Phase: phase, TurnID: turnID}, event.TurnID)
+		p := b.hub.Presence()
+		p.Phase, p.TurnID = phase, turnID
+		b.hub.SetPresence(p)
 	})
 
 	// Measured speech prosody → viseme timing and head motion.
@@ -199,6 +205,9 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		}
 		log.Printf("[BRIDGE] Automation phase → overlay: %s/%s", phase.Phase, phase.Target)
 		b.hub.BroadcastNotification(NotifAutomation, phase, event.TurnID)
+		p := b.hub.Presence()
+		p.Target = phase.Target
+		b.hub.SetPresence(p)
 	})
 
 	log.Println("[BRIDGE] Event bus bridge active")
