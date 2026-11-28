@@ -144,7 +144,7 @@ ws.on('companion.phase', (params) => {
     currentPhase = phase;
     character.setPhase(phase);
     character.setUserSpeaking(phase === 'listening' || phase === 'wake');
-    if (phase === 'wake') showCaption('I'm here', true);
+    if (phase === 'wake') showCaption("I'm here", true);
 });
 
 const asrCaption = document.getElementById('asrCaption');
