@@ -154,7 +154,7 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 		prompt := r.buildPrompt(goal, steps)
 
 		// Generate the next step
-		response, err := r.llm.GenerateStructured(ctx, prompt, json.RawMessage(`{
+		response, err := r.llm.GenerateStructured(iterCtx, prompt, json.RawMessage(`{
 			"type": "object",
 			"properties": {
 				"thought": { "type": "string" },
@@ -222,7 +222,7 @@ func (r *ReActLoop) Execute(ctx context.Context, goal string) (string, error) {
 			callHistory = append(callHistory, currentCall)
 			log.Printf("[ReAct] Action: %s(%s)", step.Action, step.ActionInput)
 
-			result, err := r.registry.Execute(ctx, step.Action, step.ActionInput)
+			result, err := r.registry.Execute(iterCtx, step.Action, step.ActionInput)
 			if err != nil {
 				step.Observation = fmt.Sprintf("Error: %v", err)
 				log.Printf("[ReAct] Tool error: %v", err)

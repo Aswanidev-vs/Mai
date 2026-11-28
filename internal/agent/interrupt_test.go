@@ -196,6 +196,29 @@ func TestOrchestrator_StopAtBoundaryCancelsTurnOnce(t *testing.T) {
 	o.stopAtBoundary() // second call is a no-op, not a second cancel
 }
 
+// A finishing turn must not clear the cancel of the turn that replaced it.
+func TestOrchestrator_TurnCancelGeneration(t *testing.T) {
+	o := &Orchestrator{}
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	genA := o.setTurnCancel(cancelA)
+
+	ctxB, cancelB := context.WithCancel(context.Background())
+	defer cancelB()
+	genB := o.setTurnCancel(cancelB)
+
+	o.clearTurnCancel(genA)
+	o.InterruptCurrent()
+	assert.NoError(t, ctxA.Err(), "the superseded turn must not be cancelled again")
+	assert.Error(t, ctxB.Err(), "the current turn must still be cancellable")
+
+	o.clearTurnCancel(genB)
+	ctxC, cancelC := context.WithCancel(context.Background())
+	defer cancelC()
+	o.InterruptCurrent()
+	assert.NoError(t, ctxC.Err(), "a cleared turn must not hold a stale cancel")
+}
+
 func TestClassifyInterruptLevels(t *testing.T) {
 	assert.Equal(t, InterruptCritical, ClassifyInterrupt("this is an emergency"))
 	assert.Equal(t, InterruptHigh, ClassifyInterrupt("cancel that"))

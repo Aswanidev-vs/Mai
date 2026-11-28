@@ -47,7 +47,8 @@ type Orchestrator struct {
 	genOpts interfaces.GenerationOptions
 
 	turnMu        sync.Mutex
-	currentCancel context.CancelFunc // cancels the in-flight LLM stream (barge-in)
+	currentCancel context.CancelFunc // cancels the in-flight turn (barge-in), including ReAct
+	turnGen       uint64             // a finishing turn must not clear a newer one's cancel
 
 	// status is read from the server's request goroutines while HandleInput
 	// writes it, so it is stored atomically rather than as a plain field.
@@ -984,11 +985,11 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	// completed sentence as it is produced, so audio starts before the full
 	// answer exists; compatibility mode defers TTS until the stream completes.
 	ctx, cancel := context.WithCancel(ctx)
-	o.setTurnCancel(cancel)
+	gen := o.setTurnCancel(cancel)
 	o.softStop.Store(false)
 	defer func() {
 		cancel()
-		o.setTurnCancel(nil)
+		o.clearTurnCancel(gen)
 	}()
 	// Close the TTS turn on every exit path — normal end, stream error, and
 	// barge-in — so the player always learns that no further sentences follow
@@ -1086,7 +1087,11 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 				},
 			})
 		}
-		return &interfaces.AgentResponse{Text: strings.TrimSpace(full.String()), Success: true, Spoken: false}, nil
+		// Text stays empty: handleTranscription turns a non-spoken response into
+		// an action.tts.request, so returning the full draft here would make Mai
+		// speak the words the user just cut off. The heard prefix already went
+		// into conversation history via recordTruncatedTurn above.
+		return &interfaces.AgentResponse{Text: "", Success: true, Spoken: false}, nil
 	}
 	// Flush any trailing text that didn't end on a sentence boundary.
 	if rem := cleanResponse(pending.String()); strings.TrimSpace(rem) != "" {
@@ -1542,15 +1547,26 @@ func (o *Orchestrator) SetTTSBaseSpeed(speed float32) {
 	o.ttsAdapter.SetBaseSpeed(speed)
 }
 
-// setTurnCancel stores the cancel func for the current generation turn so a
-// barge-in can abort the in-flight LLM stream.
-func (o *Orchestrator) setTurnCancel(c context.CancelFunc) {
+// setTurnCancel stores the cancel func for the current turn so a barge-in can
+// abort the in-flight LLM stream or ReAct tool call. The generation token keeps
+// an older turn from clearing a newer turn's cancel when it finishes.
+func (o *Orchestrator) setTurnCancel(c context.CancelFunc) uint64 {
 	o.turnMu.Lock()
 	defer o.turnMu.Unlock()
+	o.turnGen++
 	o.currentCancel = c
+	return o.turnGen
 }
 
-// InterruptCurrent cancels the in-flight LLM stream (called on barge-in).
+func (o *Orchestrator) clearTurnCancel(gen uint64) {
+	o.turnMu.Lock()
+	defer o.turnMu.Unlock()
+	if o.turnGen == gen {
+		o.currentCancel = nil
+	}
+}
+
+// InterruptCurrent cancels the in-flight turn, LLM stream or ReAct tool call (called on barge-in).
 func (o *Orchestrator) InterruptCurrent() {
 	o.turnMu.Lock()
 	c := o.currentCancel
@@ -1831,7 +1847,17 @@ func (o *Orchestrator) handleTranscription(event interfaces.Event) {
 	// NOTE: no Working().Add here — HandleInput records the user input once
 	// (working + episodic). Adding again here would double every voice turn
 	// in the ring and trigger compaction prematurely.
-	resp, err := o.HandleInput(context.Background(), map[string]interface{}{"text": text})
+	//
+	// Register the turn cancel before routing: the conversation path derives
+	// its stream context from this one, and the ReAct path uses it directly,
+	// so a barge-in can stop tool execution too.
+	turnCtx, cancel := context.WithCancel(context.Background())
+	gen := o.setTurnCancel(cancel)
+	defer func() {
+		cancel()
+		o.clearTurnCancel(gen)
+	}()
+	resp, err := o.HandleInput(turnCtx, map[string]interface{}{"text": text})
 	if err != nil {
 		log.Printf("[Agent] Error handling input: %v", err)
 		return

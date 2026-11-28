@@ -3,6 +3,7 @@ package cognition
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,6 +12,34 @@ import (
 
 	"github.com/user/mai/pkg/interfaces"
 )
+
+// deadlineLLM reports whether the ReAct loop applied its per-iteration timeout
+// to the LLM call. A parent context with no deadline must still produce one.
+type deadlineLLM struct{}
+
+func (*deadlineLLM) Generate(context.Context, string, interfaces.GenerationOptions) (string, error) {
+	return "", fmt.Errorf("not implemented")
+}
+func (*deadlineLLM) Stream(context.Context, string, interfaces.GenerationOptions, func(string)) error {
+	return fmt.Errorf("not implemented")
+}
+func (*deadlineLLM) Embed(context.Context, string) ([]float32, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+func (*deadlineLLM) HealthCheck(context.Context) error { return nil }
+func (*deadlineLLM) GenerateStructured(ctx context.Context, _ string, _ json.RawMessage) (json.RawMessage, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		return nil, fmt.Errorf("iteration deadline was not passed to GenerateStructured")
+	}
+	return json.RawMessage(`{"final_answer":"ok"}`), nil
+}
+
+func TestReActLoop_AppliesIterationDeadlineToLLM(t *testing.T) {
+	loop := NewReActLoop(&deadlineLLM{}, &mockToolRegistry{}, nil)
+	answer, err := loop.Execute(context.Background(), "hello")
+	require.NoError(t, err)
+	assert.Equal(t, "ok", answer)
+}
 
 // Mock types for testing
 
