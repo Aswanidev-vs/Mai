@@ -5,13 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/user/mai/pkg/interfaces"
 )
 
-// ShellTool provides shell execution capabilities
-type ShellTool struct{}
+// ShellTool provides shell execution capabilities. Allowed, when non-empty,
+// restricts the first command token to a fixed set; Confirm adds an explicit
+// approval gate for every request.
+type ShellTool struct {
+	Allowed []string
+	Confirm func(command string) bool
+}
 
 func (t *ShellTool) Metadata() interfaces.ToolMetadata {
 	params := json.RawMessage(`{
@@ -45,6 +52,26 @@ func (t *ShellTool) Execute(ctx context.Context, params json.RawMessage) (interf
 
 	if err := json.Unmarshal(params, &args); err != nil {
 		return interfaces.ToolResult{}, err
+	}
+	if strings.TrimSpace(args.Command) == "" {
+		return interfaces.ToolResult{Error: fmt.Errorf("shell_execute requires a command")}, nil
+	}
+	if len(t.Allowed) > 0 {
+		fields := strings.Fields(args.Command)
+		verb := strings.ToLower(filepath.Base(fields[0]))
+		permitted := false
+		for _, name := range t.Allowed {
+			if verb == strings.ToLower(name) {
+				permitted = true
+				break
+			}
+		}
+		if !permitted {
+			return interfaces.ToolResult{Error: fmt.Errorf("command %q is not in the shell allowlist", verb)}, nil
+		}
+	}
+	if t.Confirm != nil && !t.Confirm(args.Command) {
+		return interfaces.ToolResult{Output: "Command cancelled: no confirmation."}, nil
 	}
 
 	var cmd *exec.Cmd

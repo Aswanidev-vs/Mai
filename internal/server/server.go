@@ -154,7 +154,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		status = s.getStatus()
 	}
 	raw := fmt.Sprintf(`{"method":"status.changed","params":{"status":"%s"}}`, status)
-	client.send <- outboundMessage{data: []byte(raw)}
+	s.hub.SendToClient(client, []byte(raw))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

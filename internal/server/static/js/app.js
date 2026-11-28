@@ -3,7 +3,13 @@
 const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const wsUrl = `${wsProtocol}//${location.host}/ws`;
 
-const ws = new WSClient(wsUrl);
+// Auth token comes from the page URL once, then persists locally. The server
+// wraps every route when server.token is set, so the WS upgrade needs it too.
+const urlToken = new URLSearchParams(location.search).get('token');
+if (urlToken) localStorage.setItem('mai-ws-token', urlToken);
+const wsToken = urlToken || localStorage.getItem('mai-ws-token') || '';
+
+const ws = new WSClient(wsUrl, wsToken);
 const chat = new ChatUI();
 const audio = new AudioPlayer();
 const character = new CharacterRenderer('characterContainer');

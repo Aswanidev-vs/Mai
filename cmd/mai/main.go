@@ -1394,7 +1394,7 @@ func main() {
 		// Tools. WhatsApp is registered as a guarded fallback; see
 		// registerBuiltinTools and the message-workflow comment above.
 		registry := tools.NewRegistry()
-		registerBuiltinTools(registry, auto)
+		registerBuiltinTools(registry, auto, cfg)
 
 		// MCP — auto-discover tools from configured servers
 		if cfg.MCP.Enabled {

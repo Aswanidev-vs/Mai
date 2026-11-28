@@ -97,6 +97,21 @@ func hybrid(local, cloud interfaces.LLMProvider) *HybridProvider {
 	return NewHybridProvider(local, cloud, privacyGuard())
 }
 
+func TestHybridProvider_BlockCloudLatchesToLocal(t *testing.T) {
+	local, cloud := newChatStub("local"), newChatStub("cloud")
+	p := NewHybridProvider(local, cloud, privacyGuard(), true)
+	sensitive := []interfaces.ChatMessage{{Role: "user", Content: "my salary is secret"}}
+
+	require.NoError(t, p.StreamChat(context.Background(), sensitive, interfaces.GenerationOptions{}, func(string) {}))
+	assert.Equal(t, []string{"StreamChat"}, local.methodCalls())
+
+	// Once blocked, an ordinary follow-up must stay local too.
+	plain := []interfaces.ChatMessage{{Role: "user", Content: "what's the weather?"}}
+	require.NoError(t, p.StreamChat(context.Background(), plain, interfaces.GenerationOptions{}, func(string) {}))
+	assert.Len(t, local.methodCalls(), 2)
+	assert.Empty(t, cloud.methodCalls())
+}
+
 func TestHybridProvider_StreamChatRoutesByPrivacy(t *testing.T) {
 	local, cloud := newChatStub("local"), newChatStub("cloud")
 	p := hybrid(local, cloud)

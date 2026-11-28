@@ -534,6 +534,10 @@ privacy:
 
 agentic:
   enabled: true # Set to true to enable high-autonomy JARVIS mode
+  # Host-modifying tools are opt-in: web content can steer the model, so leaving
+  # these off keeps prompt injection from becoming code execution or file writes.
+  allow_shell: false
+  allow_file_write: false
 
 mcp:
   enabled: false

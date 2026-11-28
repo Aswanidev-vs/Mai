@@ -285,7 +285,9 @@ type Config struct {
 		Threshold      float64 `yaml:"threshold"`       // 0.5=lenient, 0.7=balanced, 0.85=strict
 	} `yaml:"speaker_id"`
 	Agentic struct {
-		Enabled bool `yaml:"enabled"`
+		Enabled        bool `yaml:"enabled"`
+		AllowShell     bool `yaml:"allow_shell"`      // opt-in: shell_execute is off by default
+		AllowFileWrite bool `yaml:"allow_file_write"` // opt-in: file_write is off by default
 	} `yaml:"agentic"`
 	MCP struct {
 		Enabled bool     `yaml:"enabled"`

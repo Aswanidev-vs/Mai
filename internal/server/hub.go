@@ -163,6 +163,10 @@ func (h *Hub) BroadcastBinary(frame []byte) {
 
 // SendToClient sends a message to a specific client.
 func (h *Hub) SendToClient(client *Client, data []byte) {
+	// Eviction closes client.send under h.mu; hold the read lock across the
+	// send so a direct reply can never race it and panic on a closed channel.
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	select {
 	case client.send <- outboundMessage{data: data}:
 	default:

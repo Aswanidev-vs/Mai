@@ -1317,7 +1317,10 @@ class VirtualOverlay {
             return;
         }
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        this.ws = new WSClient(`${proto}//${location.host}/ws`);
+        const urlToken = new URLSearchParams(location.search).get('token');
+        if (urlToken) localStorage.setItem('mai-ws-token', urlToken);
+        const token = urlToken || localStorage.getItem('mai-ws-token') || '';
+        this.ws = new WSClient(`${proto}//${location.host}/ws`, token);
 
         this.ws.on('emotion.detected', (params) => {
             const emotion = params?.emotion || 'calm';

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/user/mai/internal/tools"
+	"github.com/user/mai/pkg/models"
 )
 
 // TestBuiltinToolRegistryIncludesGuardedWhatsAppSend verifies that the LLM can
@@ -12,7 +13,9 @@ import (
 // confirmation guards visible to the model.
 func TestBuiltinToolRegistryIncludesGuardedWhatsAppSend(t *testing.T) {
 	registry := tools.NewRegistry()
-	registerBuiltinTools(registry, &Automation{})
+	cfg := models.Config{}
+	cfg.Agentic.AllowShell = true
+	registerBuiltinTools(registry, &Automation{}, cfg)
 
 	sawShell := false
 	sawWhatsApp := false
@@ -35,5 +38,16 @@ func TestBuiltinToolRegistryIncludesGuardedWhatsAppSend(t *testing.T) {
 	}
 	if !sawWhatsApp {
 		t.Fatal("expected whatsapp_send to be registered as a guarded fallback")
+	}
+}
+
+func TestBuiltinToolsRequireOptInForHostModification(t *testing.T) {
+	registry := tools.NewRegistry()
+	registerBuiltinTools(registry, &Automation{}, models.Config{})
+
+	for _, meta := range registry.List() {
+		if meta.Name == "shell_execute" || meta.Name == "file_write" {
+			t.Fatalf("%s must be opt-in, but was registered by default", meta.Name)
+		}
 	}
 }
