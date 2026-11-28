@@ -1092,7 +1092,7 @@ class VirtualOverlay {
         const energy = 0.6 + variance * 0.8;
         this.statusPoseTarget = {
             pitch: cfg.pose.pitch * energy,
-            yaw: cfg.pose.yaw * energy,
+            yaw: cfg.pose.yaw * energy + (this.attentionYaw || 0),
             roll: cfg.pose.roll * energy,
         };
         // The status expression is a gentle baseline; emotions override it.
@@ -1555,6 +1555,10 @@ class VirtualOverlay {
                 this.clickThrough = !!evt.on;
                 console.log('[VIRTUAL] click-through:', this.clickThrough);
                 break;
+            case 'foregroundRect':
+                // Glance toward the active window, within a small head-angle budget.
+                this.attentionYaw = Math.max(-0.18, Math.min(0.18, (Number(evt.x) || 0) * 0.18));
+                break;
             default:
                 console.log('[VIRTUAL] host event:', evt);
         }
@@ -1869,4 +1873,8 @@ const readyCheck = setInterval(() => {
     while (pendingHostEvents.length) {
         hostEventTarget(pendingHostEvents.shift());
     }
+    // Keep the attention target current even when the foreground window changes
+    // while Mai is idle.
+    hostSend('getForegroundRect');
+    setInterval(() => hostSend('getForegroundRect'), 2000);
 }, 100);

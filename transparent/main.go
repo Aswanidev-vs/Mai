@@ -1022,6 +1022,23 @@ func (h *overlayHost) onHostCall(method, params string) {
 		h.dispatch(func() { h.endDrag() })
 	case "perchOnForeground":
 		h.dispatch(func() { h.perchOnForeground() })
+	case "getForegroundRect":
+		h.dispatch(func() {
+			r, ok := foregroundRect()
+			if !ok {
+				return
+			}
+			left, _, screenW, _ := virtualScreenBounds()
+			if screenW <= 0 {
+				return
+			}
+			centerX := float64(r.Left+r.Right) / 2
+			normalized := (centerX-float64(left))/float64(screenW)*2 - 1
+			h.emitToPage(map[string]any{
+				"event": "foregroundRect",
+				"x":     normalized,
+			})
+		})
 	case "setClickThrough":
 		var p struct {
 			On bool `json:"on"`

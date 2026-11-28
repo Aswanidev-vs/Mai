@@ -206,6 +206,7 @@ class CharacterRenderer {
         this.lastInteraction = performance.now();
         this.userTyping = false;
         this.userPresent = false;
+        this.userSpeaking = false;
         this.postureHead = { pitch: 0, yaw: 0, roll: 0 };  // smoothed emotion/life offsets
         this.idleBehaviorTimer = this._rand(IDLE_BEHAVIOR_MIN, IDLE_BEHAVIOR_MAX);
         this.idleBehavior = null;      // { type, t, dur }
@@ -1465,6 +1466,13 @@ class CharacterRenderer {
             }
         }
 
+        // Voice is the strongest attention cue: look at the mic/user while
+        // they are speaking, even if the cursor is elsewhere.
+        if (this.userSpeaking && this.gazeWander < 0.5) {
+            this.gazePoint.x = lerp(this.gazePoint.x, this.defaultLookAt.x - 0.12, 0.14);
+            this.gazePoint.y = lerp(this.gazePoint.y, this.defaultLookAt.y + 0.04, 0.14);
+        }
+
         // If the user is typing, glance toward where they are (camera-left of her view).
         if (this.userTyping && this.gazeWander < 0.5) {
             this.gazePoint.x = lerp(this.gazePoint.x, this.defaultLookAt.x - 0.35, 0.08);
@@ -1879,6 +1887,14 @@ class CharacterRenderer {
                 this.breathScale = 1;
                 this.agentStatus = 'idle';
                 break;
+        }
+    }
+
+    setUserSpeaking(b) {
+        this.userSpeaking = !!b;
+        if (this.userSpeaking) {
+            this.gazeWander = 0;
+            this.breathScale = 1.1;
         }
     }
 

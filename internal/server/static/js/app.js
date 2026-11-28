@@ -137,7 +137,11 @@ ws.on('companion.phase', (params) => {
     if (phase === currentPhase) return;
     currentPhase = phase;
     character.setPhase(phase);
+    character.setUserSpeaking(phase === 'listening' || phase === 'wake');
 });
+
+ws.on('asr.partial', () => character.setUserSpeaking(true));
+ws.on('asr.final', () => character.setUserSpeaking(false));
 
 // Measured prosody reshapes the viseme timeline for the next sentence.
 ws.on('companion.prosody', (params) => character.setProsody(params));
