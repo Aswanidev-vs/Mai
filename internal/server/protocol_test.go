@@ -36,6 +36,24 @@ func TestPartialTranscriptParamsJSONShape(t *testing.T) {
 	}
 }
 
+func TestPresenceParamsJSONShape(t *testing.T) {
+	data, err := json.Marshal(PresenceParams{Phase: "thinking", Emotion: "calm", Intensity: 0.4, Target: "chrome", TurnID: "t3"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"phase":"thinking","emotion":"calm","intensity":0.4,"target":"chrome","turn_id":"t3"}`, string(data))
+}
+
+func TestProsodyParamsJSONShape(t *testing.T) {
+	data, err := json.Marshal(ProsodyParams{PauseRatio: 0.4, PitchVariance: 0.7, RMS: 0.2, TurnID: "t1"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"pause_ratio":0.4,"pitch_variance":0.7,"rms":0.2,"turn_id":"t1"}`, string(data))
+}
+
+func TestPhaseParamsCarriesPhaseAndTurn(t *testing.T) {
+	data, err := json.Marshal(PhaseParams{Phase: "thinking", TurnID: "t42"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"phase":"thinking","turn_id":"t42"}`, string(data))
+}
+
 func TestPartialTranscriptFinalDistinguishableFromInterim(t *testing.T) {
 	interim, err := json.Marshal(PartialTranscriptParams{Text: "mai are you"})
 	require.NoError(t, err)

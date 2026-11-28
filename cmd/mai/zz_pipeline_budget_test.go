@@ -165,7 +165,8 @@ func TestPipelineBudget(t *testing.T) {
 	kwsConfig.ModelConfig.Tokens = resolve(join(cfg.KWS.ModelDir, cfg.KWS.Tokens))
 	kwsConfig.KeywordsBuf = splitKeywords(cfg.KWS.Keywords, "\n")
 	kwsConfig.KeywordsBufSize = len(kwsConfig.KeywordsBuf)
-	kwsConfig.KeywordsThreshold = cfg.KWS.Threshold
+	// sherpa's fallback for a keyword without its own "#" threshold.
+	kwsConfig.KeywordsThreshold = 0.25
 	kwsConfig.ModelConfig.NumThreads = cfg.KWS.NumThreads
 	kwsConfig.ModelConfig.Provider = cfg.KWS.Provider
 	spotter := sherpa.NewKeywordSpotter(&kwsConfig)

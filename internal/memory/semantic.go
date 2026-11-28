@@ -13,6 +13,12 @@ import (
 	"github.com/user/mai/pkg/interfaces"
 )
 
+// maxSemanticEntries bounds both RAM and the on-disk snapshot. Older facts are
+// dropped first; the episodic store keeps the verbatim history.
+const maxSemanticEntries = 2000
+
+const compactEvery = 256
+
 type vectorEntry struct {
 	Fact   interfaces.MemoryEntry `json:"fact"`
 	Vector []float32              `json:"vector"`
@@ -68,7 +74,19 @@ func (s *SemanticStore) AddFact(entry interfaces.MemoryEntry) error {
 	s.entries = append(s.entries, vectorEntry{Fact: entry, Vector: embedding})
 
 	// Append-only write — O(1) instead of O(n)
-	return s.appendJSONL(s.entries[len(s.entries)-1])
+	if err := s.appendJSONL(s.entries[len(s.entries)-1]); err != nil {
+		return err
+	}
+	// Fold the tail into the snapshot periodically so the JSONL cannot grow
+	// without bound and a restart does not have to replay thousands of lines.
+	if len(s.entries)%compactEvery == 0 {
+		return s.compactLocked()
+	}
+	if len(s.entries) > maxSemanticEntries {
+		s.entries = append([]vectorEntry(nil), s.entries[len(s.entries)-maxSemanticEntries:]...)
+		return s.compactLocked()
+	}
+	return nil
 }
 
 func (s *SemanticStore) SearchFacts(query string, k int) ([]interfaces.MemoryEntry, error) {
@@ -198,44 +216,66 @@ func (s *SemanticStore) save() error {
 }
 
 func (s *SemanticStore) load() error {
-	// Try main JSON first (fast path)
-	data, err := os.ReadFile(s.filePath)
-	if err == nil && len(data) > 2 {
-		if err := json.Unmarshal(data, &s.entries); err == nil && len(s.entries) > 0 {
-			return nil
+	// The snapshot used to win outright, so facts appended to the JSONL tail
+	// were invisible until someone deleted the JSON. Merge both sources and
+	// dedupe by ID instead.
+	var merged []vectorEntry
+	seen := make(map[string]bool)
+	add := func(entry vectorEntry) {
+		key := entry.Fact.ID
+		if key == "" {
+			key = entry.Fact.Content
+		}
+		if key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		merged = append(merged, entry)
+	}
+
+	if data, err := os.ReadFile(s.filePath); err == nil && len(data) > 2 {
+		var snapshot []vectorEntry
+		if err := json.Unmarshal(data, &snapshot); err == nil {
+			for _, entry := range snapshot {
+				add(entry)
+			}
 		}
 	}
-
-	// Fallback: load from JSONL append file
-	s.entries = make([]vectorEntry, 0)
-	f, err := os.Open(s.jsonlPath)
-	if err != nil {
-		return nil // no data yet — not an error
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB line buffer
-	for scanner.Scan() {
-		var entry vectorEntry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err == nil {
-			s.entries = append(s.entries, entry)
+	if f, err := os.Open(s.jsonlPath); err == nil {
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB line buffer
+		for scanner.Scan() {
+			var entry vectorEntry
+			if err := json.Unmarshal(scanner.Bytes(), &entry); err == nil {
+				add(entry)
+			}
 		}
+		_ = f.Close()
 	}
 
-	// Consolidate to JSON for next load
+	if len(merged) > maxSemanticEntries {
+		merged = append([]vectorEntry(nil), merged[len(merged)-maxSemanticEntries:]...)
+	}
+	s.entries = merged
 	if len(s.entries) > 0 {
-		_ = s.save()
+		return s.compactLocked()
 	}
 	return nil
+}
+
+// compactLocked folds the append-only tail into the snapshot and truncates it.
+func (s *SemanticStore) compactLocked() error {
+	if err := s.save(); err != nil {
+		return err
+	}
+	return os.WriteFile(s.jsonlPath, nil, 0644)
 }
 
 // Compact rewrites the JSON from JSONL. Call periodically.
 func (s *SemanticStore) Compact() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.load()
-	return s.save()
+	return s.load()
 }
 
 func cosineSimilarity(a, b []float32) float64 {

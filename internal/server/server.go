@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/gorilla/websocket"
+	"github.com/user/mai/internal/observability"
 	"github.com/user/mai/pkg/interfaces"
 )
 
@@ -76,6 +78,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/ws", s.handleWS)
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/state", s.handleState)
+	mux.HandleFunc("/api/metrics", s.handleMetrics)
 
 	staticDir := filepath.Join(".", "internal", "server", "static")
 	mux.Handle("/", http.FileServer(http.Dir(staticDir)))
@@ -151,7 +154,15 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		status = s.getStatus()
 	}
 	raw := fmt.Sprintf(`{"method":"status.changed","params":{"status":"%s"}}`, status)
-	client.send <- outboundMessage{data: []byte(raw)}
+	s.hub.SendToClient(client, []byte(raw))
+
+	// Catch a reconnecting browser or overlay up on the current moment.
+	if presence, err := json.Marshal(s.hub.Presence()); err == nil {
+		msg := WSMessage{Method: NotifPresence, Params: presence}
+		if data, err := json.Marshal(msg); err == nil {
+			s.hub.SendToClient(client, data)
+		}
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -171,4 +182,13 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		status = s.getStatus()
 	}
 	fmt.Fprintf(w, `{"status":"%s"}`, status)
+}
+
+// handleMetrics exposes stage p50/p95/p99 and counters so latency tuning can
+// start from the stage that actually dominates instead of a guess.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(observability.Snapshot()); err != nil {
+		log.Printf("[SERVER] Metrics encode: %v", err)
+	}
 }

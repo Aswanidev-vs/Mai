@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main, v1]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # The app links sherpa-onnx/onnxruntime through cgo; the runner needs a C compiler.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+      - name: Build
+        shell: msys2 {0}
+        env:
+          CC: gcc
+        run: go build ./cmd/mai ./transparent
+      - name: Vet
+        shell: msys2 {0}
+        env:
+          CC: gcc
+        run: go vet ./cmd/mai ./internal/... ./pkg/... ./transparent
+      - name: Test
+        shell: msys2 {0}
+        env:
+          CC: gcc
+        run: go test ./cmd/mai ./internal/... ./pkg/... ./transparent
+      - name: Race
+        shell: msys2 {0}
+        env:
+          CC: gcc
+        run: go test -race ./internal/... ./pkg/...
+
+  js:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test

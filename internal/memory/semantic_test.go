@@ -137,6 +137,25 @@ func TestSemanticStore_AppendOnlyPersistence(t *testing.T) {
 	assert.Equal(t, 5, len(store2.entries))
 }
 
+func TestSemanticStore_LoadsJSONLTailAlongsideSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	store := NewSemanticStore(&mockLLM{}, dir)
+	require.NoError(t, store.AddFact(interfaces.MemoryEntry{ID: "snapshot", Content: "first", Timestamp: 1}))
+	require.NoError(t, store.Compact())
+
+	tail := vectorEntry{
+		Fact:   interfaces.MemoryEntry{ID: "tail", Content: "second", Timestamp: 2},
+		Vector: []float32{1, 0, 0},
+	}
+	data, err := json.Marshal(tail)
+	require.NoError(t, err)
+	jsonl := filepath.Join(dir, "semantic_vectors.json.jsonl")
+	require.NoError(t, os.WriteFile(jsonl, append(data, '\n'), 0644))
+
+	reopened := NewSemanticStore(&mockLLM{}, dir)
+	assert.Equal(t, 2, reopened.Count(), "facts appended after the snapshot must survive a restart")
+}
+
 func TestSemanticStore_LoadFromJSONL(t *testing.T) {
 	defer goleak.VerifyNone(t)
 

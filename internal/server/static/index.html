@@ -72,6 +72,7 @@
                         <p class="welcome-sub">Your cognitive partner. Ask me anything.</p>
                     </div>
                 </div>
+                <div class="asr-caption" id="asrCaption" aria-live="polite"></div>
                 <div class="chat-input-area">
                     <div class="input-wrapper">
                         <textarea id="chatInput" placeholder="Message Mai..." rows="1"></textarea>
@@ -134,11 +135,21 @@
                         <span class="toggle-slider"></span>
                     </label>
                 </div>
+                <div class="setting-group">
+                    <label class="setting-label" for="settingQuality">Render Quality</label>
+                    <select id="settingQuality" class="setting-select">
+                        <option value="low">Low</option>
+                        <option value="medium" selected>Medium</option>
+                        <option value="high">High</option>
+                    </select>
+                </div>
             </div>
         </aside>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/pixi.js@7.3.3/dist/pixi.min.js"></script>
+    <script src="js/watchdog.js"></script>
+    <script>window.installMaiWatchdog(5000);</script>
     <script src="js/motion3-loader.js"></script>
     <script src="js/utils.js"></script>
     <script src="js/ws-client.js"></script>

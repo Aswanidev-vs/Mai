@@ -117,7 +117,7 @@ func (f *Factory) CreateHybridProvider() (interfaces.LLMProvider, error) {
 
 	// 4. Wrap in HybridProvider with PrivacyGuard
 	guard := agent.NewPrivacyGuard(f.config.Privacy)
-	return NewHybridProvider(local, cloud, guard), nil
+	return NewHybridProvider(local, cloud, guard, f.config.Privacy.BlockCloud), nil
 }
 
 func (f *Factory) createCloudProvider(provider, model, url, apiKey string) (interfaces.LLMProvider, error) {

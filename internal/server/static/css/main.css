@@ -5,7 +5,7 @@
     --bg-hover: rgba(139, 92, 246, 0.15);
     --text-primary: #f8f9fa;
     --text-secondary: #a0a0b8;
-    --text-muted: #64647f;
+    --text-muted: #7d7d99;
     --accent: #8b5cf6;
     --accent-dim: #6d28d9;
     --accent-glow: rgba(139, 92, 246, 0.15);
@@ -95,7 +95,9 @@ body {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 14px;
+    min-width: 104px;
+    justify-content: center;
+    padding: 7px 14px;
     border-radius: 20px;
     background: var(--bg-tertiary);
     border: 1px solid var(--border);
@@ -127,15 +129,33 @@ body {
     animation: pulse 0.6s infinite;
 }
 
+.status-indicator.listening .status-dot {
+    background: var(--success);
+    animation: pulse 1.2s infinite;
+}
+
+.status-indicator.interrupted .status-dot {
+    background: var(--error);
+}
+
+.status-indicator.wake .status-dot {
+    background: var(--accent);
+    animation: pulse 1.4s infinite;
+}
+
+.status-indicator.offline .status-dot {
+    background: var(--error);
+}
+
 @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.4; }
 }
 
 .icon-btn {
-    width: 36px;
-    height: 36px;
-    border-radius: var(--radius-sm);
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
     border: 1px solid transparent;
     background: transparent;
     color: var(--text-secondary);

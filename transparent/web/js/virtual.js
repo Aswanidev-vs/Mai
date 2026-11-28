@@ -555,6 +555,8 @@ class VirtualOverlay {
         this.currentEmotion = null;
         this.expressionResetTimer = null;
         this.agentStatus = 'idle';
+        this.phase = 'idle';
+        this.prosody = null;
         this.statusPose = { pitch: 0, yaw: 0, roll: 0 };
         this.statusPoseTarget = { pitch: 0, yaw: 0, roll: 0 };
         this.gesturePose = { pitch: 0, yaw: 0, roll: 0 };
@@ -1067,11 +1069,40 @@ class VirtualOverlay {
         }
     }
 
+    // Choreography comes from the backend's single companion.phase event.
+    setPhase(phase) {
+        const next = ['wake', 'listening', 'thinking', 'speaking', 'interrupted', 'idle'].includes(phase)
+            ? phase : 'idle';
+        if (this.phase === next) return;
+        this.phase = next;
+        if (next === 'interrupted') {
+            this.setStatus('error');
+            this.setEmotion('surprised', 0.55);
+            return;
+        }
+        if (next === 'wake') next = 'listening';
+        this.setStatus(next);
+        if (next === 'thinking') {
+            // Same signature beat as the browser avatar: look toward the work
+            // in front of the user before answering.
+            this.statusPoseTarget.yaw += 0.08;
+            setTimeout(() => {
+                if (this.phase === 'thinking') this.statusPoseTarget.yaw -= 0.08;
+            }, 450);
+        }
+    }
+
     setStatus(status) {
         this.agentStatus = status || 'idle';
         const cfg = STATUS_MAP[this.agentStatus];
         if (!cfg) return;
-        this.statusPoseTarget = cfg.pose;
+        const variance = Number(this.prosody?.pitch_variance) || 0.3;
+        const energy = 0.6 + variance * 0.8;
+        this.statusPoseTarget = {
+            pitch: cfg.pose.pitch * energy,
+            yaw: cfg.pose.yaw * energy + (this.attentionYaw || 0),
+            roll: cfg.pose.roll * energy,
+        };
         // The status expression is a gentle baseline; emotions override it.
         for (const e of cfg.expression) {
             if (!VRM_EXPRESSIONS.includes(e.name)) continue;
@@ -1317,8 +1348,17 @@ class VirtualOverlay {
             return;
         }
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        this.ws = new WSClient(`${proto}//${location.host}/ws`);
+        const urlToken = new URLSearchParams(location.search).get('token');
+        if (urlToken) localStorage.setItem('mai-ws-token', urlToken);
+        const token = urlToken || localStorage.getItem('mai-ws-token') || '';
+        this.ws = new WSClient(`${proto}//${location.host}/ws`, token);
 
+        this.ws.on('companion.phase', (params) => this.setPhase(params?.phase));
+        this.ws.on('companion.prosody', (params) => { this.prosody = params; });
+        this.ws.on('companion.presence', (params) => {
+            if (params?.emotion) this.setEmotion(params.emotion, params.intensity || 0.5);
+            if (params?.phase) this.setPhase(params.phase);
+        });
         this.ws.on('emotion.detected', (params) => {
             const emotion = params?.emotion || 'calm';
             const intensity = clamp(Number(params?.intensity) || 0.35, 0.2, 0.6);
@@ -1526,6 +1566,10 @@ class VirtualOverlay {
             case 'clickThrough':
                 this.clickThrough = !!evt.on;
                 console.log('[VIRTUAL] click-through:', this.clickThrough);
+                break;
+            case 'foregroundRect':
+                // Glance toward the active window, within a small head-angle budget.
+                this.attentionYaw = Math.max(-0.18, Math.min(0.18, (Number(evt.x) || 0) * 0.18));
                 break;
             default:
                 console.log('[VIRTUAL] host event:', evt);
@@ -1841,4 +1885,8 @@ const readyCheck = setInterval(() => {
     while (pendingHostEvents.length) {
         hostEventTarget(pendingHostEvents.shift());
     }
+    // Keep the attention target current even when the foreground window changes
+    // while Mai is idle.
+    hostSend('getForegroundRect');
+    setInterval(() => hostSend('getForegroundRect'), 2000);
 }, 100);

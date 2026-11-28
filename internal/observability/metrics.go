@@ -15,11 +15,11 @@ const (
 )
 
 type Metric struct {
-	Name      string     `json:"name"`
-	Type      MetricType `json:"type"`
-	Value     float64    `json:"value"`
+	Name      string            `json:"name"`
+	Type      MetricType        `json:"type"`
+	Value     float64           `json:"value"`
 	Labels    map[string]string `json:"labels,omitempty"`
-	Timestamp time.Time  `json:"timestamp"`
+	Timestamp time.Time         `json:"timestamp"`
 }
 
 type MetricsCollector struct {
@@ -91,7 +91,9 @@ func (mc *MetricsCollector) RecordHistogram(name string, value float64, labels m
 }
 
 func (mc *MetricsCollector) RecordLatency(operation string, duration time.Duration) {
-	mc.RecordHistogram("latency_ms", float64(duration.Milliseconds()), map[string]string{"operation": operation})
+	// Fractional milliseconds: sub-millisecond stages (AEC, bus fanout) must
+	// remain visible in the percentiles instead of collapsing to zero.
+	mc.RecordHistogram("latency_ms", float64(duration.Nanoseconds())/1e6, map[string]string{"operation": operation})
 }
 
 func (mc *MetricsCollector) GetMetric(name string, labels map[string]string) *Metric {

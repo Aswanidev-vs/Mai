@@ -5,8 +5,9 @@ const BINARY_TAG_TTS = 0x54;
 const TTS_HEADER_BYTES = 14;
 
 class WSClient {
-    constructor(url) {
+    constructor(url, token = "") {
         this.url = url;
+        this.token = token;
         this.ws = null;
         this.handlers = {};
         this.reconnectDelay = 1000;
@@ -21,7 +22,11 @@ class WSClient {
             return;
         }
 
-        this.ws = new WebSocket(this.url);
+        let target = this.url;
+        if (this.token) {
+            target += (target.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(this.token);
+        }
+        this.ws = new WebSocket(target);
         // Keep binary frames as ArrayBuffers so the PCM view is zero-copy.
         this.ws.binaryType = 'arraybuffer';
 

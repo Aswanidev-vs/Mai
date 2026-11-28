@@ -48,7 +48,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		if text == "" {
 			return
 		}
-		b.hub.BroadcastNotification(NotifChatResponse, ChatResponseChunk{Text: text, Done: true})
+		b.hub.BroadcastNotification(NotifChatResponse, ChatResponseChunk{Text: text, Done: true}, event.TurnID)
 	})
 
 	// Streaming transcript from orchestrator (publishTTS sends per-sentence
@@ -56,7 +56,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 	bus.Subscribe("chat.response", func(event interfaces.Event) {
 		text, _ := event.Payload["text"].(string)
 		done, _ := event.Payload["done"].(bool)
-		b.hub.BroadcastNotification(NotifChatResponse, ChatResponseChunk{Text: text, Done: done})
+		b.hub.BroadcastNotification(NotifChatResponse, ChatResponseChunk{Text: text, Done: done}, event.TurnID)
 	})
 
 	// User emotion → companion avatar response. The browser turns this into a
@@ -68,7 +68,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		b.hub.BroadcastNotification(NotifEmotionDetect, EmotionDetectedParams{
 			Emotion:   emotion,
 			Intensity: intensity,
-		})
+		}, event.TurnID)
 	})
 
 	// Mai's OWN sentiment (detected from her response text by the orchestrator).
@@ -80,7 +80,10 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		b.hub.BroadcastNotification(NotifEmotionMai, EmotionDetectedParams{
 			Emotion:   emotion,
 			Intensity: intensity,
-		})
+		}, event.TurnID)
+		p := b.hub.Presence()
+		p.Emotion, p.Intensity = emotion, intensity
+		b.hub.SetPresence(p)
 	})
 
 	// TTS audio chunks → WS clients (browser-side lip sync; muted chunks are
@@ -119,6 +122,9 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		text, _ := event.Payload["text"].(string)
 		final, _ := event.Payload["final"].(bool)
 		turnID, _ := event.Payload["turn_id"].(string)
+		if turnID == "" {
+			turnID = event.TurnID
+		}
 		b.PublishPartialTranscript(PartialTranscriptParams{
 			Text:   text,
 			Final:  final,
@@ -126,10 +132,36 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		})
 	})
 
+	// Turn-taking phases drive both avatar clients. This replaces emotion
+	// guessed from response text: the backend knows which part of the turn is
+	// active, and the UI only animates that decision.
+	bus.Subscribe(NotifPhase, func(event interfaces.Event) {
+		phase, _ := event.Payload["phase"].(string)
+		if phase == "" {
+			return
+		}
+		turnID, _ := event.Payload["turn_id"].(string)
+		b.hub.BroadcastNotification(NotifPhase, PhaseParams{Phase: phase, TurnID: turnID}, event.TurnID)
+		p := b.hub.Presence()
+		p.Phase, p.TurnID = phase, turnID
+		b.hub.SetPresence(p)
+	})
+
+	// Measured speech prosody → viseme timing and head motion.
+	bus.Subscribe(NotifProsody, func(event interfaces.Event) {
+		pause, _ := event.Payload["pause_ratio"].(float64)
+		pitch, _ := event.Payload["pitch_variance"].(float64)
+		rms, _ := event.Payload["rms"].(float64)
+		turnID, _ := event.Payload["turn_id"].(string)
+		b.hub.BroadcastNotification(NotifProsody, ProsodyParams{
+			PauseRatio: pause, PitchVariance: pitch, RMS: rms, TurnID: turnID,
+		}, event.TurnID)
+	})
+
 	// Dance request from the orchestrator → browser tells the avatar to dance.
 	bus.Subscribe("companion.dance", func(event interfaces.Event) {
 		log.Println("[BRIDGE] Dance request → browser")
-		b.hub.BroadcastNotification(NotifDance, struct{}{})
+		b.hub.BroadcastNotification(NotifDance, struct{}{}, event.TurnID)
 	})
 
 	// Explicit action/motion request from orchestrator → browser plays matching motion & expression.
@@ -147,7 +179,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		b.hub.BroadcastNotification(NotifAction, ActionParams{
 			Action:   act,
 			Duration: dur,
-		})
+		}, event.TurnID)
 	})
 
 	// Desktop automation phases → overlay. The overlay walks to the taskbar or
@@ -172,7 +204,10 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 			return
 		}
 		log.Printf("[BRIDGE] Automation phase → overlay: %s/%s", phase.Phase, phase.Target)
-		b.hub.BroadcastNotification(NotifAutomation, phase)
+		b.hub.BroadcastNotification(NotifAutomation, phase, event.TurnID)
+		p := b.hub.Presence()
+		p.Target = phase.Target
+		b.hub.SetPresence(p)
 	})
 
 	log.Println("[BRIDGE] Event bus bridge active")

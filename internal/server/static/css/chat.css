@@ -8,7 +8,42 @@
     padding: 20px;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 14px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+}
+
+/* Live speech caption — one replaceable line, not a chat message. */
+.asr-caption {
+    min-height: 28px;
+    margin: 0 20px 8px;
+    padding: 6px 12px;
+    border-radius: 8px;
+    background: rgba(12, 12, 20, 0.72);
+    color: var(--text-primary);
+    font-size: 14px;
+    text-align: center;
+    opacity: 0;
+    pointer-events: none;
+    border-left: 2px solid var(--accent);
+    transition: opacity 160ms ease;
+}
+
+.asr-caption.visible {
+    opacity: 1;
+}
+
+/* System notices are context, not a person speaking. */
+.message.system {
+    align-self: center;
+    max-width: 100%;
+}
+
+.system-message {
+    font-size: 12px;
+    font-style: italic;
+    color: var(--text-muted);
+    padding: 2px 8px;
 }
 
 /* Welcome */
@@ -20,7 +55,7 @@
     flex: 1;
     text-align: center;
     padding: 40px 20px;
-    opacity: 0.6;
+    opacity: 0.78;
 }
 
 .welcome-icon {
@@ -51,8 +86,8 @@
 /* Messages */
 .message {
     display: flex;
-    gap: 12px;
-    max-width: 80%;
+    gap: 10px;
+    max-width: 86%;
     animation: fadeIn 0.2s ease;
 }
 
@@ -95,8 +130,8 @@
 .message-content {
     padding: 10px 14px;
     border-radius: var(--radius);
-    font-size: 14px;
-    line-height: 1.5;
+    font-size: 14.5px;
+    line-height: 1.55;
     word-wrap: break-word;
 }
 
@@ -198,12 +233,13 @@
 }
 
 .input-wrapper textarea::placeholder {
-    color: var(--text-muted);
+    color: var(--text-secondary);
+    opacity: 0.75;
 }
 
 .send-btn {
-    width: 36px;
-    height: 36px;
+    width: 44px;
+    height: 44px;
     border-radius: var(--radius-sm);
     border: none;
     background: var(--accent);
@@ -233,7 +269,8 @@
 
 .input-hint {
     text-align: center;
-    font-size: 11px;
-    color: var(--text-muted);
+    font-size: 12px;
+    color: var(--text-secondary);
+    opacity: 0.8;
     margin-top: 8px;
 }

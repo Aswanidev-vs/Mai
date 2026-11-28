@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,6 +29,29 @@ func ResetForTest() {
 	defaultMu.Lock()
 	defaultCollector = NewMetricsCollector()
 	defaultMu.Unlock()
+}
+
+// Turn IDs correlate bus events, WS notifications and stage timings for one
+// user turn. The audio path is single-writer, so a process-wide current turn is
+// sufficient; typed-chat turns call StartTurn on their way in as well.
+var (
+	turnSeq     atomic.Uint64
+	currentTurn atomic.Value // string
+)
+
+// StartTurn begins a new turn and returns its ID.
+func StartTurn() string {
+	id := fmt.Sprintf("t%d", turnSeq.Add(1))
+	currentTurn.Store(id)
+	return id
+}
+
+// CurrentTurnID is the ID stamped on events that do not carry one explicitly.
+func CurrentTurnID() string {
+	if v := currentTurn.Load(); v != nil {
+		return v.(string)
+	}
+	return ""
 }
 
 func Incr(name string) {

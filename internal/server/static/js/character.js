@@ -91,6 +91,21 @@ const secureRand = () => {
     catch (e) { return 0.5; }
 };
 
+// Reused every frame: allocating Raycaster/Plane/Vector3 inside _updateGaze
+// shows up as periodic GC hitches even when the mean frame time looks fine.
+const _gazePointer = new THREE.Vector2();
+const _gazeRaycaster = new THREE.Raycaster();
+const _gazePlane = new THREE.Plane(new THREE.Vector3(0, 0, -1), 0);
+const _gazeHit = new THREE.Vector3();
+
+// Frame budget: cap both the pixel ratio and total drawing-buffer pixels. A 4K
+// panel at DPR 2 is 33 megapixels and no avatar needs that.
+const QUALITY_LEVELS = {
+    low: { dpr: 1, maxPixels: 1200000 },
+    medium: { dpr: 1.5, maxPixels: 2500000 },
+    high: { dpr: 2, maxPixels: 4000000 },
+};
+
 class CharacterRenderer {
     constructor(containerId) {
         this.container = document.getElementById(containerId);
@@ -103,6 +118,20 @@ class CharacterRenderer {
         this.loaded = false;
         this.mixer = null;
         this._wasHidden = false;
+        this.quality = (typeof localStorage !== 'undefined' && localStorage.getItem('mai-quality')) || 'medium';
+        if (!QUALITY_LEVELS[this.quality]) this.quality = 'medium';
+        this.reducedMotion = typeof matchMedia === 'function'
+            && matchMedia('(prefers-reduced-motion: reduce)').matches;
+        this.frameSamples = [];
+        this._lastPerfAt = 0;
+        this.debugHud = null;
+        this.debugHudVisible = false;
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'F3') {
+                e.preventDefault();
+                this.debugHudVisible = !this.debugHudVisible;
+            }
+        });
 
         // Motion3 clips are fetched on first use, not before the first render.
         this.motionClips = new Array(MOTION_FILES.length).fill(null);
@@ -129,6 +158,7 @@ class CharacterRenderer {
         // Viseme schedule (word-accurate lip sync)
         this.visemeSchedule = null;
         this.visemeDuration = 0;
+        this.prosody = null;
 
         // Blink state (initialized lazily in _updateBlink)
         this._blinkState = null;
@@ -180,6 +210,7 @@ class CharacterRenderer {
         this.currentEmotion = null;
         this.expressionResetTimer = null;
         this.agentStatus = 'idle';   // idle | thinking | speaking | listening
+        this.phase = 'idle';          // backend-driven turn phase
 
         // Enhanced micro-expressions (Airi-style)
         this.microExpressionTimer = 0;
@@ -204,6 +235,7 @@ class CharacterRenderer {
         this.lastInteraction = performance.now();
         this.userTyping = false;
         this.userPresent = false;
+        this.userSpeaking = false;
         this.postureHead = { pitch: 0, yaw: 0, roll: 0 };  // smoothed emotion/life offsets
         this.idleBehaviorTimer = this._rand(IDLE_BEHAVIOR_MIN, IDLE_BEHAVIOR_MAX);
         this.idleBehavior = null;      // { type, t, dur }
@@ -284,7 +316,7 @@ class CharacterRenderer {
         });
         console.log('[VRM] Using WebGL renderer');
 
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this._applyQuality();
         this.renderer.setClearColor(0x000000, 0); // Transparent — PixiJS handles background
         this.renderer.outputColorSpace = THREE.SRGBColorSpace;
         this.renderer.toneMapping = THREE.LinearToneMapping;
@@ -301,9 +333,11 @@ class CharacterRenderer {
 
         // Three-point rig. MToon needs a directional key to produce form: with only
         // ambient light the limbs and hair collapse into flat, faceted silhouettes.
-        this.scene.add(new THREE.AmbientLight(0xffe8d4, 0.30));
+        this.ambientLight = new THREE.AmbientLight(0xffe8d4, 0.30);
+        this.scene.add(this.ambientLight);
         const keyLight = new THREE.DirectionalLight(0xffedda, 0.85);
         keyLight.position.set(1.1, 1.6, 1.4);
+        this.keyLight = keyLight;
         this.scene.add(keyLight);
         const fillLight = new THREE.DirectionalLight(0xd6dff0, 0.22);
         fillLight.position.set(-1.2, 0.6, 0.9);
@@ -742,10 +776,28 @@ class CharacterRenderer {
         }
     }
 
+    _applyQuality() {
+        if (!this.renderer) return;
+        const level = QUALITY_LEVELS[this.quality] || QUALITY_LEVELS.medium;
+        const w = Math.max(1, this.container.clientWidth);
+        const h = Math.max(1, this.container.clientHeight);
+        const pixelCap = Math.sqrt(level.maxPixels / (w * h));
+        const dpr = Math.max(0.75, Math.min(window.devicePixelRatio || 1, level.dpr, pixelCap));
+        this.renderer.setPixelRatio(dpr);
+    }
+
+    setQuality(level) {
+        if (!QUALITY_LEVELS[level]) return;
+        this.quality = level;
+        try { localStorage.setItem('mai-quality', level); } catch (e) { /* private mode */ }
+        this._applyQuality();
+    }
+
     _resize() {
         const w = this.container.clientWidth;
         const h = this.container.clientHeight;
         if (w === 0 || h === 0) return;
+        this._applyQuality();
         this.renderer.setSize(w, h);
         this.camera.aspect = w / h;
         this.camera.updateProjectionMatrix();
@@ -917,6 +969,7 @@ class CharacterRenderer {
             this.vrmGroup.add(vrm.scene);
             // Removed rotation - let model face its default direction
             this.scene.add(this.vrmGroup);
+            this._addContactShadow();
 
             vrm.springBoneManager?.reset();
             // Tune spring bones for realistic hair movement
@@ -1161,6 +1214,19 @@ class CharacterRenderer {
         }
     }
 
+    // A soft ground ellipse gives the avatar a contact point instead of
+    // floating in a transparent void.
+    _addContactShadow() {
+        const geometry = new THREE.CircleGeometry(0.42, 32);
+        const material = new THREE.MeshBasicMaterial({
+            color: 0x1a1410, transparent: true, opacity: 0.22, depthWrite: false,
+        });
+        this.contactShadow = new THREE.Mesh(geometry, material);
+        this.contactShadow.rotation.x = -Math.PI / 2;
+        this.contactShadow.position.y = 0.002;
+        this.scene.add(this.contactShadow);
+    }
+
     _frameModel() {
         if (!this.vrm?.scene) return;
 
@@ -1181,6 +1247,10 @@ class CharacterRenderer {
         const center = new THREE.Vector3();
         box.getSize(size);
         box.getCenter(center);
+        if (this.contactShadow) {
+            this.contactShadow.position.set(center.x, box.min.y + 0.002, center.z);
+            this.contactShadow.scale.setScalar(Math.max(0.5, size.x * 0.55));
+        }
 
         const rad = (CAMERA_FOV / 2 * Math.PI) / 180;
         // Frame from head to waist — aim camera at upper body, not full-body center
@@ -1448,19 +1518,23 @@ class CharacterRenderer {
         // Mouse tracking: project screen cursor to 3D gaze plane (Airi: useLive2DEyeFocusFor)
         if (this.userPresent && this.gazeWander < 0.5 && this.camera) {
             // Project mouse position onto the eye-height plane
-            const mouseScreen = new THREE.Vector2(this.mouseX, this.mouseY);
-            const raycaster = new THREE.Raycaster();
-            raycaster.setFromCamera(mouseScreen, this.camera);
+            _gazePointer.set(this.mouseX, this.mouseY);
+            _gazeRaycaster.setFromCamera(_gazePointer, this.camera);
             // Intersect with horizontal plane at eye height
-            const plane = new THREE.Plane(new THREE.Vector3(0, 0, -1), -this.defaultLookAt.z);
-            const intersect = new THREE.Vector3();
-            raycaster.ray.intersectPlane(plane, intersect);
-            if (intersect) {
+            _gazePlane.constant = -this.defaultLookAt.z;
+            if (_gazeRaycaster.ray.intersectPlane(_gazePlane, _gazeHit)) {
                 // Blend mouse influence (stronger when closer)
                 const influence = 0.25;
-                this.gazePoint.x = lerp(this.gazePoint.x, intersect.x * influence + this.defaultLookAt.x * (1 - influence), 0.08);
-                this.gazePoint.y = lerp(this.gazePoint.y, intersect.y * influence + this.defaultLookAt.y * (1 - influence), 0.08);
+                this.gazePoint.x = lerp(this.gazePoint.x, _gazeHit.x * influence + this.defaultLookAt.x * (1 - influence), 0.08);
+                this.gazePoint.y = lerp(this.gazePoint.y, _gazeHit.y * influence + this.defaultLookAt.y * (1 - influence), 0.08);
             }
+        }
+
+        // Voice is the strongest attention cue: look at the mic/user while
+        // they are speaking, even if the cursor is elsewhere.
+        if (this.userSpeaking && this.gazeWander < 0.5) {
+            this.gazePoint.x = lerp(this.gazePoint.x, this.defaultLookAt.x - 0.12, 0.14);
+            this.gazePoint.y = lerp(this.gazePoint.y, this.defaultLookAt.y + 0.04, 0.14);
         }
 
         // If the user is typing, glance toward where they are (camera-left of her view).
@@ -1469,12 +1543,19 @@ class CharacterRenderer {
             this.gazePoint.y = lerp(this.gazePoint.y, this.defaultLookAt.y - 0.05, 0.08);
         }
 
+        if (this._thinkingGlanceUntil && performance.now() < this._thinkingGlanceUntil) {
+            this.gazePoint.x = lerp(this.gazePoint.x, this.defaultLookAt.x - 0.45, 0.25);
+            this.gazePoint.y = lerp(this.gazePoint.y, this.defaultLookAt.y + 0.05, 0.25);
+        }
+
         // Ease the fixation target toward the chosen gaze point.
         const lerpSpeed = 1 - Math.exp(-12 * delta);
         this.fixationTarget.lerp(this.gazePoint, lerpSpeed);
         // Tiny constant micro-drift so the eyes never feel frozen.
-        this.fixationTarget.x += Math.sin(performance.now() * 0.0007) * 0.004;
-        this.fixationTarget.y += Math.sin(performance.now() * 0.0009 + 1.3) * 0.003;
+        if (!this.reducedMotion) {
+            this.fixationTarget.x += Math.sin(performance.now() * 0.0007) * 0.004;
+            this.fixationTarget.y += Math.sin(performance.now() * 0.0009 + 1.3) * 0.003;
+        }
 
         if (this.vrm.lookAt.target) {
             this.vrm.lookAt.target.position.copy(this.fixationTarget);
@@ -1731,14 +1812,14 @@ class CharacterRenderer {
         if (this.restMode) { tp = lerp(tp, 0.06, 0.7); ty = lerp(ty, 0.02, 0.5); }
 
         // Enhanced idle behaviors with more variety
-        if (!this.speaking) {
+        if (!this.speaking && !this.reducedMotion) {
             this.idleBehaviorTimer -= delta;
             if (!this.idleBehavior && this.idleBehaviorTimer <= 0) {
                 this.idleBehaviorTimer = this._rand(IDLE_BEHAVIOR_MIN, IDLE_BEHAVIOR_MAX);
                 // No arm-moving behaviors: a random arm swing reads as a glitch.
-                const behaviorOptions = ['glance', 'adjust', 'breatheDeep', 'headNod', 'shoulderShrug'];
+                const behaviorOptions = ['glance', 'adjust', 'breatheDeep', 'headNod', 'shoulderShrug', 'weightShift'];
                 const kind = behaviorOptions[Math.floor(secureRand() * behaviorOptions.length)];
-                const durations = { glance: 1.4, adjust: 1.0, breatheDeep: 2.8, headNod: 0.8, shoulderShrug: 1.2 };
+                const durations = { glance: 1.4, adjust: 1.0, breatheDeep: 2.8, headNod: 0.8, shoulderShrug: 1.2, weightShift: 3.2 };
                 this.idleBehavior = { kind, dur: durations[kind] };
                 this.idleBehaviorT = 0;
             }
@@ -1761,6 +1842,15 @@ class CharacterRenderer {
                     case 'shoulderShrug':
                         tr += env * 0.02; // Slight shoulder roll
                         break;
+                    case 'weightShift': {
+                        const hips = this.vrm?.humanoid?.getNormalizedBoneNode('hips');
+                        if (hips) {
+                            if (this.hipsBaseX === null) this.hipsBaseX = hips.position.x;
+                            hips.position.x = this.hipsBaseX + env * 0.022;
+                            if (p >= 1) hips.position.x = this.hipsBaseX;
+                        }
+                        break;
+                    }
                 }
                 if (p >= 1) this.idleBehavior = null;
             }
@@ -1803,7 +1893,7 @@ class CharacterRenderer {
     }
 
     prepareVisemes(text) {
-        const sched = buildVisemeSchedule(text);
+        const sched = buildVisemeSchedule(text, this.prosody);
         this.visemeSchedule = sched.segments;
         // Store for sentence pitch contour detection
         this._lastUtteranceText = text;
@@ -1812,6 +1902,12 @@ class CharacterRenderer {
 
     setVisemeDuration(d) {
         this.visemeDuration = Number.isFinite(d) && d >= 0 ? d : 0;
+    }
+
+    // Measured from the rendered sentence, not guessed from punctuation.
+    setProsody(p) {
+        this.prosody = p || null;
+        if (this._lastUtteranceText) this.prepareVisemes(this._lastUtteranceText);
     }
 
     setSpeaking(s) {
@@ -1834,6 +1930,61 @@ class CharacterRenderer {
     setStatus(status) {
         this.agentStatus = status || 'idle';
         if (status !== 'idle') this.lastInteraction = performance.now();
+    }
+
+    // Turn-taking choreography. The backend owns the phase; this method only
+    // maps it to posture, breath and gaze, so text and expression cannot fight.
+    setPhase(phase) {
+        const next = ['wake', 'listening', 'thinking', 'speaking', 'interrupted', 'idle'].includes(phase)
+            ? phase : 'idle';
+        if (this.phase === next) return;
+        this.phase = next;
+        if (next !== 'thinking') this._thinkingGlanceUntil = 0;
+        this.lastInteraction = performance.now();
+
+        if (next === 'thinking' || next === 'listening') this.agentStatus = next;
+        switch (next) {
+            case 'listening':
+            case 'wake':
+                this.gazeWander = 0;
+                this.breathScale = 1.15;
+                this.headSpring.targetPitch += 0.03; // lean in
+                break;
+            case 'thinking':
+                // Signature beat: before answering, she looks toward the work
+                // you were doing (keyboard side), then returns to you.
+                this.gazeWander = 0;
+                this.gazePoint.set(
+                    this.defaultLookAt.x - 0.45,
+                    this.defaultLookAt.y + 0.05,
+                    this.defaultLookAt.z
+                );
+                this._thinkingGlanceUntil = performance.now() + 450;
+                this.breathScale = 0.9;
+                break;
+            case 'speaking':
+                this.gazeWander = 0;
+                this.breathScale = 1.25;
+                break;
+            case 'interrupted':
+                this.gazeWander = 0;
+                this.headSpring.targetYaw += 0.08; // small recoil
+                this.headSpring.targetPitch -= 0.04;
+                break;
+            default:
+                this.gazeWander = 0;
+                this.breathScale = 1;
+                this.agentStatus = 'idle';
+                break;
+        }
+    }
+
+    setUserSpeaking(b) {
+        this.userSpeaking = !!b;
+        if (this.userSpeaking) {
+            this.gazeWander = 0;
+            this.breathScale = 1.1;
+        }
     }
 
     setUserTyping(b) {
@@ -2143,22 +2294,23 @@ class CharacterRenderer {
         const text = this._lastUtteranceText || '';
         const endsWithQuestion = /[?]$/.test(text.trim()) || /[？]$/.test(text.trim());
         const endsWithExclamation = /[!]$/.test(text.trim()) || /[！]$/.test(text.trim());
+        const energy = this.prosody ? 0.6 + this.prosody.pitchVariance * 0.8 : 1;
 
         if (endsWithQuestion) {
             // Questions: head tilts UP at the end
             const rise = Math.max(0, phase - 0.7) / 0.3; // 0..1 in last 30%
             const head = this.vrm.humanoid.getNormalizedBoneNode('head');
-            if (head) head.rotation.x -= rise * 0.025; // pitch up (negative = up)
+            if (head) head.rotation.x -= rise * 0.025 * energy; // pitch up (negative = up)
         } else if (endsWithExclamation) {
             // Exclamations: head lifts with energy
             const lift = Math.max(0, phase - 0.8) / 0.2;
             const head = this.vrm.humanoid.getNormalizedBoneNode('head');
-            if (head) head.rotation.x -= lift * 0.02;
+            if (head) head.rotation.x -= lift * 0.02 * energy;
         } else {
             // Statements: head nods down at the end
             const drop = Math.max(0, phase - 0.8) / 0.2;
             const head = this.vrm.humanoid.getNormalizedBoneNode('head');
-            if (head) head.rotation.x += drop * 0.015;
+            if (head) head.rotation.x += drop * 0.015 * energy;
         }
     }
 
@@ -2335,6 +2487,41 @@ class CharacterRenderer {
         }
     }
 
+    // Optional F3 overlay: measured p95 (not a mean), draw calls and GPU memory.
+    _updatePerf(elapsed, delta) {
+        this.frameSamples.push(delta * 1000);
+        if (this.frameSamples.length > 120) this.frameSamples.shift();
+        if (!this.debugHudVisible || elapsed - this._lastPerfAt < 0.5) return;
+        this._lastPerfAt = elapsed;
+        if (!this.debugHud) {
+            this.debugHud = document.createElement('div');
+            this.debugHud.id = 'mai-perf';
+            this.debugHud.style.cssText = 'position:absolute;top:8px;right:8px;padding:4px 8px;'
+                + 'background:rgba(12,12,20,.8);color:#a0a0b8;font:11px monospace;'
+                + 'border-radius:6px;pointer-events:none;z-index:5;white-space:pre';
+            this.container.appendChild(this.debugHud);
+        }
+        const sorted = this.frameSamples.slice().sort((a, b) => a - b);
+        const p95 = sorted[Math.floor(sorted.length * 0.95)] || 0;
+        const info = this.renderer.info;
+        this.debugHud.textContent = `p95 ${p95.toFixed(1)}ms  draw ${info.render.drawCalls}  tris ${info.render.triangles}\n`
+            + `geo ${info.memory.geometries}  tex ${info.memory.textures}  quality ${this.quality}`;
+    }
+
+    // One motivated light direction; its colour follows the time of day and
+    // softens with her mood. This keeps the room coherent without a bloom pass.
+    _updateLighting(elapsed) {
+        if (!this.keyLight || elapsed - (this._lastLightingAt || 0) < 1) return;
+        this._lastLightingAt = elapsed;
+        const hour = new Date().getHours();
+        const evening = hour < 7 || hour >= 18;
+        const sad = this.currentEmotion === 'sad' || this.currentEmotion === 'stressed';
+        const bright = this.currentEmotion === 'excited' || this.currentEmotion === 'happy';
+        this.keyLight.color.setHex(evening || sad ? 0xffd0a0 : 0xffedda);
+        this.keyLight.intensity = sad ? 0.55 : bright ? 0.95 : evening ? 0.65 : 0.85;
+        this.ambientLight.intensity = sad ? 0.22 : evening ? 0.26 : 0.30;
+    }
+
     _animate() {
         requestAnimationFrame(() => this._animate());
         if (!this.renderer) return; // Wait for async _init to complete
@@ -2352,8 +2539,10 @@ class CharacterRenderer {
         }
         const delta = Math.min(this.clock.getDelta(), 0.1);
         const elapsed = this.clock.getElapsedTime();
+        this._updatePerf(elapsed, delta);
 
         if (this.vrm) {
+            this._updateLighting(elapsed);
             if (this.mixer) this.mixer.update(delta);
             this._updateIdle(elapsed, delta);
             this._updateLife(delta, elapsed);     // emotion posture + idle + rest (after idle)

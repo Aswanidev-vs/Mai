@@ -6,7 +6,7 @@ import vm from 'node:vm';
 
 const source = fs.readFileSync(new URL('./ws-client.js', import.meta.url), 'utf8');
 
-function loadWSClient() {
+function loadWSClient(token = '') {
     class FakeWebSocket {
         constructor(url) {
             this.url = url;
@@ -31,10 +31,15 @@ function loadWSClient() {
     };
     vm.createContext(context);
     vm.runInContext(`${source}\nthis.WSClient = WSClient;`, context);
-    const client = new context.WSClient('ws://localhost/ws');
+    const client = new context.WSClient('ws://localhost/ws', token);
     client.connect();
     return { client, socket: FakeWebSocket.instances[0], context, btoaCalls: () => btoaCalls };
 }
+
+test('auth token is appended to the websocket URL', () => {
+    const { socket } = loadWSClient('a b');
+    assert.equal(socket.url, 'ws://localhost/ws?token=a%20b');
+});
 
 // Build the frame inside the VM so `instanceof ArrayBuffer` matches the client.
 function ttsFrame(context, { rate, flags, duration, samples }) {

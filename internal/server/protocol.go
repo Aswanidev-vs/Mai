@@ -38,6 +38,7 @@ type WSMessage struct {
 	Params json.RawMessage `json:"params,omitempty"`
 	Result json.RawMessage `json:"result,omitempty"`
 	Error  *WSError        `json:"error,omitempty"`
+	TurnID string          `json:"turn_id,omitempty"`
 }
 
 // WSError represents an error in a WSMessage.
@@ -68,6 +69,9 @@ const (
 	NotifDance         = "companion.dance"
 	NotifAction        = "companion.action"
 	NotifAutomation    = "companion.automation"
+	NotifPhase         = "companion.phase"
+	NotifProsody       = "companion.prosody"
+	NotifPresence      = "companion.presence"
 	// NotifPartialTranscript carries an in-progress ASR result (final=false) and
 	// NotifFinalTranscript the authoritative one for the utterance (final=true).
 	NotifPartialTranscript = "asr.partial"
@@ -95,6 +99,32 @@ type AutomationPhaseParams struct {
 	Contact    string `json:"contact,omitempty"`
 	Reason     string `json:"reason,omitempty"`
 	DurationMS int    `json:"duration_ms,omitempty"`
+}
+
+// PhaseParams carries one turn-taking phase. Both the browser and the overlay
+// animate from this single source instead of guessing from chat text.
+type PhaseParams struct {
+	Phase  string `json:"phase"`
+	TurnID string `json:"turn_id,omitempty"`
+}
+
+// PresenceParams is the small snapshot a reconnecting client needs to resume
+// the same moment: where Mai is in the turn and how she is feeling.
+type PresenceParams struct {
+	Phase     string  `json:"phase"`
+	Emotion   string  `json:"emotion,omitempty"`
+	Intensity float64 `json:"intensity,omitempty"`
+	Target    string  `json:"target,omitempty"`
+	TurnID    string  `json:"turn_id,omitempty"`
+}
+
+// ProsodyParams carries measured speech features for one sentence so the
+// avatar can time pauses and head motion from the audio, not from punctuation.
+type ProsodyParams struct {
+	PauseRatio    float64 `json:"pause_ratio"`
+	PitchVariance float64 `json:"pitch_variance"`
+	RMS           float64 `json:"rms"`
+	TurnID        string  `json:"turn_id,omitempty"`
 }
 
 // ChatResponseChunk is streamed back for chat.response.

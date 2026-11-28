@@ -42,6 +42,10 @@ func TestShouldIgnoreRepeatedInputLeavesNewCommandsAlone(t *testing.T) {
 		"a different command must not be suppressed by the repeat guard")
 }
 
+func TestNextMemoryIDIsUniqueWithinMillisecond(t *testing.T) {
+	assert.NotEqual(t, nextMemoryID("user"), nextMemoryID("user"))
+}
+
 func TestTakeSentenceKeepsEllipsisTogether(t *testing.T) {
 	var buf strings.Builder
 	buf.WriteString("Hmm... That makes sense.")

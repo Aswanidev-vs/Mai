@@ -4,7 +4,6 @@ package models
 type Config struct {
 	Audio struct {
 		SampleRate         int     `yaml:"sample_rate"`
-		CaptureBufferMs    int     `yaml:"capture_buffer_ms"`
 		BargeInEnabled     bool    `yaml:"barge_in_enabled"`
 		BargeInThreshold   float64 `yaml:"barge_in_threshold"`
 		BargeInWarmupMs    int     `yaml:"barge_in_warmup_ms"`  // AEC convergence wait before barge-in arms; <=0 = 400ms
@@ -24,16 +23,15 @@ type Config struct {
 		SpeechRatioMin float64 `yaml:"speech_ratio_min"` // Denoised/raw energy ratio below which a frame is noise, not speech
 	} `yaml:"denoise"`
 	KWS struct {
-		Provider   string  `yaml:"provider"` // "cpu", "cuda", "coreml", "opencl"
-		ModelDir   string  `yaml:"model_dir"`
-		Encoder    string  `yaml:"encoder"`
-		Decoder    string  `yaml:"decoder"`
-		Joiner     string  `yaml:"joiner"`
-		Tokens     string  `yaml:"tokens"`
-		Keywords   string  `yaml:"keywords"`
-		NumThreads int     `yaml:"num_threads"`
-		CooldownMs int     `yaml:"cooldown_ms"`
-		Threshold  float32 `yaml:"confidence_threshold"`
+		Provider   string `yaml:"provider"` // "cpu", "cuda", "coreml", "opencl"
+		ModelDir   string `yaml:"model_dir"`
+		Encoder    string `yaml:"encoder"`
+		Decoder    string `yaml:"decoder"`
+		Joiner     string `yaml:"joiner"`
+		Tokens     string `yaml:"tokens"`
+		Keywords   string `yaml:"keywords"`
+		NumThreads int    `yaml:"num_threads"`
+		CooldownMs int    `yaml:"cooldown_ms"`
 	} `yaml:"kws"`
 	VAD struct {
 		Provider           string  `yaml:"provider"` // "cpu", "cuda", "coreml", "opencl"
@@ -286,7 +284,9 @@ type Config struct {
 		Threshold      float64 `yaml:"threshold"`       // 0.5=lenient, 0.7=balanced, 0.85=strict
 	} `yaml:"speaker_id"`
 	Agentic struct {
-		Enabled bool `yaml:"enabled"`
+		Enabled        bool `yaml:"enabled"`
+		AllowShell     bool `yaml:"allow_shell"`      // opt-in: shell_execute is off by default
+		AllowFileWrite bool `yaml:"allow_file_write"` // opt-in: file_write is off by default
 	} `yaml:"agentic"`
 	MCP struct {
 		Enabled bool     `yaml:"enabled"`

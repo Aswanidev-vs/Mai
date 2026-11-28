@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"strings"
+	"sync"
 
 	"github.com/user/mai/internal/agent"
 	"github.com/user/mai/pkg/interfaces"
@@ -18,19 +19,46 @@ type HybridProvider struct {
 	cloud  interfaces.LLMProvider
 	guard  *agent.PrivacyGuard
 	active bool
+
+	// blockCloud makes the first sensitive request latch the provider to local
+	// for the rest of the session, as configured by block_cloud_on_sensitivity.
+	blockCloud bool
+	blockMu    sync.RWMutex
+	blocked    bool
 }
 
-func NewHybridProvider(local, cloud interfaces.LLMProvider, guard *agent.PrivacyGuard) *HybridProvider {
-	return &HybridProvider{
+func NewHybridProvider(local, cloud interfaces.LLMProvider, guard *agent.PrivacyGuard, blockCloud ...bool) *HybridProvider {
+	p := &HybridProvider{
 		local:  local,
 		cloud:  cloud,
 		guard:  guard,
 		active: true,
 	}
+	if len(blockCloud) > 0 {
+		p.blockCloud = blockCloud[0]
+	}
+	return p
+}
+
+// shouldUseLocal is the single routing decision for every method: it goes
+// through PrivacyGuard.ShouldUseLocal and applies the sticky cloud block.
+func (p *HybridProvider) shouldUseLocal(text string) bool {
+	sensitive := p.guard != nil && p.guard.ShouldUseLocal(text, true)
+	if sensitive && p.blockCloud {
+		p.blockMu.Lock()
+		p.blocked = true
+		p.blockMu.Unlock()
+	}
+	if sensitive {
+		return true
+	}
+	p.blockMu.RLock()
+	defer p.blockMu.RUnlock()
+	return p.blocked
 }
 
 func (p *HybridProvider) Generate(ctx context.Context, prompt string, opts interfaces.GenerationOptions) (string, error) {
-	if p.guard.IsSensitive(prompt) {
+	if p.shouldUseLocal(prompt) {
 		log.Println("[HYBRID] Sensitive prompt detected. Routing to local model.")
 		return p.local.Generate(ctx, prompt, opts)
 	}
@@ -39,7 +67,7 @@ func (p *HybridProvider) Generate(ctx context.Context, prompt string, opts inter
 }
 
 func (p *HybridProvider) Stream(ctx context.Context, prompt string, opts interfaces.GenerationOptions, callback func(chunk string)) error {
-	if p.guard.IsSensitive(prompt) {
+	if p.shouldUseLocal(prompt) {
 		return p.local.Stream(ctx, prompt, opts, callback)
 	}
 	return p.cloud.Stream(ctx, prompt, opts, callback)
@@ -52,7 +80,7 @@ func (p *HybridProvider) Stream(ctx context.Context, prompt string, opts interfa
 // fell back to the flat prompt.
 func (p *HybridProvider) StreamChat(ctx context.Context, messages []interfaces.ChatMessage, opts interfaces.GenerationOptions, callback func(chunk string)) error {
 	target := p.cloud
-	if p.guard.IsSensitive(chatText(messages)) {
+	if p.shouldUseLocal(chatText(messages)) {
 		log.Println("[HYBRID] Sensitive conversation detected. Routing chat to local model.")
 		target = p.local
 	} else {
@@ -101,9 +129,9 @@ func flattenChat(messages []interfaces.ChatMessage) string {
 }
 
 func (p *HybridProvider) GenerateStructured(ctx context.Context, prompt string, schema json.RawMessage) (json.RawMessage, error) {
-	// For structured reasoning (agentic loop), we might prefer local even if not sensitive 
+	// For structured reasoning (agentic loop), we might prefer local even if not sensitive
 	// to avoid latency, but here we follow the sensitivity rule.
-	if p.guard.IsSensitive(prompt) {
+	if p.shouldUseLocal(prompt) {
 		return p.local.GenerateStructured(ctx, prompt, schema)
 	}
 	return p.cloud.GenerateStructured(ctx, prompt, schema)
