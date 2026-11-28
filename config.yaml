@@ -7,8 +7,6 @@
 
 audio:
   sample_rate: 16000
-  capture_buffer_ms: 100
-  playback_device: ""  # empty = default
   barge_in_enabled: true    # Interrupt TTS by speaking during playback
   barge_in_threshold: 0.008 # Mic energy threshold for barge-in
   barge_in_warmup_ms: 400   # AEC convergence wait before barge-in detection arms
@@ -43,7 +41,6 @@ kws:
   # critical path's CPU budget; the old 2 oversubscribed the box once ASR and
   # TTS were both live.
   num_threads: 1
-  debug: 0
   model_dir: "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
   encoder: "encoder-epoch-12-avg-2-chunk-16-left-64.onnx"
   decoder: "decoder-epoch-12-avg-2-chunk-16-left-64.onnx"
@@ -63,8 +60,6 @@ vad:
   # leaves headroom for the capture drain and TTS instead of pinning every
   # ONNX pool at full width.
   num_threads: 1
-  debug: 0
-  sample_rate: 16000
   model: "silero_vad.onnx"
 
   window_size: 512
@@ -72,7 +67,6 @@ vad:
   min_silence_duration: 0.5
   min_speech_duration: 0.5
   max_speech_duration: 10.0
-  buffer_size_seconds: 20
 
 asr:
   # Active model: "qwen3" | "nemotron" | "omnilingual" | "transducer"
@@ -306,9 +300,6 @@ tts:
     lexicon: "lexicon.txt"
     tokens: "tokens.txt"
     vocoder: "vocos_24khz.onnx"  # ⚠️ MUST DOWNLOAD: https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos_24khz.onnx
-    num_steps: 4
-    speed: 1.0
-    extra: '{"min_char_in_sentence": 10}'
 
   voice_cloning:
     enabled: true
@@ -343,7 +334,6 @@ llm:
   api_key: ""
   auto_start: true
   local_model: qwen3.5:4b  # Model for local fallback (Ollama)
-  stream: true
   think: false
   # num_ctx pins Ollama's context window. The window has to hold the persona
   # (~1.9k tokens) plus the verbatim history: when a rendered prompt overflows

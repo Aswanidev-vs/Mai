@@ -4,7 +4,6 @@ package models
 type Config struct {
 	Audio struct {
 		SampleRate         int     `yaml:"sample_rate"`
-		CaptureBufferMs    int     `yaml:"capture_buffer_ms"`
 		BargeInEnabled     bool    `yaml:"barge_in_enabled"`
 		BargeInThreshold   float64 `yaml:"barge_in_threshold"`
 		BargeInWarmupMs    int     `yaml:"barge_in_warmup_ms"`  // AEC convergence wait before barge-in arms; <=0 = 400ms

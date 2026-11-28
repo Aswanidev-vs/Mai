@@ -83,6 +83,9 @@ func main() {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		log.Fatalf("Failed to parse config: %v", err)
 	}
+	for _, warning := range models.ValidateConfigBytes(data) {
+		log.Printf("[CONFIG] %s", warning)
+	}
 
 	// Resolve environment variable references in config
 	resolveConfigEnv(&cfg)
