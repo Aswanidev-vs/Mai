@@ -39,9 +39,3 @@ type Agent interface {
 	SetGoal(ctx context.Context, goal Goal) error
 	GetStatus() AgentStatus
 }
-
-// CognitionEngine defines reasoning and planning capabilities
-type CognitionEngine interface {
-	Reason(ctx context.Context, goal string, context string) (string, error)
-	Plan(ctx context.Context, goal string) ([]string, error)
-}
