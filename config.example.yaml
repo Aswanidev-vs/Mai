@@ -49,9 +49,10 @@ kws:
   # Distinct @names and per-keyword thresholds (sherpa parses "#0.45"):
   # "MY" is a common English word and needs a higher bar than "MAI";
   # "HEY MAI" is longer and can trigger lower. Distinct names let the wake
-  # log say which phrase fired. Subword token version.
+  # log say which phrase fired. Subword token version. These per-keyword
+  # values are the thresholds: the old global confidence_threshold was ignored
+  # by sherpa and has been removed.
   keywords: "▁MA I @mai #0.25, ▁MY @my #0.45, ▁HE Y ▁MA I @heymai #0.20"
-  confidence_threshold: 0.25
   cooldown_ms: 1500
 
 vad:

@@ -23,16 +23,15 @@ type Config struct {
 		SpeechRatioMin float64 `yaml:"speech_ratio_min"` // Denoised/raw energy ratio below which a frame is noise, not speech
 	} `yaml:"denoise"`
 	KWS struct {
-		Provider   string  `yaml:"provider"` // "cpu", "cuda", "coreml", "opencl"
-		ModelDir   string  `yaml:"model_dir"`
-		Encoder    string  `yaml:"encoder"`
-		Decoder    string  `yaml:"decoder"`
-		Joiner     string  `yaml:"joiner"`
-		Tokens     string  `yaml:"tokens"`
-		Keywords   string  `yaml:"keywords"`
-		NumThreads int     `yaml:"num_threads"`
-		CooldownMs int     `yaml:"cooldown_ms"`
-		Threshold  float32 `yaml:"confidence_threshold"`
+		Provider   string `yaml:"provider"` // "cpu", "cuda", "coreml", "opencl"
+		ModelDir   string `yaml:"model_dir"`
+		Encoder    string `yaml:"encoder"`
+		Decoder    string `yaml:"decoder"`
+		Joiner     string `yaml:"joiner"`
+		Tokens     string `yaml:"tokens"`
+		Keywords   string `yaml:"keywords"`
+		NumThreads int    `yaml:"num_threads"`
+		CooldownMs int    `yaml:"cooldown_ms"`
 	} `yaml:"kws"`
 	VAD struct {
 		Provider           string  `yaml:"provider"` // "cpu", "cuda", "coreml", "opencl"

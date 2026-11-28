@@ -345,9 +345,13 @@ func main() {
 	kwsConfig.ModelConfig.Transducer.Decoder = join(cfg.KWS.ModelDir, cfg.KWS.Decoder)
 	kwsConfig.ModelConfig.Transducer.Joiner = join(cfg.KWS.ModelDir, cfg.KWS.Joiner)
 	kwsConfig.ModelConfig.Tokens = join(cfg.KWS.ModelDir, cfg.KWS.Tokens)
+	// One keyword registry only: registering the same phrases both here and on
+	// the stream doubled the entries in sherpa's context graph. The per-keyword
+	// "#" values in keywords are the thresholds; this global value is only a
+	// fallback for a phrase that forgot to specify one.
 	kwsConfig.KeywordsBuf = strings.ReplaceAll(cfg.KWS.Keywords, ",", "\n")
 	kwsConfig.KeywordsBufSize = len(kwsConfig.KeywordsBuf)
-	kwsConfig.KeywordsThreshold = cfg.KWS.Threshold
+	kwsConfig.KeywordsThreshold = 0.25
 	kwsConfig.ModelConfig.NumThreads = cfg.KWS.NumThreads
 	kwsConfig.ModelConfig.Provider = cfg.KWS.Provider
 
@@ -357,7 +361,7 @@ func main() {
 	}
 	defer sherpa.DeleteKeywordSpotter(spotter)
 
-	kwsStream := sherpa.NewKeywordStreamWithKeywords(spotter, strings.ReplaceAll(cfg.KWS.Keywords, ",", "/"))
+	kwsStream := sherpa.NewKeywordStream(spotter)
 	if kwsStream == nil {
 		log.Fatal("Failed to create keyword stream")
 	}
@@ -2494,57 +2498,61 @@ func main() {
 			// Rate-limited because this runs on the pipeline goroutine: an
 			// unbuffered write per frame competes with the serial drain and shows
 			// up as dropped frames.
-			if time.Since(lastDetected) < time.Duration(cfg.KWS.CooldownMs)*time.Millisecond {
-				return
-			}
 			for spotter.IsReady(kwsStream) {
 				spotter.Decode(kwsStream)
 				fmt.Print("*")
 				result := spotter.GetResult(kwsStream)
-				if result.Keyword != "" {
-					spotter.Reset(kwsStream)
-					lastDetected = time.Now()
-					log.Printf("\n[WAKE] Detected %q! Listening...", result.Keyword)
-					publishPhase(bus, "listening")
-
-					// Do not reset the ASR stream here. The keyword spotter
-					// reports 20-300ms after the phrase starts, so by now the
-					// decoder may already hold "Mai, send a message to ...".
-					// Keeping that stream (and stripping the leading wake word
-					// at finalization) is what preserves the command prefix.
-					snap := streaming.Snapshot()
-					liveText := strings.TrimSpace(stripWakeWordPrefix(snap.Text))
-					// Only the decoder's text can tell us whether the user
-					// already continued past the wake word. VAD is non-empty
-					// for the wake word itself, so it must not suppress the
-					// greeting when the decoder is simply a little late.
-					speechInProgress := liveText != ""
-					// Route greeting through the orchestrator so it shares the
-					// turn-sequence space and can be truncated by an
-					// interruption. If speech was already present, skip the
-					// greeting entirely: it would talk over the command.
-					wantGreeting := !speechInProgress && orch != nil
-					if speechInProgress {
-						log.Printf("[WAKE] Speech already in progress; preserving ASR prefix (%q).", snap.Text)
-					}
-
-					// Publish the listening state before the greeting
-					// goroutine can start playback, so the state machine and
-					// TTS agree about the turn from the first frame.
-					state = StateListening
-					streaming.SetEndpointEnabled(true)
-					turnStartedAt = time.Time{}
-					// A greeting is only skipped when the decoder already heard
-					// more than the wake word; keep the existing text and let
-					// the turn finalizer clean it.
-					if liveText != "" {
-						lastVoiceAt = time.Now()
-					}
-					if wantGreeting {
-						go orch.Speak(pickGreeting())
-					}
-					return
+				if result.Keyword == "" {
+					continue
 				}
+				// Always drain and reset a detection, even during cooldown:
+				// skipping Decode here used to let audio pile up in the stream
+				// and delayed the next wake after the cooldown expired.
+				spotter.Reset(kwsStream)
+				if time.Since(lastDetected) < time.Duration(cfg.KWS.CooldownMs)*time.Millisecond {
+					continue
+				}
+				lastDetected = time.Now()
+				log.Printf("\n[WAKE] Detected %q! Listening...", result.Keyword)
+				publishPhase(bus, "listening")
+
+				// Do not reset the ASR stream here. The keyword spotter
+				// reports 20-300ms after the phrase starts, so by now the
+				// decoder may already hold "Mai, send a message to ...".
+				// Keeping that stream (and stripping the leading wake word
+				// at finalization) is what preserves the command prefix.
+				snap := streaming.Snapshot()
+				liveText := strings.TrimSpace(stripWakeWordPrefix(snap.Text))
+				// Only the decoder's text can tell us whether the user
+				// already continued past the wake word. VAD is non-empty
+				// for the wake word itself, so it must not suppress the
+				// greeting when the decoder is simply a little late.
+				speechInProgress := liveText != ""
+				// Route greeting through the orchestrator so it shares the
+				// turn-sequence space and can be truncated by an
+				// interruption. If speech was already present, skip the
+				// greeting entirely: it would talk over the command.
+				wantGreeting := !speechInProgress && orch != nil
+				if speechInProgress {
+					log.Printf("[WAKE] Speech already in progress; preserving ASR prefix (%q).", snap.Text)
+				}
+
+				// Publish the listening state before the greeting
+				// goroutine can start playback, so the state machine and
+				// TTS agree about the turn from the first frame.
+				state = StateListening
+				streaming.SetEndpointEnabled(true)
+				turnStartedAt = time.Time{}
+				// A greeting is only skipped when the decoder already heard
+				// more than the wake word; keep the existing text and let
+				// the turn finalizer clean it.
+				if liveText != "" {
+					lastVoiceAt = time.Now()
+				}
+				if wantGreeting {
+					go orch.Speak(pickGreeting())
+				}
+				return
 			}
 
 		case StateListening:
