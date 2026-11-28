@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log"
 
+	"github.com/user/mai/internal/observability"
 	"github.com/user/mai/pkg/interfaces"
 )
 
@@ -58,6 +59,7 @@ func (h *Hub) handleChatInput(client *Client, msg WSMessage) {
 	event := interfaces.Event{
 		Type:   "ws.chat.input",
 		Source: "ws-server",
+		TurnID: observability.StartTurn(),
 		Payload: map[string]interface{}{
 			"text":   params.Text,
 			"client": client.id,
@@ -178,10 +180,14 @@ func (h *Hub) sendError(client *Client, id string, code int, message string) {
 	h.SendToClient(client, data)
 }
 
-// BroadcastNotification sends a server notification to all clients.
-func (h *Hub) BroadcastNotification(method string, params interface{}) {
+// BroadcastNotification sends a server notification to all clients. An optional
+// turn ID correlates the notification with the bus event that produced it.
+func (h *Hub) BroadcastNotification(method string, params interface{}, turnID ...string) {
 	data, _ := json.Marshal(params)
 	msg := WSMessage{Method: method, Params: data}
+	if len(turnID) > 0 {
+		msg.TurnID = turnID[0]
+	}
 	raw, _ := json.Marshal(msg)
 	h.BroadcastToAll(raw)
 }

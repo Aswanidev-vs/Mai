@@ -48,7 +48,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		if text == "" {
 			return
 		}
-		b.hub.BroadcastNotification(NotifChatResponse, ChatResponseChunk{Text: text, Done: true})
+		b.hub.BroadcastNotification(NotifChatResponse, ChatResponseChunk{Text: text, Done: true}, event.TurnID)
 	})
 
 	// Streaming transcript from orchestrator (publishTTS sends per-sentence
@@ -56,7 +56,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 	bus.Subscribe("chat.response", func(event interfaces.Event) {
 		text, _ := event.Payload["text"].(string)
 		done, _ := event.Payload["done"].(bool)
-		b.hub.BroadcastNotification(NotifChatResponse, ChatResponseChunk{Text: text, Done: done})
+		b.hub.BroadcastNotification(NotifChatResponse, ChatResponseChunk{Text: text, Done: done}, event.TurnID)
 	})
 
 	// User emotion → companion avatar response. The browser turns this into a
@@ -68,7 +68,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		b.hub.BroadcastNotification(NotifEmotionDetect, EmotionDetectedParams{
 			Emotion:   emotion,
 			Intensity: intensity,
-		})
+		}, event.TurnID)
 	})
 
 	// Mai's OWN sentiment (detected from her response text by the orchestrator).
@@ -80,7 +80,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		b.hub.BroadcastNotification(NotifEmotionMai, EmotionDetectedParams{
 			Emotion:   emotion,
 			Intensity: intensity,
-		})
+		}, event.TurnID)
 	})
 
 	// TTS audio chunks → WS clients (browser-side lip sync; muted chunks are
@@ -119,6 +119,9 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		text, _ := event.Payload["text"].(string)
 		final, _ := event.Payload["final"].(bool)
 		turnID, _ := event.Payload["turn_id"].(string)
+		if turnID == "" {
+			turnID = event.TurnID
+		}
 		b.PublishPartialTranscript(PartialTranscriptParams{
 			Text:   text,
 			Final:  final,
@@ -129,7 +132,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 	// Dance request from the orchestrator → browser tells the avatar to dance.
 	bus.Subscribe("companion.dance", func(event interfaces.Event) {
 		log.Println("[BRIDGE] Dance request → browser")
-		b.hub.BroadcastNotification(NotifDance, struct{}{})
+		b.hub.BroadcastNotification(NotifDance, struct{}{}, event.TurnID)
 	})
 
 	// Explicit action/motion request from orchestrator → browser plays matching motion & expression.
@@ -147,7 +150,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		b.hub.BroadcastNotification(NotifAction, ActionParams{
 			Action:   act,
 			Duration: dur,
-		})
+		}, event.TurnID)
 	})
 
 	// Desktop automation phases → overlay. The overlay walks to the taskbar or
@@ -172,7 +175,7 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 			return
 		}
 		log.Printf("[BRIDGE] Automation phase → overlay: %s/%s", phase.Phase, phase.Target)
-		b.hub.BroadcastNotification(NotifAutomation, phase)
+		b.hub.BroadcastNotification(NotifAutomation, phase, event.TurnID)
 	})
 
 	log.Println("[BRIDGE] Event bus bridge active")

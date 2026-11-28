@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/user/mai/internal/observability"
 	"github.com/user/mai/pkg/interfaces"
 )
 
@@ -52,6 +53,11 @@ func (b *Bus) rebuildSnapshot() {
 }
 
 func (b *Bus) Publish(event interfaces.Event) error {
+	// Stamp the current turn on every event that did not set one itself, so a
+	// trace can be reconstructed without threading an ID through every caller.
+	if event.TurnID == "" {
+		event.TurnID = observability.CurrentTurnID()
+	}
 	b.mu.RLock()
 	if b.snapshotDirty {
 		b.mu.RUnlock()

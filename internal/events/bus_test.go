@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/user/mai/internal/observability"
 	"github.com/user/mai/pkg/interfaces"
 	"go.uber.org/goleak"
 )
@@ -35,6 +37,20 @@ func TestBus_PublishSubscribe(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for event")
 	}
+}
+
+func TestBus_StampsCurrentTurnOnUnlabelledEvents(t *testing.T) {
+	bus := NewBus()
+	turnID := observability.StartTurn()
+	var got string
+	bus.Subscribe("trace.event", func(event interfaces.Event) { got = event.TurnID })
+
+	bus.Publish(interfaces.Event{Type: "trace.event", Payload: map[string]interface{}{}})
+	assert.Equal(t, turnID, got)
+
+	explicit := observability.StartTurn()
+	bus.Publish(interfaces.Event{Type: "trace.event", TurnID: explicit, Payload: map[string]interface{}{}})
+	assert.Equal(t, explicit, got, "an explicit ID must not be overwritten")
 }
 
 func TestBus_MultipleSubscribers(t *testing.T) {

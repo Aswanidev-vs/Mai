@@ -261,8 +261,9 @@ func main() {
 	denoiser := newDenoiseGate(newNoiseSuppressor(&cfg))
 	defer denoiser.Close()
 
-	var bargeStartNano atomic.Int64 // when the residual first crossed the barge-in gate (0 = idle)
-	var ttsStartedNano atomic.Int64 // UnixNano when current TTS playback started
+	var bargeStartNano atomic.Int64  // when the residual first crossed the barge-in gate (0 = idle)
+	var ttsStartedNano atomic.Int64  // UnixNano when current TTS playback started
+	var turnStartedNano atomic.Int64 // UnixNano when the current user turn began
 
 	// Duplex session state. This is NOT yet the owner of isSpeaking /
 	// ttsPlaying / stopPlayback — those atomics stay authoritative for this
@@ -1283,6 +1284,9 @@ func main() {
 					// frames' speaker reference is already stale.
 					micPipe.Load().SetMaxLag(audioQueueDepth)
 					ttsStartedNano.Store(time.Now().UnixNano())
+					if start := turnStartedNano.Load(); start != 0 {
+						observability.RecordStage("first_audio", time.Since(time.Unix(0, start)))
+					}
 					bargeStartNano.Store(0)
 				}
 				// Announce this sentence exactly when its audio starts, so
@@ -1651,6 +1655,9 @@ func main() {
 			// has to go back to the tight budget that fits its tap window.
 			micPipe.Load().SetMaxLag(audioQueueDepth)
 			ttsStartedNano.Store(time.Now().UnixNano())
+			if start := turnStartedNano.Load(); start != 0 {
+				observability.RecordStage("first_audio", time.Since(time.Unix(0, start)))
+			}
 			bargeStartNano.Store(0)
 			atomic.StoreInt32(&stopPlayback, 0)
 			playErr := playAudioStreaming(ctx, 44100, &stopPlayback, func(ch chan<- []float32) {
@@ -1809,6 +1816,10 @@ func main() {
 		if !turnStartedAt.IsZero() {
 			observability.RecordStage("asr", time.Since(turnStartedAt))
 		}
+		// One ID follows this turn through bus events, WS notifications and the
+		// metrics endpoint. Typed chat input starts its own turn in the server.
+		observability.StartTurn()
+		turnStartedNano.Store(time.Now().UnixNano())
 		// The display transcript and the routed transcript are the same text.
 		// Strip the wake word that the ASR stream may have retained while KWS
 		// was confirming it, then remove decoder-loop repetition before the

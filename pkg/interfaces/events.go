@@ -17,11 +17,12 @@ const (
 // Event represents a single message on the event bus
 type Event struct {
 	Type      string                 `json:"type"`
-	Source    string                 `json:"source"`      // Component ID
+	Source    string                 `json:"source"` // Component ID
 	Timestamp time.Time              `json:"timestamp"`
 	Payload   map[string]interface{} `json:"payload"`
-	Priority  EventPriority          `json:"priority"`    // Low, Normal, High, Critical
-	SessionID string                 `json:"session_id"`  // For tracing
+	Priority  EventPriority          `json:"priority"`          // Low, Normal, High, Critical
+	SessionID string                 `json:"session_id"`        // For tracing
+	TurnID    string                 `json:"turn_id,omitempty"` // correlates one user turn across stages
 }
 
 // EventHandler is a function that processes an event

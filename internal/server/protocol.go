@@ -38,6 +38,7 @@ type WSMessage struct {
 	Params json.RawMessage `json:"params,omitempty"`
 	Result json.RawMessage `json:"result,omitempty"`
 	Error  *WSError        `json:"error,omitempty"`
+	TurnID string          `json:"turn_id,omitempty"`
 }
 
 // WSError represents an error in a WSMessage.
