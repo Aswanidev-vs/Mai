@@ -36,6 +36,12 @@ func TestPartialTranscriptParamsJSONShape(t *testing.T) {
 	}
 }
 
+func TestPhaseParamsCarriesPhaseAndTurn(t *testing.T) {
+	data, err := json.Marshal(PhaseParams{Phase: "thinking", TurnID: "t42"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"phase":"thinking","turn_id":"t42"}`, string(data))
+}
+
 func TestPartialTranscriptFinalDistinguishableFromInterim(t *testing.T) {
 	interim, err := json.Marshal(PartialTranscriptParams{Text: "mai are you"})
 	require.NoError(t, err)

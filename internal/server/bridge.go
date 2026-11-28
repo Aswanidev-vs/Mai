@@ -129,6 +129,18 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		})
 	})
 
+	// Turn-taking phases drive both avatar clients. This replaces emotion
+	// guessed from response text: the backend knows which part of the turn is
+	// active, and the UI only animates that decision.
+	bus.Subscribe(NotifPhase, func(event interfaces.Event) {
+		phase, _ := event.Payload["phase"].(string)
+		if phase == "" {
+			return
+		}
+		turnID, _ := event.Payload["turn_id"].(string)
+		b.hub.BroadcastNotification(NotifPhase, PhaseParams{Phase: phase, TurnID: turnID}, event.TurnID)
+	})
+
 	// Dance request from the orchestrator → browser tells the avatar to dance.
 	bus.Subscribe("companion.dance", func(event interfaces.Event) {
 		log.Println("[BRIDGE] Dance request → browser")

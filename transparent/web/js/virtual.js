@@ -555,6 +555,7 @@ class VirtualOverlay {
         this.currentEmotion = null;
         this.expressionResetTimer = null;
         this.agentStatus = 'idle';
+        this.phase = 'idle';
         this.statusPose = { pitch: 0, yaw: 0, roll: 0 };
         this.statusPoseTarget = { pitch: 0, yaw: 0, roll: 0 };
         this.gesturePose = { pitch: 0, yaw: 0, roll: 0 };
@@ -1067,6 +1068,21 @@ class VirtualOverlay {
         }
     }
 
+    // Choreography comes from the backend's single companion.phase event.
+    setPhase(phase) {
+        const next = ['wake', 'listening', 'thinking', 'speaking', 'interrupted', 'idle'].includes(phase)
+            ? phase : 'idle';
+        if (this.phase === next) return;
+        this.phase = next;
+        if (next === 'interrupted') {
+            this.setStatus('error');
+            this.setEmotion('surprised', 0.55);
+            return;
+        }
+        if (next === 'wake') next = 'listening';
+        this.setStatus(next);
+    }
+
     setStatus(status) {
         this.agentStatus = status || 'idle';
         const cfg = STATUS_MAP[this.agentStatus];
@@ -1322,6 +1338,7 @@ class VirtualOverlay {
         const token = urlToken || localStorage.getItem('mai-ws-token') || '';
         this.ws = new WSClient(`${proto}//${location.host}/ws`, token);
 
+        this.ws.on('companion.phase', (params) => this.setPhase(params?.phase));
         this.ws.on('emotion.detected', (params) => {
             const emotion = params?.emotion || 'calm';
             const intensity = clamp(Number(params?.intensity) || 0.35, 0.2, 0.6);

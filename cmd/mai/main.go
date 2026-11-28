@@ -1223,6 +1223,7 @@ func main() {
 			atomic.StoreInt32(&isSpeaking, 0)
 			atomic.StoreInt32(&ttsPlaying, 0)
 			atomic.StoreInt32(&stopPlayback, 0)
+			publishPhase(bus, "idle")
 			// Nothing is playing now, so the consumer gets the idle burst
 			// budget. The ASR decoder is on its own worker, so this is no
 			// longer a chunk-decode window.
@@ -1278,6 +1279,7 @@ func main() {
 				// the mic in those gaps and produce phantom user turns.
 				atomic.StoreInt32(&isSpeaking, 1)
 				atomic.StoreInt32(&ttsPlaying, 1)
+				publishPhase(bus, "speaking")
 				if !turnOpen {
 					refBuffer.Clear()
 					echoCanceller.Reset()
@@ -1652,6 +1654,7 @@ func main() {
 			// Streaming TTS: generate chunks and play them as they arrive.
 			atomic.StoreInt32(&isSpeaking, 1) // Block ASR during TTS playback
 			atomic.StoreInt32(&ttsPlaying, 1)
+			publishPhase(bus, "speaking")
 			refBuffer.Clear()
 			echoCanceller.Reset()
 			// The echo canceller is live from this point, so the capture queue
@@ -1694,6 +1697,7 @@ func main() {
 				observability.RecordStage("tts", time.Since(time.Unix(0, start)))
 			}
 			atomic.StoreInt32(&isSpeaking, 0) // Resume ASR
+			publishPhase(bus, "idle")
 			lastResponseMu.Lock()
 			lastResponseTime = time.Now()
 			lastResponseMu.Unlock()
@@ -2334,6 +2338,7 @@ func main() {
 						sessions.SetState(session.StateIdle)
 						bargeStartNano.Store(0)
 						atomic.StoreInt32(&stopPlayback, 1)
+						publishPhase(bus, "interrupted")
 						if interruptCurrent != nil {
 							interruptCurrent()
 						}
@@ -2440,6 +2445,7 @@ func main() {
 
 					if segmentRMS > 0.001 {
 						log.Printf("[FOLLOW-UP] Speech detected (segment level %.4f)! Skipping wake word.", segmentRMS)
+						publishPhase(bus, "listening")
 						// Preserve whatever the streaming decoder already
 						// heard. Resetting here used to throw away the first
 						// word of a follow-up.
@@ -2497,6 +2503,7 @@ func main() {
 					spotter.Reset(kwsStream)
 					lastDetected = time.Now()
 					log.Printf("\n[WAKE] Detected %q! Listening...", result.Keyword)
+					publishPhase(bus, "listening")
 
 					// Do not reset the ASR stream here. The keyword spotter
 					// reports 20-300ms after the phrase starts, so by now the
@@ -2761,6 +2768,22 @@ func resolveEnv(val string) string {
 		return envVal
 	}
 	return val
+}
+
+// publishPhase tells both avatar clients which part of the turn is active.
+// It is the single choreography source; the UIs must not infer it from text.
+func publishPhase(bus interfaces.EventBus, phase string) {
+	if bus == nil {
+		return
+	}
+	bus.Publish(interfaces.Event{
+		Type:   "companion.phase",
+		Source: "main",
+		Payload: map[string]interface{}{
+			"phase":   phase,
+			"turn_id": observability.CurrentTurnID(),
+		},
+	})
 }
 
 // publishTranscript pushes one streamed transcript segment to the companion

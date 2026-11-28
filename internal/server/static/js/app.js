@@ -15,105 +15,14 @@ const audio = new AudioPlayer();
 const character = new CharacterRenderer('characterContainer');
 const settings = new SettingsPanel(ws);
 
-// Small, deterministic cues keep the avatar responsive without asking the
-// language model for brittle JSON or exposing internal emotion labels to the
-// user. These are intentionally conservative: a technical answer should not
-// make Mai look angry just because it mentions an error.
-const ASSISTANT_EXPRESSION_CUES = [
-    // tease
-    { pattern: /\b(heh|as expected|aren't you|you really are|don't flatter yourself|making things complicated|architecture discussion|suit yourself|you're such a|got me there|well played|as expected of you)\b/i, emotion: 'tease', intensity: 0.65 },
-    // shy
-    { pattern: /\b(idiot|what are you saying|don't say that|stop it|embarrassing|not like that|shut up|you're embarrassing me|i'm blushing|so forward)\b/i, emotion: 'shy', intensity: 0.60 },
-    // touched
-    { pattern: /\b(thank you|that's sweet|i appreciate|i'm glad|always here|by your side|happy to help|anytime|aswani-kun|you mean a lot|that means a lot|i care about you)\b/i, emotion: 'touched', intensity: 0.52 },
-    // skeptical
-    { pattern: /\b(really\?|are you sure|doubt it|that doesn't sound right|that doesn't make sense|i'm not convinced|seriously\?|you can't be serious|i'll believe it when i see it)\b/i, emotion: 'skeptical', intensity: 0.55 },
-    // excited
-    { pattern: /\b(we did it|you got it|that's amazing|excellent|congratulations|nice work|fantastic|that's incredible|so cool|love it|finally|im so excited|perfect|i can't wait|can't wait|so fun|how fun|that's so fun|yay|woohoo|awesome|brilliant|i'm thrilled|so pumped)\b/i, emotion: 'excited', intensity: 0.62 },
-    // surprised
-    { pattern: /\b(oh\b|wow|whoa|no way|really\b|seriously|wait what|hold on|huh\?|wait, really|that's surprising|i didn't expect that|unexpected|i'm shocked|what a surprise|oh my|that's unexpected)\b/i, emotion: 'surprised', intensity: 0.48 },
-    // sad
-    { pattern: /\b(i'm sorry|that sounds hard|that sounds painful|take your time|i'm here with you|that's rough|i feel for you|that's so sad|oh no|that's unfortunate|i'm sorry to hear|that's disappointing|sad to see|i wish i could help more|my heart goes out|i'm worried)\b/i, emotion: 'sad', intensity: 0.38 },
-    // happy
-    { pattern: /\b(glad for you|happy for you|proud of you|wonderful|love that|good news|great to hear|i'm happy to|that's great|i'm so happy|that makes me happy|delighted|thrilled|so glad|how wonderful|lovely|that's wonderful|i love that|makes me smile)\b/i, emotion: 'happy', intensity: 0.48 },
-    // think (hesitation / reasoning)
-    { pattern: /\b(hmm|well\b|let me think|let's see|uhm|uhh|huh|let me check|give me a second|one moment|probably|maybe|i'd say|the reason is|because|let me think about that|i'm thinking|interesting question|good question|let me consider|hmm, let's see|i need a moment)\b|\?/i, emotion: 'think', intensity: 0.38 },
-];
-
+// Emotion comes from the backend (emotion.mai / emotion.detected); turn state
+// comes from companion.phase. The client no longer guesses either from text.
 const USER_MOOD_TO_RESPONSE = {
-    sad: 'sad',
-    stressed: 'calm',
-    frustrated: 'calm',
-    excited: 'happy',
-    happy: 'happy',
-    calm: 'calm',
-    neutral: 'calm',
+    sad: 'sad', stressed: 'calm', frustrated: 'calm',
+    excited: 'happy', happy: 'happy', calm: 'calm', neutral: 'calm',
 };
+let currentPhase = 'idle';
 
-let responseInProgress = false;
-let activeAssistantEmotion = '';
-let activeAssistantIntensity = 0;
-let assistantDecayTimer = null;
-
-function updateAssistantExpression(text) {
-    if (!text) return;
-    if (!responseInProgress) {
-        responseInProgress = true;
-        activeAssistantEmotion = 'calm';
-        activeAssistantIntensity = 0.25;
-        character.setEmotion('calm', 0.25);
-    }
-
-    // Score every cue instead of stopping at the first match: the emotional
-    // tone should follow the *strongest, most recent* cue, not whichever regex
-    // happens to be listed first. Recency is a small tiebreaker so a late
-    // "we did it!" outweighs an early "let me think".
-    let best = null;
-    let bestScore = -1;
-    for (const cue of ASSISTANT_EXPRESSION_CUES) {
-        cue.pattern.lastIndex = 0;
-        const m = cue.pattern.exec(text);
-        if (!m) continue;
-        const recency = m.index / Math.max(text.length, 1);
-        const score = cue.intensity + recency * 0.25;
-        if (score > bestScore) {
-            bestScore = score;
-            best = cue;
-        }
-    }
-    if (!best) return;
-
-    // Re-anchor when the emotion changes, or when a clearly stronger cue for
-    // the same emotion arrives — avoids flicker between subtle cues.
-    const changed = best.emotion !== activeAssistantEmotion;
-    const stronger = best.intensity > activeAssistantIntensity + 0.1;
-    if (changed || stronger) {
-        activeAssistantEmotion = best.emotion;
-        activeAssistantIntensity = best.intensity;
-        character.setEmotion(best.emotion, best.intensity);
-    }
-}
-
-// Gentle decay: after Mai finishes speaking her expression eases back toward
-// neutral over ~1.5s instead of snapping. Each step lowers the intensity and
-// re-applies the same emotion; character.setEmotion re-arms its own reset
-// timer each call, so the fade stays smooth until we settle on calm/neutral.
-function decayAssistantExpression() {
-    if (assistantDecayTimer) clearTimeout(assistantDecayTimer);
-    const step = () => {
-        if (responseInProgress) return; // still talking — don't fade mid-sentence
-        if (!activeAssistantEmotion || activeAssistantIntensity <= 0.05) {
-            activeAssistantEmotion = '';
-            activeAssistantIntensity = 0;
-            character.setEmotion('calm', 0.25);
-            return;
-        }
-        activeAssistantIntensity = Math.max(0, activeAssistantIntensity - 0.09);
-        character.setEmotion(activeAssistantEmotion, activeAssistantIntensity);
-        assistantDecayTimer = setTimeout(step, 300);
-    };
-    assistantDecayTimer = setTimeout(step, 450);
-}
 
 // Wire audio analyser to character for lip sync
 audio.init();
@@ -185,7 +94,6 @@ const UNCERTAINTY_MARKERS = [
 
 ws.on('chat.response', (params) => {
     if (params.text) {
-        updateAssistantExpression(params.text);
         if (!streamingActive) {
             chat.startAgentMessage();
             streamingActive = true;
@@ -205,13 +113,11 @@ ws.on('chat.response', (params) => {
     if (params.done) {
         chat.finalizeMessage();
         streamingActive = false;
-        responseInProgress = false;
         // The send button is only disabled in _send(); re-enable it here so
         // the user can queue a follow-up while Mai is still speaking (the
         // transcript itself stays open until her voice ends).
         if (chat.sendBtn) chat.sendBtn.disabled = false;
         // Let the expression gently decay back toward neutral rather than snapping.
-        decayAssistantExpression();
         // Check for uncertainty markers and trigger gaze avoidance
         const lower = gazeAvoidBuffer.toLowerCase();
         for (const marker of UNCERTAINTY_MARKERS) {
@@ -223,6 +129,14 @@ ws.on('chat.response', (params) => {
         ttsTextBuffer = '';
         gazeAvoidBuffer = '';
     }
+});
+
+// Turn choreography: one backend phase drives posture, gaze and attention.
+ws.on('companion.phase', (params) => {
+    const phase = params.phase || 'idle';
+    if (phase === currentPhase) return;
+    currentPhase = phase;
+    character.setPhase(phase);
 });
 
 // Status changes
@@ -287,10 +201,6 @@ ws.on('emotion.detected', (params) => {
 ws.on('emotion.mai', (params) => {
     const emotion = params.emotion || 'neutral';
     const intensity = Math.min(0.7, Math.max(0.2, Number(params.intensity) || 0.4));
-    // Track it so the same gentle decay applies once she finishes speaking.
-    if (assistantDecayTimer) clearTimeout(assistantDecayTimer);
-    activeAssistantEmotion = emotion;
-    activeAssistantIntensity = intensity;
     character.setEmotion(emotion, intensity);
 });
 

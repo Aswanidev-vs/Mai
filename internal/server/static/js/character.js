@@ -180,6 +180,7 @@ class CharacterRenderer {
         this.currentEmotion = null;
         this.expressionResetTimer = null;
         this.agentStatus = 'idle';   // idle | thinking | speaking | listening
+        this.phase = 'idle';          // backend-driven turn phase
 
         // Enhanced micro-expressions (Airi-style)
         this.microExpressionTimer = 0;
@@ -1834,6 +1835,44 @@ class CharacterRenderer {
     setStatus(status) {
         this.agentStatus = status || 'idle';
         if (status !== 'idle') this.lastInteraction = performance.now();
+    }
+
+    // Turn-taking choreography. The backend owns the phase; this method only
+    // maps it to posture, breath and gaze, so text and expression cannot fight.
+    setPhase(phase) {
+        const next = ['wake', 'listening', 'thinking', 'speaking', 'interrupted', 'idle'].includes(phase)
+            ? phase : 'idle';
+        if (this.phase === next) return;
+        this.phase = next;
+        this.lastInteraction = performance.now();
+
+        if (next === 'thinking' || next === 'listening') this.agentStatus = next;
+        switch (next) {
+            case 'listening':
+            case 'wake':
+                this.gazeWander = 0;
+                this.breathScale = 1.15;
+                this.headSpring.targetPitch += 0.03; // lean in
+                break;
+            case 'thinking':
+                this.gazeWander = Math.max(this.gazeWander, 0.7); // glance away
+                this.breathScale = 0.9;
+                break;
+            case 'speaking':
+                this.gazeWander = 0;
+                this.breathScale = 1.25;
+                break;
+            case 'interrupted':
+                this.gazeWander = 0;
+                this.headSpring.targetYaw += 0.08; // small recoil
+                this.headSpring.targetPitch -= 0.04;
+                break;
+            default:
+                this.gazeWander = 0;
+                this.breathScale = 1;
+                this.agentStatus = 'idle';
+                break;
+        }
     }
 
     setUserTyping(b) {

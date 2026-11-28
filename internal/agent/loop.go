@@ -1812,7 +1812,19 @@ func (o *Orchestrator) GetStatus() interfaces.AgentStatus {
 // setStatus / statusValue publish and read the turn state across goroutines:
 // HandleInput writes it, the event bridge and the proactive ticker read it.
 func (o *Orchestrator) setStatus(s interfaces.AgentStatus) {
+	prev := o.statusValue()
 	o.status.Store(s)
+	if prev == s || o.bus == nil {
+		return
+	}
+	o.bus.Publish(interfaces.Event{
+		Type:   "companion.phase",
+		Source: "agent.orchestrator",
+		Payload: map[string]interface{}{
+			"phase":   string(s),
+			"turn_id": observability.CurrentTurnID(),
+		},
+	})
 }
 
 func (o *Orchestrator) statusValue() interfaces.AgentStatus {

@@ -69,6 +69,7 @@ const (
 	NotifDance         = "companion.dance"
 	NotifAction        = "companion.action"
 	NotifAutomation    = "companion.automation"
+	NotifPhase         = "companion.phase"
 	// NotifPartialTranscript carries an in-progress ASR result (final=false) and
 	// NotifFinalTranscript the authoritative one for the utterance (final=true).
 	NotifPartialTranscript = "asr.partial"
@@ -96,6 +97,13 @@ type AutomationPhaseParams struct {
 	Contact    string `json:"contact,omitempty"`
 	Reason     string `json:"reason,omitempty"`
 	DurationMS int    `json:"duration_ms,omitempty"`
+}
+
+// PhaseParams carries one turn-taking phase. Both the browser and the overlay
+// animate from this single source instead of guessing from chat text.
+type PhaseParams struct {
+	Phase  string `json:"phase"`
+	TurnID string `json:"turn_id,omitempty"`
 }
 
 // ChatResponseChunk is streamed back for chat.response.
