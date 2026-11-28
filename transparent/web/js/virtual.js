@@ -1082,6 +1082,14 @@ class VirtualOverlay {
         }
         if (next === 'wake') next = 'listening';
         this.setStatus(next);
+        if (next === 'thinking') {
+            // Same signature beat as the browser avatar: look toward the work
+            // in front of the user before answering.
+            this.statusPoseTarget.yaw += 0.08;
+            setTimeout(() => {
+                if (this.phase === 'thinking') this.statusPoseTarget.yaw -= 0.08;
+            }, 450);
+        }
     }
 
     setStatus(status) {
@@ -1347,6 +1355,10 @@ class VirtualOverlay {
 
         this.ws.on('companion.phase', (params) => this.setPhase(params?.phase));
         this.ws.on('companion.prosody', (params) => { this.prosody = params; });
+        this.ws.on('companion.presence', (params) => {
+            if (params?.emotion) this.setEmotion(params.emotion, params.intensity || 0.5);
+            if (params?.phase) this.setPhase(params.phase);
+        });
         this.ws.on('emotion.detected', (params) => {
             const emotion = params?.emotion || 'calm';
             const intensity = clamp(Number(params?.intensity) || 0.35, 0.2, 0.6);

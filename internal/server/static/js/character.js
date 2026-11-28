@@ -1543,6 +1543,11 @@ class CharacterRenderer {
             this.gazePoint.y = lerp(this.gazePoint.y, this.defaultLookAt.y - 0.05, 0.08);
         }
 
+        if (this._thinkingGlanceUntil && performance.now() < this._thinkingGlanceUntil) {
+            this.gazePoint.x = lerp(this.gazePoint.x, this.defaultLookAt.x - 0.45, 0.25);
+            this.gazePoint.y = lerp(this.gazePoint.y, this.defaultLookAt.y + 0.05, 0.25);
+        }
+
         // Ease the fixation target toward the chosen gaze point.
         const lerpSpeed = 1 - Math.exp(-12 * delta);
         this.fixationTarget.lerp(this.gazePoint, lerpSpeed);
@@ -1934,6 +1939,7 @@ class CharacterRenderer {
             ? phase : 'idle';
         if (this.phase === next) return;
         this.phase = next;
+        if (next !== 'thinking') this._thinkingGlanceUntil = 0;
         this.lastInteraction = performance.now();
 
         if (next === 'thinking' || next === 'listening') this.agentStatus = next;
@@ -1945,7 +1951,15 @@ class CharacterRenderer {
                 this.headSpring.targetPitch += 0.03; // lean in
                 break;
             case 'thinking':
-                this.gazeWander = Math.max(this.gazeWander, 0.7); // glance away
+                // Signature beat: before answering, she looks toward the work
+                // you were doing (keyboard side), then returns to you.
+                this.gazeWander = 0;
+                this.gazePoint.set(
+                    this.defaultLookAt.x - 0.45,
+                    this.defaultLookAt.y + 0.05,
+                    this.defaultLookAt.z
+                );
+                this._thinkingGlanceUntil = performance.now() + 450;
                 this.breathScale = 0.9;
                 break;
             case 'speaking':
