@@ -15,6 +15,12 @@ const audio = new AudioPlayer();
 const character = new CharacterRenderer('characterContainer');
 const settings = new SettingsPanel(ws);
 
+const qualitySelect = document.getElementById('settingQuality');
+if (qualitySelect) {
+    qualitySelect.value = character.quality;
+    qualitySelect.addEventListener('change', () => character.setQuality(qualitySelect.value));
+}
+
 // Emotion comes from the backend (emotion.mai / emotion.detected); turn state
 // comes from companion.phase. The client no longer guesses either from text.
 const USER_MOOD_TO_RESPONSE = {

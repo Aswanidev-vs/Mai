@@ -91,6 +91,21 @@ const secureRand = () => {
     catch (e) { return 0.5; }
 };
 
+// Reused every frame: allocating Raycaster/Plane/Vector3 inside _updateGaze
+// shows up as periodic GC hitches even when the mean frame time looks fine.
+const _gazePointer = new THREE.Vector2();
+const _gazeRaycaster = new THREE.Raycaster();
+const _gazePlane = new THREE.Plane(new THREE.Vector3(0, 0, -1), 0);
+const _gazeHit = new THREE.Vector3();
+
+// Frame budget: cap both the pixel ratio and total drawing-buffer pixels. A 4K
+// panel at DPR 2 is 33 megapixels and no avatar needs that.
+const QUALITY_LEVELS = {
+    low: { dpr: 1, maxPixels: 1200000 },
+    medium: { dpr: 1.5, maxPixels: 2500000 },
+    high: { dpr: 2, maxPixels: 4000000 },
+};
+
 class CharacterRenderer {
     constructor(containerId) {
         this.container = document.getElementById(containerId);
@@ -103,6 +118,20 @@ class CharacterRenderer {
         this.loaded = false;
         this.mixer = null;
         this._wasHidden = false;
+        this.quality = (typeof localStorage !== 'undefined' && localStorage.getItem('mai-quality')) || 'medium';
+        if (!QUALITY_LEVELS[this.quality]) this.quality = 'medium';
+        this.reducedMotion = typeof matchMedia === 'function'
+            && matchMedia('(prefers-reduced-motion: reduce)').matches;
+        this.frameSamples = [];
+        this._lastPerfAt = 0;
+        this.debugHud = null;
+        this.debugHudVisible = false;
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'F3') {
+                e.preventDefault();
+                this.debugHudVisible = !this.debugHudVisible;
+            }
+        });
 
         // Motion3 clips are fetched on first use, not before the first render.
         this.motionClips = new Array(MOTION_FILES.length).fill(null);
@@ -287,7 +316,7 @@ class CharacterRenderer {
         });
         console.log('[VRM] Using WebGL renderer');
 
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this._applyQuality();
         this.renderer.setClearColor(0x000000, 0); // Transparent — PixiJS handles background
         this.renderer.outputColorSpace = THREE.SRGBColorSpace;
         this.renderer.toneMapping = THREE.LinearToneMapping;
@@ -747,10 +776,28 @@ class CharacterRenderer {
         }
     }
 
+    _applyQuality() {
+        if (!this.renderer) return;
+        const level = QUALITY_LEVELS[this.quality] || QUALITY_LEVELS.medium;
+        const w = Math.max(1, this.container.clientWidth);
+        const h = Math.max(1, this.container.clientHeight);
+        const pixelCap = Math.sqrt(level.maxPixels / (w * h));
+        const dpr = Math.max(0.75, Math.min(window.devicePixelRatio || 1, level.dpr, pixelCap));
+        this.renderer.setPixelRatio(dpr);
+    }
+
+    setQuality(level) {
+        if (!QUALITY_LEVELS[level]) return;
+        this.quality = level;
+        try { localStorage.setItem('mai-quality', level); } catch (e) { /* private mode */ }
+        this._applyQuality();
+    }
+
     _resize() {
         const w = this.container.clientWidth;
         const h = this.container.clientHeight;
         if (w === 0 || h === 0) return;
+        this._applyQuality();
         this.renderer.setSize(w, h);
         this.camera.aspect = w / h;
         this.camera.updateProjectionMatrix();
@@ -1471,18 +1518,15 @@ class CharacterRenderer {
         // Mouse tracking: project screen cursor to 3D gaze plane (Airi: useLive2DEyeFocusFor)
         if (this.userPresent && this.gazeWander < 0.5 && this.camera) {
             // Project mouse position onto the eye-height plane
-            const mouseScreen = new THREE.Vector2(this.mouseX, this.mouseY);
-            const raycaster = new THREE.Raycaster();
-            raycaster.setFromCamera(mouseScreen, this.camera);
+            _gazePointer.set(this.mouseX, this.mouseY);
+            _gazeRaycaster.setFromCamera(_gazePointer, this.camera);
             // Intersect with horizontal plane at eye height
-            const plane = new THREE.Plane(new THREE.Vector3(0, 0, -1), -this.defaultLookAt.z);
-            const intersect = new THREE.Vector3();
-            raycaster.ray.intersectPlane(plane, intersect);
-            if (intersect) {
+            _gazePlane.constant = -this.defaultLookAt.z;
+            if (_gazeRaycaster.ray.intersectPlane(_gazePlane, _gazeHit)) {
                 // Blend mouse influence (stronger when closer)
                 const influence = 0.25;
-                this.gazePoint.x = lerp(this.gazePoint.x, intersect.x * influence + this.defaultLookAt.x * (1 - influence), 0.08);
-                this.gazePoint.y = lerp(this.gazePoint.y, intersect.y * influence + this.defaultLookAt.y * (1 - influence), 0.08);
+                this.gazePoint.x = lerp(this.gazePoint.x, _gazeHit.x * influence + this.defaultLookAt.x * (1 - influence), 0.08);
+                this.gazePoint.y = lerp(this.gazePoint.y, _gazeHit.y * influence + this.defaultLookAt.y * (1 - influence), 0.08);
             }
         }
 
@@ -1503,8 +1547,10 @@ class CharacterRenderer {
         const lerpSpeed = 1 - Math.exp(-12 * delta);
         this.fixationTarget.lerp(this.gazePoint, lerpSpeed);
         // Tiny constant micro-drift so the eyes never feel frozen.
-        this.fixationTarget.x += Math.sin(performance.now() * 0.0007) * 0.004;
-        this.fixationTarget.y += Math.sin(performance.now() * 0.0009 + 1.3) * 0.003;
+        if (!this.reducedMotion) {
+            this.fixationTarget.x += Math.sin(performance.now() * 0.0007) * 0.004;
+            this.fixationTarget.y += Math.sin(performance.now() * 0.0009 + 1.3) * 0.003;
+        }
 
         if (this.vrm.lookAt.target) {
             this.vrm.lookAt.target.position.copy(this.fixationTarget);
@@ -1761,7 +1807,7 @@ class CharacterRenderer {
         if (this.restMode) { tp = lerp(tp, 0.06, 0.7); ty = lerp(ty, 0.02, 0.5); }
 
         // Enhanced idle behaviors with more variety
-        if (!this.speaking) {
+        if (!this.speaking && !this.reducedMotion) {
             this.idleBehaviorTimer -= delta;
             if (!this.idleBehavior && this.idleBehaviorTimer <= 0) {
                 this.idleBehaviorTimer = this._rand(IDLE_BEHAVIOR_MIN, IDLE_BEHAVIOR_MAX);
@@ -2427,6 +2473,27 @@ class CharacterRenderer {
         }
     }
 
+    // Optional F3 overlay: measured p95 (not a mean), draw calls and GPU memory.
+    _updatePerf(elapsed, delta) {
+        this.frameSamples.push(delta * 1000);
+        if (this.frameSamples.length > 120) this.frameSamples.shift();
+        if (!this.debugHudVisible || elapsed - this._lastPerfAt < 0.5) return;
+        this._lastPerfAt = elapsed;
+        if (!this.debugHud) {
+            this.debugHud = document.createElement('div');
+            this.debugHud.id = 'mai-perf';
+            this.debugHud.style.cssText = 'position:absolute;top:8px;right:8px;padding:4px 8px;'
+                + 'background:rgba(12,12,20,.8);color:#a0a0b8;font:11px monospace;'
+                + 'border-radius:6px;pointer-events:none;z-index:5;white-space:pre';
+            this.container.appendChild(this.debugHud);
+        }
+        const sorted = this.frameSamples.slice().sort((a, b) => a - b);
+        const p95 = sorted[Math.floor(sorted.length * 0.95)] || 0;
+        const info = this.renderer.info;
+        this.debugHud.textContent = `p95 ${p95.toFixed(1)}ms  draw ${info.render.drawCalls}  tris ${info.render.triangles}\n`
+            + `geo ${info.memory.geometries}  tex ${info.memory.textures}  quality ${this.quality}`;
+    }
+
     // One motivated light direction; its colour follows the time of day and
     // softens with her mood. This keeps the room coherent without a bloom pass.
     _updateLighting(elapsed) {
@@ -2458,6 +2525,7 @@ class CharacterRenderer {
         }
         const delta = Math.min(this.clock.getDelta(), 0.1);
         const elapsed = this.clock.getElapsedTime();
+        this._updatePerf(elapsed, delta);
 
         if (this.vrm) {
             this._updateLighting(elapsed);
