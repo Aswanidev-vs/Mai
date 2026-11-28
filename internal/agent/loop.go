@@ -521,7 +521,7 @@ func (o *Orchestrator) HandleInput(ctx context.Context, input map[string]interfa
 		Metadata: map[string]interface{}{"emotion": string(emotionState.Type)},
 	})
 	o.memory.Episodic().StoreEvent(interfaces.MemoryEntry{
-		ID: fmt.Sprintf("user_%d", time.Now().UnixMilli()), Type: "user_input",
+		ID: nextMemoryID("user"), Type: "user_input",
 		Content: text, Timestamp: time.Now().Unix(),
 		Metadata: map[string]interface{}{"emotion": string(emotionState.Type)},
 	})
@@ -736,7 +736,7 @@ func (o *Orchestrator) storeResponse(text string, userTurn ...string) {
 		Type: "assistant_response", Content: text, Timestamp: time.Now().Unix(),
 	})
 	o.memory.Episodic().StoreEvent(interfaces.MemoryEntry{
-		ID: fmt.Sprintf("mai_%d", time.Now().UnixMilli()), Type: "assistant_response",
+		ID: nextMemoryID("mai"), Type: "assistant_response",
 		Content: text, Timestamp: time.Now().Unix(),
 	})
 	if len(userTurn) > 0 {
@@ -849,7 +849,7 @@ func (o *Orchestrator) recordTruncatedTurn(user string, heard string, chatMessag
 		Metadata:  map[string]interface{}{"interrupted": true},
 	})
 	o.memory.Episodic().StoreEvent(interfaces.MemoryEntry{
-		ID:        fmt.Sprintf("mai_%d", time.Now().UnixMilli()),
+		ID:        nextMemoryID("mai"),
 		Type:      "assistant_response",
 		Content:   heard,
 		Timestamp: time.Now().Unix(),
@@ -1153,7 +1153,7 @@ func (o *Orchestrator) handleConversation(ctx context.Context, text string, emot
 	})
 
 	o.memory.Episodic().StoreEvent(interfaces.MemoryEntry{
-		ID:        fmt.Sprintf("mai_%d", time.Now().UnixMilli()),
+		ID:        nextMemoryID("mai"),
 		Type:      "assistant_response",
 		Content:   response,
 		Timestamp: time.Now().Unix(),
@@ -1928,6 +1928,14 @@ func (s *echoWordSet) has(word string) bool {
 // (prepare/confirm, retries), while a decoder or TTS→STT loop will repeat far
 // more often than this.
 const repeatInputIgnoreAfter = 10
+
+// Memory IDs need a sequence as well as a timestamp: two turns finalized in
+// the same millisecond used to overwrite each other in the SQLite events table.
+var memoryIDSeq atomic.Uint64
+
+func nextMemoryID(prefix string) string {
+	return fmt.Sprintf("%s_%d_%d", prefix, time.Now().UnixMilli(), memoryIDSeq.Add(1))
+}
 
 // normalizeRepeatInput makes punctuation, case and spacing differences
 // irrelevant when deciding whether the user said the same thing again.
