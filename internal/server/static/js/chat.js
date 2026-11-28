@@ -107,19 +107,12 @@ class ChatUI {
 
     addSystemMessage(text) {
         const el = document.createElement('div');
-        el.className = 'message assistant';
-
-        const avatar = document.createElement('div');
-        avatar.className = 'message-avatar';
-        avatar.textContent = 'M';
+        el.className = 'message system';
 
         const content = document.createElement('div');
-        content.className = 'message-content';
-        const em = document.createElement('em');
-        em.textContent = text;
-        content.appendChild(em);
+        content.className = 'system-message';
+        content.textContent = text;
 
-        el.appendChild(avatar);
         el.appendChild(content);
         this.messagesEl.appendChild(el);
         this._scrollToBottom();

@@ -29,6 +29,22 @@ const USER_MOOD_TO_RESPONSE = {
 };
 let currentPhase = 'idle';
 
+const PHASE_LABELS = {
+    wake: 'Waking', listening: 'Listening', thinking: 'Thinking',
+    speaking: 'Speaking', interrupted: 'Interrupted', idle: 'Idle',
+};
+
+// One place owns the status pill so phase events and backend status cannot
+// fight over it (the old pill said "Idle" right after a reply).
+function setStatusDisplay(phase) {
+    const p = PHASE_LABELS[phase] ? phase : 'idle';
+    if (statusText) statusText.textContent = PHASE_LABELS[p];
+    if (statusIndicator) {
+        statusIndicator.className = 'status-indicator ' +
+            (p === 'idle' ? (ws.connected ? 'connected' : '') : p);
+    }
+}
+
 
 // Wire audio analyser to character for lip sync
 audio.init();
@@ -144,6 +160,7 @@ ws.on('companion.phase', (params) => {
     currentPhase = phase;
     character.setPhase(phase);
     character.setUserSpeaking(phase === 'listening' || phase === 'wake');
+    setStatusDisplay(phase);
     if (phase === 'wake') showCaption("I'm here", true);
 });
 
@@ -181,16 +198,8 @@ ws.on('companion.prosody', (params) => character.setProsody(params));
 // Status changes
 ws.on('status.changed', (params) => {
     const status = params.status || 'idle';
-    statusText.textContent = status.charAt(0).toUpperCase() + status.slice(1);
     character.setStatus(status);
-
-    statusIndicator.className = 'status-indicator connected';
-    if (status === 'thinking') {
-        statusIndicator.classList.add('thinking');
-    } else if (status === 'speaking') {
-        statusIndicator.classList.add('speaking');
-        // Speaking state is managed by audio callbacks, not status events
-    }
+    setStatusDisplay(currentPhase !== 'idle' ? currentPhase : status);
 });
 
 // TTS audio chunks — queue for sequential playback with lip sync.
