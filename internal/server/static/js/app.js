@@ -139,6 +139,9 @@ ws.on('companion.phase', (params) => {
     character.setPhase(phase);
 });
 
+// Measured prosody reshapes the viseme timeline for the next sentence.
+ws.on('companion.prosody', (params) => character.setProsody(params));
+
 // Status changes
 ws.on('status.changed', (params) => {
     const status = params.status || 'idle';

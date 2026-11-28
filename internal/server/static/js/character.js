@@ -129,6 +129,7 @@ class CharacterRenderer {
         // Viseme schedule (word-accurate lip sync)
         this.visemeSchedule = null;
         this.visemeDuration = 0;
+        this.prosody = null;
 
         // Blink state (initialized lazily in _updateBlink)
         this._blinkState = null;
@@ -1804,7 +1805,7 @@ class CharacterRenderer {
     }
 
     prepareVisemes(text) {
-        const sched = buildVisemeSchedule(text);
+        const sched = buildVisemeSchedule(text, this.prosody);
         this.visemeSchedule = sched.segments;
         // Store for sentence pitch contour detection
         this._lastUtteranceText = text;
@@ -1813,6 +1814,12 @@ class CharacterRenderer {
 
     setVisemeDuration(d) {
         this.visemeDuration = Number.isFinite(d) && d >= 0 ? d : 0;
+    }
+
+    // Measured from the rendered sentence, not guessed from punctuation.
+    setProsody(p) {
+        this.prosody = p || null;
+        if (this._lastUtteranceText) this.prepareVisemes(this._lastUtteranceText);
     }
 
     setSpeaking(s) {
@@ -2182,22 +2189,23 @@ class CharacterRenderer {
         const text = this._lastUtteranceText || '';
         const endsWithQuestion = /[?]$/.test(text.trim()) || /[？]$/.test(text.trim());
         const endsWithExclamation = /[!]$/.test(text.trim()) || /[！]$/.test(text.trim());
+        const energy = this.prosody ? 0.6 + this.prosody.pitchVariance * 0.8 : 1;
 
         if (endsWithQuestion) {
             // Questions: head tilts UP at the end
             const rise = Math.max(0, phase - 0.7) / 0.3; // 0..1 in last 30%
             const head = this.vrm.humanoid.getNormalizedBoneNode('head');
-            if (head) head.rotation.x -= rise * 0.025; // pitch up (negative = up)
+            if (head) head.rotation.x -= rise * 0.025 * energy; // pitch up (negative = up)
         } else if (endsWithExclamation) {
             // Exclamations: head lifts with energy
             const lift = Math.max(0, phase - 0.8) / 0.2;
             const head = this.vrm.humanoid.getNormalizedBoneNode('head');
-            if (head) head.rotation.x -= lift * 0.02;
+            if (head) head.rotation.x -= lift * 0.02 * energy;
         } else {
             // Statements: head nods down at the end
             const drop = Math.max(0, phase - 0.8) / 0.2;
             const head = this.vrm.humanoid.getNormalizedBoneNode('head');
-            if (head) head.rotation.x += drop * 0.015;
+            if (head) head.rotation.x += drop * 0.015 * energy;
         }
     }
 

@@ -556,6 +556,7 @@ class VirtualOverlay {
         this.expressionResetTimer = null;
         this.agentStatus = 'idle';
         this.phase = 'idle';
+        this.prosody = null;
         this.statusPose = { pitch: 0, yaw: 0, roll: 0 };
         this.statusPoseTarget = { pitch: 0, yaw: 0, roll: 0 };
         this.gesturePose = { pitch: 0, yaw: 0, roll: 0 };
@@ -1087,7 +1088,13 @@ class VirtualOverlay {
         this.agentStatus = status || 'idle';
         const cfg = STATUS_MAP[this.agentStatus];
         if (!cfg) return;
-        this.statusPoseTarget = cfg.pose;
+        const variance = Number(this.prosody?.pitch_variance) || 0.3;
+        const energy = 0.6 + variance * 0.8;
+        this.statusPoseTarget = {
+            pitch: cfg.pose.pitch * energy,
+            yaw: cfg.pose.yaw * energy,
+            roll: cfg.pose.roll * energy,
+        };
         // The status expression is a gentle baseline; emotions override it.
         for (const e of cfg.expression) {
             if (!VRM_EXPRESSIONS.includes(e.name)) continue;
@@ -1339,6 +1346,7 @@ class VirtualOverlay {
         this.ws = new WSClient(`${proto}//${location.host}/ws`, token);
 
         this.ws.on('companion.phase', (params) => this.setPhase(params?.phase));
+        this.ws.on('companion.prosody', (params) => { this.prosody = params; });
         this.ws.on('emotion.detected', (params) => {
             const emotion = params?.emotion || 'calm';
             const intensity = clamp(Number(params?.intensity) || 0.35, 0.2, 0.6);

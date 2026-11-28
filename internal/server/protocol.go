@@ -70,6 +70,7 @@ const (
 	NotifAction        = "companion.action"
 	NotifAutomation    = "companion.automation"
 	NotifPhase         = "companion.phase"
+	NotifProsody       = "companion.prosody"
 	// NotifPartialTranscript carries an in-progress ASR result (final=false) and
 	// NotifFinalTranscript the authoritative one for the utterance (final=true).
 	NotifPartialTranscript = "asr.partial"
@@ -104,6 +105,15 @@ type AutomationPhaseParams struct {
 type PhaseParams struct {
 	Phase  string `json:"phase"`
 	TurnID string `json:"turn_id,omitempty"`
+}
+
+// ProsodyParams carries measured speech features for one sentence so the
+// avatar can time pauses and head motion from the audio, not from punctuation.
+type ProsodyParams struct {
+	PauseRatio    float64 `json:"pause_ratio"`
+	PitchVariance float64 `json:"pitch_variance"`
+	RMS           float64 `json:"rms"`
+	TurnID        string  `json:"turn_id,omitempty"`
 }
 
 // ChatResponseChunk is streamed back for chat.response.

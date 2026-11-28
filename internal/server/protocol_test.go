@@ -36,6 +36,12 @@ func TestPartialTranscriptParamsJSONShape(t *testing.T) {
 	}
 }
 
+func TestProsodyParamsJSONShape(t *testing.T) {
+	data, err := json.Marshal(ProsodyParams{PauseRatio: 0.4, PitchVariance: 0.7, RMS: 0.2, TurnID: "t1"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"pause_ratio":0.4,"pitch_variance":0.7,"rms":0.2,"turn_id":"t1"}`, string(data))
+}
+
 func TestPhaseParamsCarriesPhaseAndTurn(t *testing.T) {
 	data, err := json.Marshal(PhaseParams{Phase: "thinking", TurnID: "t42"})
 	require.NoError(t, err)

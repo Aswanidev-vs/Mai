@@ -267,6 +267,7 @@ func main() {
 	var bargeStartNano atomic.Int64  // when the residual first crossed the barge-in gate (0 = idle)
 	var ttsStartedNano atomic.Int64  // UnixNano when current TTS playback started
 	var turnStartedNano atomic.Int64 // UnixNano when the current user turn began
+	speechProsody := personality.NewProsodyAnalyzer()
 
 	// Duplex session state. This is NOT yet the owner of isSpeaking /
 	// ttsPlaying / stopPlayback — those atomics stay authoritative for this
@@ -1280,6 +1281,7 @@ func main() {
 				atomic.StoreInt32(&isSpeaking, 1)
 				atomic.StoreInt32(&ttsPlaying, 1)
 				publishPhase(bus, "speaking")
+				publishProsody(bus, speechProsody.Analyze(item.samples, 44100))
 				if !turnOpen {
 					refBuffer.Clear()
 					echoCanceller.Reset()
@@ -2782,6 +2784,24 @@ func publishPhase(bus interfaces.EventBus, phase string) {
 		Payload: map[string]interface{}{
 			"phase":   phase,
 			"turn_id": observability.CurrentTurnID(),
+		},
+	})
+}
+
+// publishProsody sends measured features of the sentence about to be played,
+// so the viseme schedule and head beats follow the real audio.
+func publishProsody(bus interfaces.EventBus, features personality.ProsodyFeatures) {
+	if bus == nil {
+		return
+	}
+	bus.Publish(interfaces.Event{
+		Type:   "companion.prosody",
+		Source: "main.tts",
+		Payload: map[string]interface{}{
+			"pause_ratio":    features.PauseRatio,
+			"pitch_variance": features.PitchVariance,
+			"rms":            features.RMSEnergy,
+			"turn_id":        observability.CurrentTurnID(),
 		},
 	})
 }

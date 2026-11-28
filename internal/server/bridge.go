@@ -141,6 +141,17 @@ func (b *Bridge) subscribe(bus interfaces.EventBus) {
 		b.hub.BroadcastNotification(NotifPhase, PhaseParams{Phase: phase, TurnID: turnID}, event.TurnID)
 	})
 
+	// Measured speech prosody → viseme timing and head motion.
+	bus.Subscribe(NotifProsody, func(event interfaces.Event) {
+		pause, _ := event.Payload["pause_ratio"].(float64)
+		pitch, _ := event.Payload["pitch_variance"].(float64)
+		rms, _ := event.Payload["rms"].(float64)
+		turnID, _ := event.Payload["turn_id"].(string)
+		b.hub.BroadcastNotification(NotifProsody, ProsodyParams{
+			PauseRatio: pause, PitchVariance: pitch, RMS: rms, TurnID: turnID,
+		}, event.TurnID)
+	})
+
 	// Dance request from the orchestrator → browser tells the avatar to dance.
 	bus.Subscribe("companion.dance", func(event interfaces.Event) {
 		log.Println("[BRIDGE] Dance request → browser")

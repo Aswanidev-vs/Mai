@@ -62,8 +62,15 @@ function jitter(val) {
 
 // Returns { segments: [{ t0, t1, viseme, open }] } normalized across 0..1.
 // Now with prosody: punctuation pauses, stress emphasis, breath points.
-function buildVisemeSchedule(text) {
+function buildVisemeSchedule(text, prosody = null) {
     if (!text) return { segments: [] };
+
+    // Measured speech features reshape the text-derived rhythm: real pauses
+    // stretch silent units, and pitch variance drives how far the mouth opens.
+    const pauseScale = prosody
+        ? Math.max(0.5, Math.min(2.2, 0.6 + prosody.pauseRatio * 2.0)) : 1;
+    const openScale = prosody
+        ? Math.max(0.7, Math.min(1.25, 0.8 + prosody.pitchVariance * 0.7)) : 1;
 
     // Step 1: Build raw units with weights
     const units = [];
@@ -75,7 +82,7 @@ function buildVisemeSchedule(text) {
 
         if (isWhitespace(ch)) {
             if (!prevWasSpace) {
-                units.push({ viseme: null, weight: jitter(0.4), open: 0.0 });
+                units.push({ viseme: null, weight: jitter(0.4 * pauseScale), open: 0.0 });
             }
             prevWasSpace = true;
             continue;
@@ -90,10 +97,10 @@ function buildVisemeSchedule(text) {
             if (raw === '.' && i + 1 < text.length && text[i + 1] === '.') {
                 while (i + 1 < text.length && text[i + 1] === '.') i++;
             }
-            units.push({ viseme: null, weight: jitter(1.8), open: 0.0 });
+            units.push({ viseme: null, weight: jitter(1.8 * pauseScale), open: 0.0 });
         } else if (isClauseEnd(raw)) {
             // Clause boundary: medium pause
-            units.push({ viseme: null, weight: jitter(0.9), open: 0.0 });
+            units.push({ viseme: null, weight: jitter(0.9 * pauseScale), open: 0.0 });
         } else if (isLatinVowel(ch)) {
             // Check if this is a stressed syllable (uppercase or start of word)
             const isStressed = raw !== ch || (i > 0 && (text[i-1] === ' ' || text[i-1] === undefined));
@@ -136,7 +143,7 @@ function buildVisemeSchedule(text) {
         const dur = u.weight / totalWeight;
         const t0 = cursor;
         const t1 = Math.min(1, cursor + dur);
-        segments.push({ t0, t1, viseme: u.viseme, open: u.open });
+        segments.push({ t0, t1, viseme: u.viseme, open: Math.min(1, u.open * openScale) });
         cursor = t1;
     }
     if (segments.length > 0) segments[segments.length - 1].t1 = 1.0;
