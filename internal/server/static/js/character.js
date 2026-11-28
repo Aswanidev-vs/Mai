@@ -304,9 +304,11 @@ class CharacterRenderer {
 
         // Three-point rig. MToon needs a directional key to produce form: with only
         // ambient light the limbs and hair collapse into flat, faceted silhouettes.
-        this.scene.add(new THREE.AmbientLight(0xffe8d4, 0.30));
+        this.ambientLight = new THREE.AmbientLight(0xffe8d4, 0.30);
+        this.scene.add(this.ambientLight);
         const keyLight = new THREE.DirectionalLight(0xffedda, 0.85);
         keyLight.position.set(1.1, 1.6, 1.4);
+        this.keyLight = keyLight;
         this.scene.add(keyLight);
         const fillLight = new THREE.DirectionalLight(0xd6dff0, 0.22);
         fillLight.position.set(-1.2, 0.6, 0.9);
@@ -920,6 +922,7 @@ class CharacterRenderer {
             this.vrmGroup.add(vrm.scene);
             // Removed rotation - let model face its default direction
             this.scene.add(this.vrmGroup);
+            this._addContactShadow();
 
             vrm.springBoneManager?.reset();
             // Tune spring bones for realistic hair movement
@@ -1164,6 +1167,19 @@ class CharacterRenderer {
         }
     }
 
+    // A soft ground ellipse gives the avatar a contact point instead of
+    // floating in a transparent void.
+    _addContactShadow() {
+        const geometry = new THREE.CircleGeometry(0.42, 32);
+        const material = new THREE.MeshBasicMaterial({
+            color: 0x1a1410, transparent: true, opacity: 0.22, depthWrite: false,
+        });
+        this.contactShadow = new THREE.Mesh(geometry, material);
+        this.contactShadow.rotation.x = -Math.PI / 2;
+        this.contactShadow.position.y = 0.002;
+        this.scene.add(this.contactShadow);
+    }
+
     _frameModel() {
         if (!this.vrm?.scene) return;
 
@@ -1184,6 +1200,10 @@ class CharacterRenderer {
         const center = new THREE.Vector3();
         box.getSize(size);
         box.getCenter(center);
+        if (this.contactShadow) {
+            this.contactShadow.position.set(center.x, box.min.y + 0.002, center.z);
+            this.contactShadow.scale.setScalar(Math.max(0.5, size.x * 0.55));
+        }
 
         const rad = (CAMERA_FOV / 2 * Math.PI) / 180;
         // Frame from head to waist — aim camera at upper body, not full-body center
@@ -1746,9 +1766,9 @@ class CharacterRenderer {
             if (!this.idleBehavior && this.idleBehaviorTimer <= 0) {
                 this.idleBehaviorTimer = this._rand(IDLE_BEHAVIOR_MIN, IDLE_BEHAVIOR_MAX);
                 // No arm-moving behaviors: a random arm swing reads as a glitch.
-                const behaviorOptions = ['glance', 'adjust', 'breatheDeep', 'headNod', 'shoulderShrug'];
+                const behaviorOptions = ['glance', 'adjust', 'breatheDeep', 'headNod', 'shoulderShrug', 'weightShift'];
                 const kind = behaviorOptions[Math.floor(secureRand() * behaviorOptions.length)];
-                const durations = { glance: 1.4, adjust: 1.0, breatheDeep: 2.8, headNod: 0.8, shoulderShrug: 1.2 };
+                const durations = { glance: 1.4, adjust: 1.0, breatheDeep: 2.8, headNod: 0.8, shoulderShrug: 1.2, weightShift: 3.2 };
                 this.idleBehavior = { kind, dur: durations[kind] };
                 this.idleBehaviorT = 0;
             }
@@ -1771,6 +1791,15 @@ class CharacterRenderer {
                     case 'shoulderShrug':
                         tr += env * 0.02; // Slight shoulder roll
                         break;
+                    case 'weightShift': {
+                        const hips = this.vrm?.humanoid?.getNormalizedBoneNode('hips');
+                        if (hips) {
+                            if (this.hipsBaseX === null) this.hipsBaseX = hips.position.x;
+                            hips.position.x = this.hipsBaseX + env * 0.022;
+                            if (p >= 1) hips.position.x = this.hipsBaseX;
+                        }
+                        break;
+                    }
                 }
                 if (p >= 1) this.idleBehavior = null;
             }
@@ -2398,6 +2427,20 @@ class CharacterRenderer {
         }
     }
 
+    // One motivated light direction; its colour follows the time of day and
+    // softens with her mood. This keeps the room coherent without a bloom pass.
+    _updateLighting(elapsed) {
+        if (!this.keyLight || elapsed - (this._lastLightingAt || 0) < 1) return;
+        this._lastLightingAt = elapsed;
+        const hour = new Date().getHours();
+        const evening = hour < 7 || hour >= 18;
+        const sad = this.currentEmotion === 'sad' || this.currentEmotion === 'stressed';
+        const bright = this.currentEmotion === 'excited' || this.currentEmotion === 'happy';
+        this.keyLight.color.setHex(evening || sad ? 0xffd0a0 : 0xffedda);
+        this.keyLight.intensity = sad ? 0.55 : bright ? 0.95 : evening ? 0.65 : 0.85;
+        this.ambientLight.intensity = sad ? 0.22 : evening ? 0.26 : 0.30;
+    }
+
     _animate() {
         requestAnimationFrame(() => this._animate());
         if (!this.renderer) return; // Wait for async _init to complete
@@ -2417,6 +2460,7 @@ class CharacterRenderer {
         const elapsed = this.clock.getElapsedTime();
 
         if (this.vrm) {
+            this._updateLighting(elapsed);
             if (this.mixer) this.mixer.update(delta);
             this._updateIdle(elapsed, delta);
             this._updateLife(delta, elapsed);     // emotion posture + idle + rest (after idle)
